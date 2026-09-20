@@ -101,6 +101,176 @@ async function testFile(label, pdfPath, expected) {
   check('detectFormat detects CIBC markers',
     Parsers.detectFormat('CIBC Costco World Mastercard\nStatement Date') === 'cibc_costco');
 
+  /* ---------- generic template: synthetic PDFs (hand-built, zero deps) ---------- */
+  console.log('== generic template (synthetic PDFs)');
+
+  function escPdfText(s) {
+    return s.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+  }
+  // pages: array of pages; each page = [{x, y, text}] with y in points from
+  // the bottom of a US-Letter page. Produces a minimal but valid PDF that
+  // the vendored pdf.js can extract text positions from.
+  function makePdf(pages) {
+    const chunks = ['%PDF-1.4'];
+    const offsets = {};
+    const bodyLen = () => Buffer.byteLength(chunks.join('\n') + '\n', 'latin1');
+    const addObj = (num, body) => { offsets[num] = bodyLen(); chunks.push(num + ' 0 obj', body, 'endobj'); };
+    const n = pages.length;
+    const pageNums = [], contentNums = [];
+    let next = 4;
+    for (let i = 0; i < n; i++) { pageNums.push(next++); contentNums.push(next++); }
+    addObj(1, '<< /Type /Catalog /Pages 2 0 R >>');
+    addObj(2, '<< /Type /Pages /Kids [' + pageNums.map((p) => p + ' 0 R').join(' ') + '] /Count ' + n + ' >>');
+    addObj(3, '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>');
+    for (let i = 0; i < n; i++) {
+      let stream = '';
+      for (const it of pages[i]) {
+        stream += 'BT /F1 11 Tf 1 0 0 1 ' + it.x + ' ' + it.y + ' Tm (' + escPdfText(it.text) + ') Tj ET\n';
+      }
+      const len = Buffer.byteLength(stream, 'latin1');
+      addObj(pageNums[i], '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] ' +
+        '/Resources << /Font << /F1 3 0 R >> >> /Contents ' + contentNums[i] + ' 0 R >>');
+      addObj(contentNums[i], '<< /Length ' + len + ' >>\nstream\n' + stream + 'endstream');
+    }
+    const xrefOff = bodyLen();
+    const maxObj = next - 1;
+    chunks.push('xref', '0 ' + (maxObj + 1), '0000000000 65535 f ');
+    for (let i = 1; i <= maxObj; i++) chunks.push(String(offsets[i]).padStart(10, '0') + ' 00000 n ');
+    chunks.push('trailer', '<< /Size ' + (maxObj + 1) + ' /Root 1 0 R >>', 'startxref', String(xrefOff), '%%EOF');
+    return Buffer.from(chunks.join('\n'), 'latin1');
+  }
+  async function parseSynthetic(pages, onProgress) {
+    const buf = makePdf(pages);
+    return Parsers.parsePdf(toArrayBuffer(buf), pdfjsLib, onProgress);
+  }
+
+  // Fictional two-column bank statement: Charges | Payments columns.
+  const twoCol = [[
+    { x: 72, y: 740, text: 'Northstar Bank' },
+    { x: 72, y: 724, text: 'Monthly statement' },
+    { x: 72, y: 708, text: 'Statement period: Mar 01, 2026 - Mar 31, 2026' },
+    { x: 72, y: 690, text: 'Previous balance 1,000.00' },
+    { x: 72, y: 660, text: 'Date' }, { x: 150, y: 660, text: 'Description' },
+    { x: 400, y: 660, text: 'Charges' }, { x: 520, y: 660, text: 'Payments' },
+    { x: 72, y: 640, text: 'Mar 05' }, { x: 150, y: 640, text: 'GROCERY STORE' }, { x: 400, y: 640, text: '45.67' },
+    { x: 72, y: 622, text: 'Mar 07' }, { x: 150, y: 622, text: 'PAYMENT THANK YOU' }, { x: 520, y: 622, text: '200.00' },
+    { x: 72, y: 604, text: 'Mar 12' }, { x: 150, y: 604, text: 'COFFEE SHOP' }, { x: 400, y: 604, text: '4.50' },
+    { x: 72, y: 586, text: 'Mar 20' }, { x: 150, y: 586, text: 'REFUND ISSUED' }, { x: 400, y: 586, text: '(12.00)' },
+    { x: 72, y: 560, text: 'New balance 838.17' },
+    { x: 72, y: 100, text: 'Page 1 of 1' },
+  ]];
+  const progCalls = [];
+  const g2 = await parseSynthetic(twoCol, (p, np) => progCalls.push([p, np]));
+  check('generic: format', g2.format === 'generic_statement', 'got ' + g2.format);
+  check('generic: templateId', g2.templateId === 'generic_statement_v1', 'got ' + g2.templateId);
+  check('generic: 4 rows', g2.rows.length === 4, 'got ' + g2.rows.length);
+  check('generic: two-column signs', JSON.stringify(g2.rows.map((r) => r.signedAmountMinor)) === '[4567,-20000,450,-1200]',
+    JSON.stringify(g2.rows.map((r) => r.signedAmountMinor)));
+  check('generic: description kept', g2.rows[0].rawDescription === 'GROCERY STORE', JSON.stringify(g2.rows[0].rawDescription));
+  check('generic: year inferred from period', g2.rows[0].dateInferred === '2026-03-05', 'got ' + g2.rows[0].dateInferred);
+  check('generic: period meta', g2.meta.period_start === '2026-03-01' && g2.meta.period_end === '2026-03-31',
+    JSON.stringify({ s: g2.meta.period_start, e: g2.meta.period_end }));
+  check('generic: opening balance meta', g2.meta.reported_start_balance_minor === 100000,
+    'got ' + g2.meta.reported_start_balance_minor);
+  check('generic: closing balance meta', g2.meta.reported_end_balance_minor === 83817,
+    'got ' + g2.meta.reported_end_balance_minor);
+  check('generic: explicit-marker row is high confidence', g2.rows[3].confidence === 'high', 'got ' + g2.rows[3].confidence);
+  check('generic: header-derived rows are medium', g2.rows[0].confidence === 'medium', 'got ' + g2.rows[0].confidence);
+  check('generic: warnings recorded', Array.isArray(g2.warnings) && g2.warnings.length >= 3,
+    'got ' + (g2.warnings || []).length);
+  check('generic: onProgress called per page', progCalls.length === 1 && progCalls[0][0] === 1 && progCalls[0][1] === 1,
+    JSON.stringify(progCalls));
+  // Full engine path: normalize -> classify -> reconcile against baseline.
+  const g2rows = Engine.normalizeRows(g2.rows.map((r) => Object.assign({}, r)));
+  check('generic: all rows have date+amount',
+    g2rows.every((r) => r.date && r.amountMinor !== null && r.amountMinor !== undefined));
+  Engine.classifyRows(g2rows, []);
+  const g2rec = Engine.reconcile(g2rows, {
+    startMinor: g2.meta.reported_start_balance_minor, endMinor: g2.meta.reported_end_balance_minor });
+  check('generic: reconcile balanceCheck = ok', g2rec.balanceCheck === 'ok',
+    'got ' + g2rec.balanceCheck + ' gap=' + g2rec.gapMinor);
+
+  // Single-column layout: bare amounts positive; - / CR negative.
+  const singleCol = [[
+    { x: 72, y: 740, text: 'Acme Bank' },
+    { x: 72, y: 724, text: 'Account statement' },
+    { x: 72, y: 708, text: 'Statement date: April 15, 2026' },
+    { x: 72, y: 660, text: 'Date' }, { x: 150, y: 660, text: 'Description' }, { x: 450, y: 660, text: 'Amount' },
+    { x: 72, y: 640, text: '2026-04-02' }, { x: 150, y: 640, text: 'COFFEE SHOP' }, { x: 450, y: 640, text: '4.50' },
+    { x: 72, y: 622, text: '2026-04-03' }, { x: 150, y: 622, text: 'PAYMENT RECEIVED' }, { x: 450, y: 622, text: '-200.00' },
+    { x: 72, y: 604, text: '2026-04-05' }, { x: 150, y: 604, text: 'STORE REFUND' }, { x: 450, y: 604, text: '25.00CR' },
+    { x: 72, y: 100, text: 'Page 1 of 1' },
+  ]];
+  const g1 = await parseSynthetic(singleCol);
+  check('single-col: 3 rows', g1.rows.length === 3, 'got ' + g1.rows.length);
+  check('single-col: signs', JSON.stringify(g1.rows.map((r) => r.signedAmountMinor)) === '[450,-20000,-2500]',
+    JSON.stringify(g1.rows.map((r) => r.signedAmountMinor)));
+  check('single-col: explicit rows high confidence',
+    g1.rows[1].confidence === 'high' && g1.rows[2].confidence === 'high',
+    JSON.stringify(g1.rows.map((r) => r.confidence)));
+  check('single-col: bare row medium confidence', g1.rows[0].confidence === 'medium',
+    'got ' + g1.rows[0].confidence);
+  check('single-col: ISO dates kept', g1.rows[0].dateInferred === '2026-04-02', 'got ' + g1.rows[0].dateInferred);
+
+  // Two columns with NO header words: sign is ambiguous -> low confidence
+  // -> engine must route into the review queue.
+  const noHeader = [[
+    { x: 72, y: 740, text: 'Some Bank' },
+    { x: 72, y: 708, text: 'Statement period: Mar 01, 2026 - Mar 31, 2026' },
+    { x: 72, y: 640, text: 'Mar 05' }, { x: 150, y: 640, text: 'GROCERY STORE' }, { x: 400, y: 640, text: '45.67' },
+    { x: 72, y: 622, text: 'Mar 07' }, { x: 150, y: 622, text: 'PAYMENT THANK YOU' }, { x: 520, y: 622, text: '200.00' },
+    { x: 72, y: 100, text: 'Page 1 of 1' },
+  ]];
+  const gA = await parseSynthetic(noHeader);
+  check('ambiguous: rows low confidence', gA.rows.every((r) => r.confidence === 'low'),
+    JSON.stringify(gA.rows.map((r) => r.confidence)));
+  const gArows = Engine.normalizeRows(gA.rows.map((r) => Object.assign({}, r)));
+  Engine.classifyRows(gArows, []);
+  check('ambiguous: payment row routed to review queue', gArows[1].confidence === 'needs_review',
+    'got ' + gArows[1].confidence);
+  check('ambiguous: review reason cites heuristic', /heuristic/i.test(gArows[1].kindReason || ''),
+    JSON.stringify(gArows[1].kindReason));
+
+  // Running-balance column: excluded via a real "Balance" header (not a
+  // "Previous balance" summary line).
+  var bal = await parseSynthetic([[
+    { x: 72, y: 700, text: 'Fictional Bank' },
+    { x: 72, y: 682, text: 'Statement period: Mar 01, 2026 - Mar 31, 2026' },
+    { x: 72, y: 664, text: 'Date' },
+    { x: 150, y: 664, text: 'Description' },
+    { x: 400, y: 664, text: 'Amount' },
+    { x: 520, y: 664, text: 'Balance' },
+    { x: 72, y: 646, text: 'Mar 05' },
+    { x: 150, y: 646, text: 'GROCERY STORE' },
+    { x: 400, y: 646, text: '45.67' },
+    { x: 520, y: 646, text: '1,045.67' },
+    { x: 72, y: 628, text: 'Mar 07' },
+    { x: 150, y: 628, text: 'PAYMENT THANK YOU' },
+    { x: 400, y: 628, text: '-200.00' },
+    { x: 520, y: 628, text: '845.67' }
+  ]]);
+  check('balance-col: 2 rows', bal.rows.length === 2, 'got ' + bal.rows.length);
+  check('balance-col: transaction amounts (not running balance)',
+    JSON.stringify(bal.rows.map((r) => r.signedAmountMinor)) === '[4567,-20000]',
+    JSON.stringify(bal.rows.map((r) => r.signedAmountMinor)));
+  check('balance-col: warning names balance exclusion',
+    bal.warnings.some((w) => /running balance/.test(w)), JSON.stringify(bal.warnings));
+
+  // Non-statement PDF: friendly error, not a technical dump.
+  const menu = [[
+    { x: 72, y: 740, text: "Luigi's Trattoria" },
+    { x: 72, y: 720, text: 'Dinner menu' },
+    { x: 72, y: 690, text: 'Margherita Pizza 14.99' },
+    { x: 72, y: 672, text: 'Spaghetti Carbonara 16.50' },
+    { x: 72, y: 654, text: 'Tiramisu 7.00' },
+    { x: 72, y: 620, text: 'Open daily 11:00am to 10:00pm' },
+  ]];
+  let menuErr = null;
+  try { await parseSynthetic(menu); } catch (e) { menuErr = e && e.message; }
+  check('non-statement: friendly error',
+    menuErr === "This PDF doesn't look like a bank or credit-card statement we can read: found 1 pages but no lines with both a date and an amount.",
+    JSON.stringify(menuErr));
+
   console.log(failures === 0 ? '\nALL PDF PARSE CHECKS PASSED' : '\n' + failures + ' CHECK(S) FAILED');
   process.exit(failures === 0 ? 0 : 1);
 })().catch((e) => { console.error('FATAL', e && e.stack || e); process.exit(1); });

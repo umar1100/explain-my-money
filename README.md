@@ -31,7 +31,9 @@ apps/web/            The installable web app (this is what deploys)
     engine.js        Deterministic core: normalize → classify → match →
                      allocate → reconcile → briefing → Q&A (validated)
     parsers.js       Statement parsers: PC Financial + CIBC Costco PDF
-                     templates, generic CSV (validated)
+                     templates (exact), generic heuristic PDF reader for any
+                     bank/card statement (low-confidence rows flagged for
+                     review), generic CSV (validated)
     store.js         IndexedDB persistence (localStorage fallback)
     ocr.js           On-device receipt OCR (vendored Tesseract.js)
     llm.js           Optional BYOK phrasing adapter (inert by default)

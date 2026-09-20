@@ -453,13 +453,19 @@
   }
 
   function classifyBuiltin(r) {
+    // Parser-level parse confidence ('high'|'medium'|'low', set by the
+    // generic PDF template only). 'low' rows must land in the review queue
+    // rather than being silently trusted: after classification below they
+    // are downgraded to needs_review. Validated templates never set
+    // r.confidence, so their behaviour is unchanged.
+    var parserConfidence = r.confidence;
     var hay = r.merchantRaw || '';
     for (var i = 0; i < BUILTIN_RULES.length; i++) {
       var rule = BUILTIN_RULES[i];
       for (var k = 0; k < rule.keywords.length; k++) {
         if (hay.indexOf(rule.keywords[k]) !== -1) {
           applyKindToRow(r, rule.kind, rule.confidence, 'builtin keyword: "' + rule.keywords[k] + '"', 'builtin');
-          return;
+          return downgradeHeuristic(r, parserConfidence);
         }
       }
     }
@@ -471,6 +477,23 @@
     } else {
       applyKindToRow(r, 'purchase', 0.60, 'default: no rule matched, treated as purchase', 'builtin');
     }
+    downgradeHeuristic(r, parserConfidence);
+  }
+
+  /**
+   * Rows the heuristic PDF reader flagged as uncertain (confidence 'low')
+   * are capped at needs_review so the statement list, reconcile counts,
+   * and txn detail all treat them as review-queue items. Household rules
+   * and user corrections outrank the heuristic and are never downgraded;
+   * already-uncertain rows are already in the queue.
+   */
+  function downgradeHeuristic(r, parserConfidence) {
+    if (parserConfidence !== 'low') return;
+    if (r.classificationSource === 'user' || r.classificationSource === 'rule') return;
+    if (r.kind === 'uncertain' || r.confidence === 'needs_review') return;
+    applyKindToRow(r, r.kind, 0.40,
+      'heuristic PDF read is uncertain (' + (r.confidenceNote || 'low parse confidence') +
+      ') — flagged for your review', r.classificationSource || 'builtin');
   }
 
   /**

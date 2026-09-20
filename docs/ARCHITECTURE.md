@@ -22,8 +22,9 @@ only the deployment shape changed (static PWA instead of Python localhost).
                         ▼
 ┌─────────────────────────────────────────────────────────┐
 │ ADAPTERS (typed interfaces, outside the core)            │
-│ parsers.js  PC Financial + CIBC Costco PDF templates,   │
-│             generic CSV mapper, file hashing             │
+│ parsers.js  PC Financial + CIBC Costco PDF templates (exact),│
+│             generic heuristic PDF reader, generic CSV mapper,│
+│             file hashing                                     │
 │ ocr.js      On-device receipt OCR (vendored Tesseract)   │
 │ llm.js      Optional BYOK phrasing; inert by default    │
 │ store.js    IndexedDB persistence, localStorage fallback│

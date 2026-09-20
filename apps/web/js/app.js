@@ -517,9 +517,9 @@ App.vAddHome = async function (v, seq) {
       '<input type="file" id="stmt-file" class="hidden-file" accept=".pdf,.csv,text/csv,application/pdf" data-change="statement-file">' +
       '<details class="more"><summary>Supported formats</summary>' +
         '<ul class="list-plain">' +
-          '<li><strong>Statement PDF</strong> — supported now, read entirely on this device:<br>' +
-          '<span class="small">President\u2019s Choice Financial Mastercard · CIBC Costco World Mastercard. ' +
-          'Other PDFs are refused with a clear message — we never guess at an unknown layout.</span></li>' +
+          '<li><strong>Statement PDF</strong> — any bank or credit-card statement, read entirely on this device:<br>' +
+          '<span class="small">Familiar layouts (President\u2019s Choice Financial Mastercard, CIBC Costco World Mastercard) ' +
+          'are read exactly. Unfamiliar layouts get a careful heuristic read, and uncertain rows are flagged for your review.</span></li>' +
           '<li><strong>CSV</strong> — supported now. Any column order; we detect date / description / amount columns.</li>' +
         '</ul>' +
       '</details>' +
@@ -594,11 +594,15 @@ App.handlePdfFile = async function (input, file, v) {
   var buf;
   try { buf = await readFileAsArrayBuffer(file); }
   catch (e) { v.innerHTML = '<div class="banner bad">Could not read that file.</div>'; return; }
-  v.innerHTML = '<div class="empty"><div class="spin" style="margin:0 auto 12px"></div>Reading PDF on this device…</div>';
+  v.innerHTML = '<div class="empty"><div class="spin" style="margin:0 auto 12px"></div><span id="pdf-prog">Reading PDF on this device…</span></div>';
   var result;
   try {
     ensurePdfWorker();
-    result = await Parsers.parsePdf(buf, (typeof pdfjsLib !== 'undefined') ? pdfjsLib : null);
+    result = await Parsers.parsePdf(buf, (typeof pdfjsLib !== 'undefined') ? pdfjsLib : null,
+      function (page, numPages) {
+        var el = document.getElementById('pdf-prog');
+        if (el) el.textContent = 'Reading page ' + page + ' of ' + numPages + ' on this device…';
+      });
   } catch (e) {
     v.innerHTML = '<div class="banner bad"><strong>Could not parse this PDF:</strong> ' +
       esc(e.message || e) + '</div>' +
@@ -613,11 +617,14 @@ App.handlePdfFile = async function (input, file, v) {
   }
   var hash = sha256HexBytes(new Uint8Array(buf));
   var dup = (await sAll('sourceFiles')).some(function (f) { return f.sha256 === hash; });
+  var isGenericPdf = result.templateId === 'generic_statement_v1';
   App.state.pending = {
     fileName: file.name, fileSize: file.size, text: null,
     rows: rows, errors: [], hash: hash, duplicate: dup,
-    fileKind: 'pdf', formatLabel: result.institution + ' statement',
-    templateId: result.templateId, pdfMeta: result.meta || null
+    fileKind: 'pdf',
+    formatLabel: isGenericPdf ? 'Generic statement (heuristic read)' : result.institution + ' statement',
+    templateId: result.templateId, pdfMeta: result.meta || null,
+    pdfWarnings: result.warnings || []
   };
   App.state.addView = 'preview';
   App.render();
@@ -644,9 +651,19 @@ App.vImportPreview = function (v, seq) {
   html += '<div class="card"><h3 style="margin-top:0">Detected fields</h3>';
   if (p.fileKind === 'pdf') {
     var meta = p.pdfMeta || {};
+    var isGeneric = p.templateId === 'generic_statement_v1';
     html += '<p class="small">Detected format: <strong>' + esc(p.formatLabel || 'PDF statement') + '</strong>' +
       (p.templateId ? ' <span class="mono tiny">' + esc(p.templateId) + '</span>' : '') +
-      '<br>Read entirely on this device — the PDF never left your phone. Every table line parsed; nothing was guessed.</p>';
+      '<br>Read entirely on this device — the PDF never left your phone. ' +
+      (isGeneric
+        ? 'This layout is unfamiliar, so rows were detected with careful heuristics rather than an exact template. ' +
+          'Uncertain rows are flagged for your review below — nothing is silently trusted.'
+        : 'Every table line parsed; nothing was guessed.') + '</p>';
+    if (isGeneric && p.pdfWarnings && p.pdfWarnings.length) {
+      html += '<div class="banner warn" style="margin-top:8px"><strong>Heuristic read — please spot-check:</strong><ul class="list-plain">';
+      p.pdfWarnings.forEach(function (w) { html += '<li>• ' + esc(w) + '</li>'; });
+      html += '</ul></div>';
+    }
     if (meta.period_start || meta.period_end) {
       html += '<p class="small">Statement period: <strong>' + esc(fmtDate(meta.period_start)) +
         ' – ' + esc(fmtDate(meta.period_end)) + '</strong></p>';
@@ -740,6 +757,10 @@ App.Actions['confirm-import'] = async function () {
     };
     if (typeof r.signedAmountMinor === 'number') o.signedAmountMinor = r.signedAmountMinor;
     if (r.dateInferred) o.dateInferred = String(r.dateInferred);
+    // Heuristic-parse certainty (generic PDF template only): the engine
+    // routes confidence:'low' rows into the review queue.
+    if (r.confidence === 'low' || r.confidence === 'medium' || r.confidence === 'high') o.confidence = r.confidence;
+    if (r.confidenceNote) o.confidenceNote = String(r.confidenceNote);
     if (r.section) o.section = String(r.section);
     if (r.spendCategoryRaw) o.spendCategoryRaw = String(r.spendCategoryRaw);
     if (r.fxOriginalAmount) o.fxOriginalAmount = String(r.fxOriginalAmount);
@@ -924,7 +945,9 @@ App.stageExtract = async function (pipe) {
     pipe.parsed = { errors: errors, rowCount: rows.length };
     detail = '<ul><li>Format: <strong>' + esc(pipe.formatLabel || 'PDF statement') + '</strong>' +
       (pipe.templateId ? ' <span class="mono tiny">' + esc(pipe.templateId) + '</span>' : '') + '</li>' +
-      '<li>' + rows.length + ' data rows; 0 unparsed lines (the parser refuses to guess).</li>' +
+      (pipe.templateId === 'generic_statement_v1'
+        ? '<li>' + rows.length + ' data rows via heuristic read; low-confidence rows are flagged for your review.</li>'
+        : '<li>' + rows.length + ' data rows; 0 unparsed lines (the parser refuses to guess).</li>') +
       '<li>Parser-authoritative signing and statement-period dates carried into normalization.</li></ul>';
   } else {
     var parsed = Engine.parseCSV(pipe.text); // authoritative re-parse for the pipeline

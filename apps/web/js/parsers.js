@@ -22,6 +22,16 @@
  *   dateInferred     ISO date with year inferred from the statement period
  *                    (the engine falls back to this when rawDateText has no
  *                    year, e.g. "16/08" or "Mar 20").
+ *   confidence       'high' | 'medium' | 'low' — heuristic-parse certainty
+ *                    (generic template only). The engine routes 'low' rows
+ *                    into the review queue (see classifyRows).
+ *   confidenceNote   human-readable reason for the confidence level.
+ *
+ * Formats: the two validated templates (pc_financial, cibc_costco) are
+ * tried first and refuse to guess. Anything else falls back to
+ * Parsers.parseGeneric, a heuristic reader for any bank/credit-card
+ * statement: date+amount line detection, amount-column clustering,
+ * header-driven sign inference, balance keyword metadata, year inference.
  *
  * Money is ALWAYS integer minor units. No parseFloat anywhere near money.
  * Nothing is silently dropped: unparsed table-region lines raise.
@@ -95,11 +105,13 @@
   }
 
   /**
-   * Parsers.collectItems(pdf, maxPages) -> Promise<[{page,x,y,cx,text}]>.
+   * Parsers.collectItems(pdf, maxPages, onProgress) -> Promise<[{page,x,y,cx,text}]>.
    * One fragment per pdf.js text item (embedded newlines split). Exact
    * (page,x,y,text) duplicates dropped (some statements emit ops twice).
+   * onProgress(page, numPages) is optional and fires once per page so the
+   * UI can show "Reading page X of Y…" instead of a dead spinner.
    */
-  Parsers.collectItems = async function (pdf, maxPages) {
+  Parsers.collectItems = async function (pdf, maxPages, onProgress) {
     var frags = [];
     var n = Math.min(pdf.numPages, maxPages || pdf.numPages);
     for (var p = 1; p <= n; p++) {
@@ -123,6 +135,9 @@
         }
       }
       if (page.cleanup) page.cleanup();
+      if (typeof onProgress === 'function') {
+        try { onProgress(p, n); } catch (e) { /* progress must never break parsing */ }
+      }
     }
     return frags;
   };
@@ -883,17 +898,565 @@
   Parsers.CIBC = CIBC;
 
   /* ================================================================== */
+  /* Generic statement (template generic_statement_v1)                    */
+  /* ================================================================== */
+  /* Fallback when detectFormat returns null: ANY bank/credit-card
+   * statement PDF gets a careful heuristic read instead of a refusal.
+   * Every uncertain decision is recorded (per-row confidence +
+   * confidenceNote, doc-level warnings); the engine routes
+   * confidence:'low' rows into the user's review queue.
+   *
+   * Sign trade-offs (documented, spot-checkable):
+   *  - Numeric dates are read day-first (03/04/2026 -> 3 Apr), the
+   *    documented order of the supported date forms. Ambiguous cases are
+   *    flagged low-confidence for review.
+   *  - Amount columns: 1 column -> bare amounts positive; '-' / ( ) /
+   *    CR / DR markers negative. 2 columns -> left positive (charges),
+   *    right negative (payments), overridden by per-column header words
+   *    when the headers name them. With no header guidance the positional
+   *    sign is flagged low-confidence rather than trusted.
+   * Money stays integer minor units throughout (amountToMinor). */
+
+  var GENERIC = {
+    templateId: 'generic_statement_v1',
+    institution: 'Generic statement'
+  };
+
+  var GENERIC_MONTHS = PC_MONTHS; // jan..dec (+sept) -> 1..12
+
+  // Date token patterns, tried in order; the first match on a line is the
+  // row date. 'skip' spans (dot dates) are never row dates but are
+  // excluded from amount matching so "15.08" is not read as $15.08.
+  var GENERIC_DATE_RES = [
+    { kind: 'iso',  re: /\b(\d{4})-(\d{1,2})-(\d{1,2})\b/g },
+    { kind: 'dmy4', re: /\b(\d{1,2})\/(\d{1,2})\/(\d{4})\b/g },
+    { kind: 'dmy4', re: /\b(\d{1,2})-(\d{1,2})-(\d{4})\b/g },
+    { kind: 'dmy2', re: /\b(\d{1,2})\/(\d{1,2})\/(\d{2})\b/g },
+    { kind: 'dmy2', re: /\b(\d{1,2})-(\d{1,2})-(\d{2})\b/g },
+    { kind: 'mon_d', re: /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s+(\d{4}))?\b/gi },
+    { kind: 'd_mon', re: /\b(\d{1,2})(?:st|nd|rd|th)?\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?(?:,?\s+(\d{4}))?\b/gi },
+    { kind: 'skip', re: /\b\d{1,2}\.\d{1,2}\.\d{2,4}\b/g }
+  ];
+
+  // Printed amount token: "$1,234.56", "1,234.56", "(123.45)",
+  // "-123.45", "123.45-", "123.45CR", "123.45DR", "$ 45.67".
+  var GENERIC_AMT_RE = /\(?\s*-?\s*\$?\s*\d[\d,]*\.\d{2}\s*(?:-\s*)?\)?(?:\s*(?:CR|DR))?/gi;
+
+  var GENERIC_RE_PAGE_FOOTER = /^\s*page\s+\d+\s+of\s+\d+\b/i;
+  var GENERIC_RE_START_BAL = /\b(previous\s+balance|opening\s+balance|balance\s+forward|balance\s+brought\s+forward)\b/i;
+  var GENERIC_RE_END_BAL = /\b(new\s+balance|closing\s+balance|statement\s+balance|ending\s+balance|total\s+balance|amount\s+due|balance\s+due)\b/i;
+  var GENERIC_RE_PERIOD_A = /([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:,?\s+(\d{4}))?\s*[-\u2013\u2014]\s*([A-Za-z]{3,9})\.?\s+(\d{1,2}),\s+(\d{4})/;
+  var GENERIC_RE_PERIOD_B = /(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})\s*(?:to|[-–—])\s*(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})/i;
+  var GENERIC_RE_STMT_DATE = /statement\s+date[^\n:]*[:\s]+([A-Za-z]+\.?\s+\d{1,2},?\s+\d{4}|\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{4})/i;
+  var GENERIC_RE_YEAR = /\b(19|20)\d{2}\b/g;
+  var GENERIC_COL_TOL = 15; // points: amount-column clustering tolerance
+
+  var GENERIC_POS_WORDS = ['charge', 'charges', 'debit', 'debits', 'withdrawal', 'purchase', 'purchases', 'advance'];
+  var GENERIC_NEG_WORDS = ['payment', 'payments', 'credit', 'credits', 'deposit', 'refund', 'repayment'];
+
+  function genericMonthNum(name) {
+    return GENERIC_MONTHS[String(name).toLowerCase()] || null;
+  }
+
+  /**
+   * Amount token text -> {minor, explicit} or null. explicit = the printed
+   * text carried its own sign marker (-, +, parens, CR, DR). Integer math
+   * only; delegates the numeric part to amountToMinor.
+   */
+  function genericAmountToMinor(text) {
+    var t = trim(text);
+    if (!t) return null;
+    var negative = false;
+    var pm = /^\(\s*(.*\S)\s*\)$/.exec(t);
+    if (pm) { negative = true; t = trim(pm[1]); }
+    var dm = /^(.*?)\s*(CR|DR)$/i.exec(t);
+    if (dm && /^\s*-?\s*\$?\s*[\d,]*\d\.\d{2}\s*-?\s*$/i.test(dm[1])) {
+      negative = true; t = trim(dm[1]); // CR/DR suffix: credit/debit marker
+    }
+    var explicit = negative || /^[+-]/.test(t) || /-$/.test(t);
+    var minor;
+    try { minor = amountToMinor(t); } catch (e) { return null; }
+    if (negative) minor = -Math.abs(minor);
+    return { minor: minor, explicit: explicit };
+  }
+
+  /**
+   * All date-like spans on a line: [{index, end, y, m, d, hasYear,
+   * ambiguous, skip}]. Invalid month/day values are discarded.
+   */
+  function genericFindDates(text) {
+    var out = [];
+    for (var k = 0; k < GENERIC_DATE_RES.length; k++) {
+      var def = GENERIC_DATE_RES[k];
+      def.re.lastIndex = 0;
+      var m;
+      while ((m = def.re.exec(text)) !== null) {
+        if (m[0].length === 0) { def.re.lastIndex++; continue; }
+        var y = null, mo = null, d = null, hasYear = false, ambiguous = false;
+        if (def.kind === 'skip') {
+          out.push({ index: m.index, end: m.index + m[0].length, skip: true });
+          continue;
+        } else if (def.kind === 'iso') {
+          y = +m[1]; mo = +m[2]; d = +m[3]; hasYear = true;
+        } else if (def.kind === 'dmy4' || def.kind === 'dmy2') {
+          var a = +m[1], b = +m[2];
+          y = +m[3]; hasYear = true;
+          if (def.kind === 'dmy2') y += (y >= 70 ? 1900 : 2000);
+          if (a > 12 && b <= 12) { d = a; mo = b; }
+          else if (b > 12 && a <= 12) { mo = a; d = b; }
+          else if (a <= 12 && b <= 12) { d = a; mo = b; ambiguous = true; } // day-first default
+          else continue; // both > 12: not a date
+        } else if (def.kind === 'mon_d') {
+          mo = genericMonthNum(m[1]); d = +m[2];
+          if (m[3]) { y = +m[3]; hasYear = true; }
+        } else if (def.kind === 'd_mon') {
+          d = +m[1]; mo = genericMonthNum(m[2]);
+          if (m[3]) { y = +m[3]; hasYear = true; }
+        }
+        if (mo === null || mo < 1 || mo > 12 || d < 1 || d > 31) continue;
+        if (hasYear && (y < 1900 || y > 2100)) continue;
+        out.push({
+          index: m.index, end: m.index + m[0].length, text: m[0],
+          y: y, m: mo, d: d, hasYear: hasYear, ambiguous: ambiguous, skip: false
+        });
+      }
+    }
+    out.sort(function (a, b) { return a.index - b.index; });
+    return out;
+  }
+
+  /** Amount-token spans not overlapping any date span: [{index, end, text}]. */
+  function genericFindAmounts(text, dateSpans) {
+    var out = [];
+    GENERIC_AMT_RE.lastIndex = 0;
+    var m;
+    while ((m = GENERIC_AMT_RE.exec(text)) !== null) {
+      if (m[0].length === 0) { GENERIC_AMT_RE.lastIndex++; continue; }
+      var s = m.index, e = s + m[0].length, overlap = false;
+      for (var i = 0; i < dateSpans.length; i++) {
+        if (e > dateSpans[i].index && s < dateSpans[i].end) { overlap = true; break; }
+      }
+      if (overlap) continue;
+      if (genericAmountToMinor(m[0]) === null) continue;
+      out.push({ index: s, end: e, text: trim(m[0]) });
+    }
+    return out;
+  }
+
+  /**
+   * Rebuild [{page, text, frags}] lines from fragments (frag-preserving
+   * variant of groupIntoLines, same y-tolerance).
+   */
+  function genericBuildLines(frags) {
+    var byPage = {};
+    frags.forEach(function (f) { (byPage[f.page] = byPage[f.page] || []).push(f); });
+    var pages = Object.keys(byPage).map(Number).sort(function (a, b) { return a - b; });
+    var out = [];
+    pages.forEach(function (p) {
+      var sorted = byPage[p].slice().sort(function (a, b) { return (b.y - a.y) || (a.x - b.x); });
+      var buckets = [];
+      for (var i = 0; i < sorted.length; i++) {
+        var f = sorted[i];
+        if (buckets.length && Math.abs(f.y - buckets[buckets.length - 1][0]) <= LINE_Y_TOLERANCE) {
+          buckets[buckets.length - 1][1].push(f);
+        } else {
+          buckets.push([f.y, [f]]);
+        }
+      }
+      buckets.forEach(function (bk) {
+        var parts = bk[1].slice().sort(function (a, c) { return a.x - c.x; });
+        var text = trim(parts.map(function (x) { return x.text; }).join(' '));
+        if (text.replace(/\s/g, '')) out.push({ page: p, text: text, frags: parts });
+      });
+    });
+    return out;
+  }
+
+  /**
+   * X-center of the fragments covering [startIdx, endIdx) of a rebuilt
+   * line's text (the rebuild joins fragments with single spaces).
+   */
+  function genericSpanCenterX(line, startIdx, endIdx) {
+    var off = 0, sum = 0, n = 0;
+    for (var i = 0; i < line.frags.length; i++) {
+      var f = line.frags[i];
+      var s = off, e = off + f.text.length;
+      if (e > startIdx && s < endIdx && typeof f.cx === 'number' && isFinite(f.cx)) {
+        sum += f.cx; n++;
+      }
+      off = e + 1;
+    }
+    return n ? sum / n : null;
+  }
+
+  function genericDim(y, m) {
+    var dims = [31, ((y % 4 === 0 && y % 100 !== 0) || y % 400 === 0) ? 29 : 28,
+                31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    return dims[m - 1] || 31;
+  }
+
+  /**
+   * Infer the statement year: period range -> statement date ->
+   * most-common 4-digit year -> current year. Returns {year, periodStart,
+   * periodEnd, note}.
+   */
+  function genericInferYear(docText) {
+    var m = GENERIC_RE_PERIOD_A.exec(docText);
+    if (m) {
+      var sm = genericMonthNum(m[1]), em = genericMonthNum(m[4]);
+      if (sm && em) {
+        var ey = +m[6], sy = m[3] ? +m[3] : (sm > em ? ey - 1 : ey);
+        return {
+          year: ey,
+          periodStart: isoDate(sy, sm, Math.min(+m[2], genericDim(sy, sm))),
+          periodEnd: isoDate(ey, em, Math.min(+m[5], genericDim(ey, em))),
+          note: 'statement period'
+        };
+      }
+    }
+    var b = GENERIC_RE_PERIOD_B.exec(docText);
+    if (b) {
+      var bsm = +b[2], bem = +b[5];
+      var by1 = +b[3], by2 = +b[6];
+      return {
+        year: by2,
+        periodStart: isoDate(by1, Math.min(bsm, 12), Math.min(+b[1], genericDim(by1, Math.min(bsm, 12)))),
+        periodEnd: isoDate(by2, Math.min(bem, 12), Math.min(+b[4], genericDim(by2, Math.min(bem, 12)))),
+        note: 'statement period'
+      };
+    }
+    var sd = GENERIC_RE_STMT_DATE.exec(docText);
+    if (sd) {
+      var ym = /(\d{4})/.exec(sd[1]);
+      if (ym) return { year: +ym[1], periodStart: null, periodEnd: null, note: 'statement date' };
+    }
+    var counts = {}, best = null, bestN = 0, ym2;
+    GENERIC_RE_YEAR.lastIndex = 0;
+    while ((ym2 = GENERIC_RE_YEAR.exec(docText)) !== null) {
+      var yy = ym2[0];
+      counts[yy] = (counts[yy] || 0) + 1;
+      if (counts[yy] > bestN) { bestN = counts[yy]; best = yy; }
+    }
+    if (best) return { year: +best, periodStart: null, periodEnd: null, note: 'most common year in document' };
+    var nowY = new Date().getFullYear();
+    return { year: nowY, periodStart: null, periodEnd: null, note: 'current year (no year found in document)' };
+  }
+
+  function genericWordPolarity(word) {
+    var w = String(word).toLowerCase();
+    for (var i = 0; i < GENERIC_POS_WORDS.length; i++) {
+      if (w === GENERIC_POS_WORDS[i]) return 1;
+    }
+    for (var j = 0; j < GENERIC_NEG_WORDS.length; j++) {
+      if (w === GENERIC_NEG_WORDS[j]) return -1;
+    }
+    return 0;
+  }
+
+  /**
+   * Parsers.parseGeneric(frags) -> {format, templateId, institution, rows,
+   * meta, warnings} or {rows: [], noStatement: true, reason, pageCount}.
+   * Pure function over collectItems fragments.
+   */
+  Parsers.parseGeneric = function (frags) {
+    var warnings = [];
+    var lines = genericBuildLines(frags || []);
+    var pageCount = 0;
+    lines.forEach(function (l) { if (l.page > pageCount) pageCount = l.page; });
+
+    var docText = lines.map(function (l) { return l.text; }).join('\n');
+    var yi = genericInferYear(docText);
+    warnings.push('year inferred as ' + yi.year + ' (' + yi.note + ')');
+    warnings.push('numeric dates read as day/month (e.g. 03/04/2026 means 3 Apr 2026)');
+
+    var meta = {
+      period_start: yi.periodStart, period_end: yi.periodEnd,
+      reported_start_balance_minor: null, reported_end_balance_minor: null
+    };
+
+    // Pass 1: balance/summary lines + candidate rows.
+    var candidates = [], skippedUndated = 0;
+    for (var li = 0; li < lines.length; li++) {
+      var line = lines[li], text = line.text;
+      if (GENERIC_RE_PAGE_FOOTER.test(text)) continue;
+      var dateSpans = genericFindDates(text);
+      var realDates = dateSpans.filter(function (ds) { return !ds.skip; });
+      var amounts = genericFindAmounts(text, dateSpans);
+
+      if (GENERIC_RE_START_BAL.test(text) || GENERIC_RE_END_BAL.test(text)) {
+        if (amounts.length) {
+          var pick = GENERIC_RE_START_BAL.test(text) ? amounts[0] : amounts[amounts.length - 1];
+          var bv = genericAmountToMinor(pick.text);
+          if (bv) {
+            if (GENERIC_RE_START_BAL.test(text) && meta.reported_start_balance_minor === null) {
+              meta.reported_start_balance_minor = Math.abs(bv.minor);
+            } else if (GENERIC_RE_END_BAL.test(text) && meta.reported_end_balance_minor === null) {
+              meta.reported_end_balance_minor = Math.abs(bv.minor);
+            }
+            continue;
+          }
+        }
+        continue;
+      }
+      if (!realDates.length || !amounts.length) continue;
+
+      var dateTok = realDates[0];
+      // Amount-token x-centers for every token on the line (used for
+      // column clustering and balance-column exclusion below).
+      var tokXs = [];
+      for (var ti = 0; ti < amounts.length; ti++) {
+        tokXs.push(genericSpanCenterX(line, amounts[ti].index, amounts[ti].end));
+      }
+      if (tokXs[0] === null) { skippedUndated++; continue; }
+      var ymd = dateTok.hasYear ? isoDate(dateTok.y, dateTok.m, dateTok.d)
+                                : isoDate(yi.year, dateTok.m, dateTok.d);
+      candidates.push({
+        line: line, page: line.page, lineIdx: li,
+        dateTok: dateTok, amtToks: amounts, tokXs: tokXs,
+        dateInferred: ymd
+      });
+    }
+
+    if (!candidates.length) {
+      return {
+        rows: [], noStatement: true, pageCount: pageCount,
+        reason: 'no lines with both a date and an amount'
+      };
+    }
+    // Header window: up to 5 lines above the first candidate block (same
+    // page). Used for column-header sign attribution and balance-column
+    // detection. A "balance" mention only signals a balance COLUMN when it
+    // sits on a header-looking line — standalone summary lines like
+    // "Previous balance 1,000.00" are not column headers.
+    var firstCand = candidates[0];
+    var headerWindowText = '', headerHasBalanceColumn = false;
+    for (var hwi = Math.max(0, firstCand.lineIdx - 5); hwi < firstCand.lineIdx; hwi++) {
+      if (lines[hwi] && lines[hwi].page === firstCand.page) {
+        var hwt = lines[hwi].text;
+        headerWindowText += ' ' + hwt;
+        if (/\bbalance\b/i.test(hwt) &&
+            !GENERIC_RE_START_BAL.test(hwt) && !GENERIC_RE_END_BAL.test(hwt)) {
+          headerHasBalanceColumn = true;
+        }
+      }
+    }
+
+    // Pass 2: amount-column clustering (~15pt tolerance) over ALL amount
+    // tokens on candidate lines. When the headers name a Balance column and
+    // there are 2+ clusters, the rightmost cluster is the running balance:
+    // drop it and re-pick each row's amount as the first token outside that
+    // column (rows with only a balance figure are not transactions).
+    function clusterXs(xs) {
+      var cols = [];
+      var sorted = xs.slice().sort(function (a, b) { return a - b; });
+      for (var xi = 0; xi < sorted.length; xi++) {
+        var x = sorted[xi];
+        if (cols.length && Math.abs(x - cols[cols.length - 1].x) <= GENERIC_COL_TOL) {
+          var cc = cols[cols.length - 1];
+          cc.x = (cc.x * cc.count + x) / (cc.count + 1);
+          cc.count++;
+        } else {
+          cols.push({ x: x, count: 1 });
+        }
+      }
+      return cols;
+    }
+    function candidateTokXs(c) {
+      var out = [];
+      for (var qi = 0; qi < c.tokXs.length; qi++) {
+        if (c.tokXs[qi] !== null) out.push(c.tokXs[qi]);
+      }
+      return out;
+    }
+    candidates.forEach(function (c) { c.pickIdx = 0; });
+    var allXs = [];
+    candidates.forEach(function (c) { allXs = allXs.concat(candidateTokXs(c)); });
+    var columns = clusterXs(allXs);
+    if (columns.length >= 2 && headerHasBalanceColumn) {
+      var balX = columns[columns.length - 1].x;
+      var kept = [];
+      candidates.forEach(function (c) {
+        var pick = -1;
+        for (var qi = 0; qi < c.tokXs.length; qi++) {
+          if (c.tokXs[qi] !== null && Math.abs(c.tokXs[qi] - balX) > GENERIC_COL_TOL) { pick = qi; break; }
+        }
+        if (pick === -1) { skippedUndated++; return; } // balance-only line
+        c.pickIdx = pick;
+        kept.push(c);
+      });
+      candidates = kept;
+      if (!candidates.length) {
+        return {
+          rows: [], noStatement: true, pageCount: pageCount,
+          reason: 'no lines with both a date and a transaction amount'
+        };
+      }
+      var keptXs = [];
+      candidates.forEach(function (c) { keptXs.push(c.tokXs[c.pickIdx]); });
+      columns = clusterXs(keptXs);
+      warnings.push('rightmost amount column looks like a running balance — excluded from transaction amounts');
+    }
+    // Final per-candidate amount + description. The description is the
+    // line with the date span and every amount-token span removed, so it
+    // works whether the amount prints before or after the date.
+    candidates.forEach(function (c) {
+      var pi = c.pickIdx || 0;
+      c.amtTok = c.amtToks[pi];
+      c.amountX = c.tokXs[pi];
+      var cutSpans = [{ index: c.dateTok.index, end: c.dateTok.end }];
+      for (var ai = 0; ai < c.amtToks.length; ai++) {
+        cutSpans.push({ index: c.amtToks[ai].index, end: c.amtToks[ai].end });
+      }
+      cutSpans.sort(function (p, q) { return p.index - q.index; });
+      var dparts = [], dcur = 0;
+      for (var di = 0; di < cutSpans.length; di++) {
+        if (cutSpans[di].index > dcur) dparts.push(c.line.text.slice(dcur, cutSpans[di].index));
+        dcur = Math.max(dcur, cutSpans[di].end);
+      }
+      dparts.push(c.line.text.slice(dcur));
+      c.description = trim(dparts.join(' ').replace(/\s+/g, ' '));
+    });
+    var columnsUnclear = columns.length > 2;
+    if (columnsUnclear) {
+      warnings.push('more than two amount columns detected — column layout is unclear, all rows flagged for review');
+      columns = columns.sort(function (a, b) { return b.count - a.count; }).slice(0, 2)
+        .sort(function (a, b) { return a.x - b.x; });
+    }
+    candidates.forEach(function (c) {
+      var best = 0, bd = Math.abs(c.amountX - columns[0].x);
+      for (var ci = 1; ci < columns.length; ci++) {
+        var dd = Math.abs(c.amountX - columns[ci].x);
+        if (dd < bd) { bd = dd; best = ci; }
+      }
+      c.colIdx = best;
+    });
+
+    // Pass 3: header words above the first candidate block, attributed to
+    // the nearest amount column by x position.
+    var first = candidates[0];
+    var colVotes = columns.map(function () { return { pos: 0, neg: 0 }; });
+    var headerWordsSeen = false;
+    for (var hi = Math.max(0, first.lineIdx - 5); hi < first.lineIdx; hi++) {
+      var hl = lines[hi];
+      if (!hl || hl.page !== first.page) continue;
+      var words = hl.text.split(/\s+/);
+      var woff = 0;
+      for (var wi = 0; wi < words.length; wi++) {
+        var w = words[wi];
+        var wStart = hl.text.indexOf(w, woff);
+        woff = wStart + w.length;
+        var pol = genericWordPolarity(w.replace(/[^a-z]/gi, ''));
+        if (!pol) continue;
+        headerWordsSeen = true;
+        var wx = genericSpanCenterX(hl, wStart, wStart + w.length);
+        if (wx === null) continue;
+        var bc = 0, bdist = Math.abs(wx - columns[0].x);
+        for (var cj = 1; cj < columns.length; cj++) {
+          var ddx = Math.abs(wx - columns[cj].x);
+          if (ddx < bdist) { bdist = ddx; bc = cj; }
+        }
+        if (pol > 0) colVotes[bc].pos++; else colVotes[bc].neg++;
+      }
+    }
+    var colSigns = [], headerClear = false;
+    for (var si = 0; si < columns.length; si++) {
+      var v = colVotes[si];
+      if (v.neg > v.pos) { colSigns.push(-1); headerClear = true; }
+      else if (v.pos > v.neg) { colSigns.push(1); headerClear = true; }
+      else colSigns.push(si === 0 ? 1 : -1); // positional default
+    }
+    if (columns.length >= 2) {
+      if (headerClear && headerWordsSeen) {
+        warnings.push('sign convention inferred from column headers — please spot-check');
+      } else {
+        warnings.push('amount columns have no clear headers — positional sign assumed (left positive, right negative), rows flagged for review');
+      }
+    } else {
+      warnings.push('single amount column: bare amounts read as charges (positive); - / ( ) / CR / DR read as credits (negative) — please spot-check');
+    }
+
+    // Pass 4: rows with sign + confidence.
+    var rows = [], lowCount = 0;
+    for (var ri = 0; ri < candidates.length; ri++) {
+      var c = candidates[ri];
+      var av = genericAmountToMinor(c.amtTok.text);
+      if (!av) { skippedUndated++; continue; }
+      var colSign = colSigns[c.colIdx] || 1;
+      var signed, signBasis;
+      if (av.explicit) { signed = av.minor; signBasis = 'explicit'; }
+      else if (columns.length === 1) { signed = Math.abs(av.minor); signBasis = 'default'; }
+      else { signed = colSign * Math.abs(av.minor); signBasis = headerClear ? 'header' : 'assumed'; }
+
+      var conf = 'high', notes = [];
+      if (!c.description) { conf = 'low'; notes.push('empty description'); }
+      if (c.dateTok.ambiguous) {
+        conf = 'low';
+        notes.push('ambiguous date (day/month order uncertain) — read as ' + c.dateInferred);
+      }
+      if (signBasis === 'assumed') {
+        conf = 'low';
+        notes.push('ambiguous sign — no header or marker; assumed ' + (signed < 0 ? 'negative' : 'positive'));
+      } else if (signBasis === 'header' || signBasis === 'default') {
+        if (conf !== 'low') conf = 'medium';
+        notes.push(signBasis === 'header' ? 'sign from column headers — spot-check'
+                                          : 'single amount column — positive assumed, spot-check');
+      }
+      if (columnsUnclear) {
+        conf = 'low';
+        notes.push('amount column unclear');
+      }
+      var confidenceNote = notes.length ? notes.join('; ') : 'heuristic read, all markers clear';
+      if (conf === 'low') lowCount++;
+
+      rows.push({
+        rawDateText: c.dateTok.text,
+        rawDescription: c.description,
+        rawAmountText: c.amtTok.text,
+        rawCurrency: 'CAD',
+        signedAmountMinor: signed,
+        dateInferred: c.dateInferred,
+        pageNumber: c.page,
+        rowIndex: rows.length,
+        confidence: conf,
+        confidenceNote: confidenceNote
+      });
+    }
+    if (skippedUndated) {
+      warnings.push(skippedUndated + ' line(s) with a date and amount could not be placed and were skipped');
+    }
+    if (lowCount) {
+      warnings.push(lowCount + ' of ' + rows.length + ' rows are low-confidence and need review');
+    }
+
+    return {
+      format: 'generic_statement',
+      templateId: GENERIC.templateId,
+      institution: GENERIC.institution,
+      rows: rows,
+      meta: meta,
+      warnings: warnings
+    };
+  };
+
+  // Expose for tests (not part of the app contract).
+  Parsers._internals.parseGeneric = Parsers.parseGeneric;
+  Parsers._internals.genericAmountToMinor = genericAmountToMinor;
+  Parsers._internals.genericFindDates = genericFindDates;
+
+  /* ================================================================== */
   /* Top-level PDF driver                                                 */
   /* ================================================================== */
 
   /**
-   * Parsers.parsePdf(arrayBuffer, pdfjsLib) ->
-   *   Promise<{format, templateId, institution, rows, meta}>.
-   * Rows follow the raw-row contract (see file header). Raises an Error
-   * naming the problem when the format is unsupported or any
-   * transaction-table line could not be parsed (no silent drops).
+   * Parsers.parsePdf(arrayBuffer, pdfjsLib, onProgress) ->
+   *   Promise<{format, templateId, institution, rows, meta, warnings?}>.
+   * Rows follow the raw-row contract (see file header). The two validated
+   * templates are tried first; anything else falls back to the generic
+   * heuristic parser. onProgress(page, numPages) is optional and is
+   * called once per extracted page. Raises an Error naming the problem
+   * when the PDF has no readable statement content.
    */
-  Parsers.parsePdf = async function (arrayBuffer, pdfjsLib) {
+  Parsers.parsePdf = async function (arrayBuffer, pdfjsLib, onProgress) {
     if (!pdfjsLib || typeof pdfjsLib.getDocument !== 'function') {
       throw new Error('PDF engine not loaded.');
     }
@@ -902,7 +1465,7 @@
       data: data, useWorkerFetch: false, isEvalSupported: false
     }).promise;
     try {
-      var frags = await Parsers.collectItems(pdf);
+      var frags = await Parsers.collectItems(pdf, null, onProgress);
       // Detect on page-1 lines rebuilt in reading order (pdf.js emits one
       // word per item on some statements, so raw fragments never contain
       // multi-word markers like "statement date").
@@ -911,9 +1474,14 @@
       var firstPageText = detectLines.map(function (l) { return l.text; }).join('\n');
       var format = Parsers.detectFormat(firstPageText);
       if (!format) {
-        throw new Error('Unsupported PDF statement: not a recognized format. ' +
-          'Gate 1 supports President\u2019s Choice Financial Mastercard and ' +
-          'CIBC Costco World Mastercard statements.');
+        var generic = Parsers.parseGeneric(frags);
+        if (generic.noStatement) {
+          var n = generic.pageCount || 0;
+          throw new Error('This PDF doesn\'t look like a bank or credit-card ' +
+            'statement we can read: found ' + n + ' pages but no lines with ' +
+            'both a date and an amount.');
+        }
+        return generic;
       }
       var P = format === 'pc_financial' ? PC : CIBC;
       var lines = P.extractLines(frags);
@@ -937,7 +1505,6 @@
       if (pdf && pdf.destroy) { try { await pdf.destroy(); } catch (e) { /* ignore */ } }
     }
   };
-
   // Expose global (ES2019-safe global lookup; mirrors engine.js).
   var _g = (typeof window !== 'undefined') ? window
          : (typeof global !== 'undefined') ? global
