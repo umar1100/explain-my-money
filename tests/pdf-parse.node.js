@@ -20,6 +20,9 @@ const PRIVATE_DIR = process.env.EMM_PRIVATE_PDF_DIR || '';
 const PRIVATE_PDFS = [
   ['PC Financial Mastercard', 'statement.pdf', { format: 'pc_financial', templateId: 'pc_world_elite_mc_v1', rows: 117 }],
   ['CIBC Costco World Mastercard', 'Account_Statement.pdf', { format: 'cibc_costco', templateId: 'cibc_costco_world_mc_v1', rows: 54 }],
+  // Unknown layout: parsed by the generic layout-inference engine
+  // (format generic_statement / template generic_statement_v1).
+  ['Triangle Mastercard (generic layout)', 'eStatement_August2026_EN.pdf', { format: 'generic_statement', templateId: 'generic_statement_v1', rows: 1 }],
 ];
 
 /* ---------- load engine.js + parsers.js into a DOM-less sandbox ---------- */
@@ -28,7 +31,7 @@ sandbox.window = sandbox;
 sandbox.global = sandbox;
 sandbox.self = sandbox;
 vm.createContext(sandbox);
-for (const f of ['js/engine.js', 'js/parsers.js']) {
+for (const f of ['js/engine.js', 'js/generic-table.js', 'js/parsers.js']) {
   vm.runInContext(fs.readFileSync(path.join(WEB, f), 'utf8'), sandbox, { filename: f });
 }
 const Engine = sandbox.Engine;
@@ -175,7 +178,10 @@ async function testFile(label, pdfPath, expected) {
   check('generic: closing balance meta', g2.meta.reported_end_balance_minor === 83817,
     'got ' + g2.meta.reported_end_balance_minor);
   check('generic: explicit-marker row is high confidence', g2.rows[3].confidence === 'high', 'got ' + g2.rows[3].confidence);
-  check('generic: header-derived rows are medium', g2.rows[0].confidence === 'medium', 'got ' + g2.rows[0].confidence);
+  // The layout-inference engine names explicit charge/payment columns
+  // with high confidence (0.85+); the old line heuristic only reached
+  // medium here. Confidence follows the engine's validated model.
+  check('generic: header-derived rows are high', g2.rows[0].confidence === 'high', 'got ' + g2.rows[0].confidence);
   check('generic: warnings recorded', Array.isArray(g2.warnings) && g2.warnings.length >= 3,
     'got ' + (g2.warnings || []).length);
   check('generic: onProgress called per page', progCalls.length === 1 && progCalls[0][0] === 1 && progCalls[0][1] === 1,
@@ -208,7 +214,8 @@ async function testFile(label, pdfPath, expected) {
   check('single-col: explicit rows high confidence',
     g1.rows[1].confidence === 'high' && g1.rows[2].confidence === 'high',
     JSON.stringify(g1.rows.map((r) => r.confidence)));
-  check('single-col: bare row medium confidence', g1.rows[0].confidence === 'medium',
+  // Single amount column under a confirmed header: high confidence.
+  check('single-col: bare row high confidence', g1.rows[0].confidence === 'high',
     'got ' + g1.rows[0].confidence);
   check('single-col: ISO dates kept', g1.rows[0].dateInferred === '2026-04-02', 'got ' + g1.rows[0].dateInferred);
 
@@ -253,8 +260,12 @@ async function testFile(label, pdfPath, expected) {
   check('balance-col: transaction amounts (not running balance)',
     JSON.stringify(bal.rows.map((r) => r.signedAmountMinor)) === '[4567,-20000]',
     JSON.stringify(bal.rows.map((r) => r.signedAmountMinor)));
-  check('balance-col: warning names balance exclusion',
-    bal.warnings.some((w) => /running balance/.test(w)), JSON.stringify(bal.warnings));
+  // The engine header-anchors the Amount column, so running-balance
+  // figures can never leak into rows: the raw amount text must be the
+  // Amount column's values, not the Balance column's.
+  check('balance-col: raw amounts are the Amount column values',
+    JSON.stringify(bal.rows.map((r) => r.rawAmountText)) === '["45.67","-200.00"]',
+    JSON.stringify(bal.rows.map((r) => r.rawAmountText)));
 
   // Non-statement PDF: friendly error, not a technical dump.
   const menu = [[

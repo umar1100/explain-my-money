@@ -179,17 +179,27 @@ async function main() {
   E.applyRules([userRow], rules);
   ok(userRow.kind === 'purchase', 'applyRules never overrides user corrections');
 
-  // --- correction: category -> app-level rule (Engine is kind-only) ---
+  // --- correction: category -> Engine-built category rule (flat shape) ---
+  // LOBLAWS auto-categorized to 'groceries' at import (categorySource=auto),
+  // so we correct to a different value; correcting to the same value is a
+  // deliberate no-op (no offer, no rule).
   const loblaws = txns.find((t) => /LOBLAWS/.test(t.rawDescription));
-  await App.applyCorrection(loblaws.id, 'category', 'groceries');
-  ok(App.state.ruleOffer && App.state.ruleOffer.rule === null, 'category correction offers app-level rule (no Engine rule)');
+  ok(loblaws && loblaws.category === 'groceries' && loblaws.categorySource === 'auto',
+    'LOBLAWS auto-categorized at import', loblaws && { c: loblaws.category, s: loblaws.categorySource });
+  await App.applyCorrection(loblaws.id, 'category', 'dining');
+  const offer2 = App.state.ruleOffer;
+  ok(offer2 && offer2.rule && offer2.rule.kind === null && offer2.rule.category === 'dining',
+    'category correction offers an Engine category rule (kind=null, category=dining)', offer2 && offer2.rule);
+  ok(offer2 && offer2.appMatch && offer2.appMatch.setCategory === 'dining', 'category offer keeps appMatch payload', offer2 && offer2.appMatch);
   await App.Actions['confirm-rule']();
   const rules2 = await Store.all('householdRules');
   ok(rules2.length === 2, 'category rule stored');
   const cr = rules2.find((x) => x.ruleType === 'category');
-  ok(cr && cr.kind === null && cr.appMatch && cr.appMatch.setCategory === 'groceries', 'category rule shape', cr);
+  ok(cr && cr.kind === null && cr.category === 'dining' && cr.appMatch && cr.appMatch.setCategory === 'dining',
+    'category rule stored flat (category) + legacy appMatch.setCategory', cr);
   const loblawsAfter = await Store.get('txns', loblaws.id);
-  ok(loblawsAfter.category === 'groceries', 'txn.category set (V9 field)');
+  ok(loblawsAfter.category === 'dining' && loblawsAfter.categorySource === 'user',
+    'user correction stamps categorySource=user', loblawsAfter && { c: loblawsAfter.category, s: loblawsAfter.categorySource });
 
   // --- correction: excluded uses 1/0 and counts in reconcile ---
   await App.applyCorrection(loblaws.id, 'excluded', 1);
