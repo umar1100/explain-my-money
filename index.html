@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- Mobile viewport: no zoom traps, respects safe areas -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#1a5c3f">
+  <meta name="description" content="Explain My Money — know where your money went, without connecting your bank. All processing happens on this device.">
+  <title>Explain My Money</title>
+  <!-- PWA / iOS install -->
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="My Money">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <noscript>
+    <p style="padding:2rem;font-family:system-ui">Explain My Money needs JavaScript to run its on-device pipeline. No data ever leaves this device.</p>
+  </noscript>
+
+  <div id="app" class="app" aria-live="off">
+    <header class="topbar" id="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <!-- inline SVG: simple ledger/coin mark, no external assets -->
+          <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <circle cx="12" cy="12" r="9"/>
+            <path d="M12 7v10M9 9.5h6M9 14.5h6"/>
+          </svg>
+        </span>
+        <span class="brand-name">Explain My Money</span>
+      </div>
+      <span class="offline-badge" title="All financial processing happens on this device. The only network use is optional AI phrasing, sent only after you preview and approve it.">
+        <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true">
+          <rect x="5" y="10" width="14" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>
+        </svg>
+        On-device
+      </span>
+    </header>
+
+    <main id="view" class="view" tabindex="-1"></main>
+
+    <nav class="tabbar" id="tabbar" aria-label="Primary">
+      <button type="button" class="tab" data-action="tab" data-tab="month" aria-label="Your Month">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M3 9.5 12 4l9 5.5"/><path d="M5 10v10h14V10"/><path d="M9.5 15h5"/>
+        </svg>
+        <span>Month</span>
+      </button>
+      <button type="button" class="tab" data-action="tab" data-tab="statement" aria-label="Clean statement">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M6 3h9l4 4v14H6z"/><path d="M9 12h7M9 16h7M9 8h3"/>
+        </svg>
+        <span>Statement</span>
+      </button>
+      <button type="button" class="tab" data-action="tab" data-tab="plan" aria-label="Plan">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1" fill="currentColor" stroke="none"/>
+        </svg>
+        <span>Plan</span>
+      </button>
+      <button type="button" class="tab" data-action="tab" data-tab="ask" aria-label="Ask about your money">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5z"/><path d="M9.5 12h.01M12.5 12h.01M15.5 12h.01"/>
+        </svg>
+        <span>Ask</span>
+      </button>
+      <button type="button" class="tab" data-action="tab" data-tab="add" aria-label="Add statements or receipts">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/>
+        </svg>
+        <span>Add</span>
+      </button>
+      <button type="button" class="tab" data-action="tab" data-tab="more" aria-label="More: rules and privacy">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true">
+          <circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/>
+        </svg>
+        <span>More</span>
+      </button>
+    </nav>
+  </div>
+
+  <script src="vendor/pdf.min.js"></script>
+  <script src="vendor/tesseract.min.js"></script>
+  <script src="js/engine.js"></script>
+  <script src="js/parsers.js"></script>
+  <script src="js/store.js"></script>
+  <script src="js/ocr.js"></script>
+  <script src="js/llm.js"></script>
+  <script src="js/app.js"></script>
+  <script>
+    // PWA: offline shell via service worker (app itself makes zero network calls).
+    if ('serviceWorker' in navigator && /^https?:$/.test(location.protocol)) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').catch(function () {});
+      });
+    }
+  </script>
+</body>
+</html>
