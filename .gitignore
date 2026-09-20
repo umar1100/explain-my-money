@@ -1,0 +1,22 @@
+# Build/test artifacts
+tests/shots/
+*.log
+
+# Private parser specimens — NEVER commit real statements
+statement.pdf
+Account_Statement.pdf
+**/statement.pdf
+**/Account_Statement.pdf
+**/*.pdf
+!apps/web/**/*.pdf
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*~
+.vscode/
+.idea/
+
+# Local env
+.env
+node_modules/

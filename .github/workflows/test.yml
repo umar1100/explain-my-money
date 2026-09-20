@@ -1,0 +1,30 @@
+name: Engine tests
+
+on:
+  push:
+    branches: [main]
+    paths: ['apps/web/js/**', 'tests/**']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # CI runs only non-private, network-free checks. tests/pdf-parse.node.js
+      # skips its opt-in private-PDF checks unless EMM_PRIVATE_PDF_DIR is set
+      # (never set in CI), and still exits 0. tests/browser-smoke.py is a
+      # manual/local script only (needs Playwright + Chromium) and is NOT
+      # run here.
+      - name: Run engine test suites
+        run: |
+          node tests/e2e.node.js
+          node tests/pdf-parse.node.js
+          node tests/new-modules.node.js
+      - name: Syntax-check app JS (no execution)
+        run: |
+          for f in apps/web/js/*.js; do node --check "$f"; done
