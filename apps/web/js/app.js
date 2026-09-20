@@ -361,6 +361,7 @@ var App = {
     dataRev: 0,            // bumped on every txn/rule mutation; invalidates dup cache
     planView: 'budgets',   // plan tab sub-view: budgets | goals | subs
     budgetMonth: null,     // chosen budget month 'YYYY-MM' (default: latest statement period)
+    month: null,           // month tab focus 'YYYY-MM' (default: latest month with transactions)
     budgetEditId: null,    // budget id being edited (form prefill)
     goalEditId: null,      // goal id being edited (form prefill)
     planMsg: ''            // one-shot notice shown at the top of the Plan tab
@@ -453,6 +454,7 @@ App.go = function (tab, params) {
   if (params.sfilter) App.state.sfilter = params.sfilter;
   if (params.txnId !== undefined) App.state.txnId = params.txnId;
   if (params.more) App.state.more = params.more;
+  if (params.month) App.state.month = params.month;
   if (params.askQ !== undefined) { App.state.askQ = params.askQ; App.state.askText = params.askText || ''; }
   App.render();
   var v = $('#view');
@@ -519,6 +521,7 @@ App.Actions['goto'] = function (d) {
   if (d.addview) App.state.addView = d.addview; // Add sub-views: home|preview|processing|receipts
   App.go(d.tab, { statementId: d.sid || undefined, sfilter: d.filter || undefined,
                   txnId: ('txn' in d && d.txn != null) ? d.txn : null,
+                  month: d.month || undefined,
                   more: d.more || undefined });
 };
 App.Actions['open-txn'] = function (d) { App.go('statement', { txnId: d.id }); };
@@ -1650,33 +1653,33 @@ App.stageMatch = async function (pipe) {
 };
 
 App.stageAllocate = async function (pipe) {
-  App.setStage('allocate', 'running', 'allocating…');
-  var rules = (await enabledRules()).filter(function (r) { return r.ruleType === 'category' && r.appMatch; });
-  var byCat = {};
+  App.setStage('allocate', 'running', 'categorizing…');
+  var rules = await enabledRules();
+  // No silent fallback: if the Engine fails, the stage fails loudly and the
+  // pipeline aborts. Engine.autoCategorize: household rules with a category
+  // win first, then built-in Canadian-merchant keyword suggestions (>= 0.6),
+  // never overwriting user-set categories. Blank stays blank (honest).
+  Engine.autoCategorize(pipe.txns, rulePayloads(rules));
+  var byCat = {}, bySource = {};
+  pipe.txns.forEach(function (t) {
+    if (t.category) byCat[t.category] = (byCat[t.category] || 0) + 1;
+    var src = t.categorySource || 'none';
+    bySource[src] = (bySource[src] || 0) + 1;
+  });
   pipe.allocations = pipe.txns.map(function (t, i) {
-    // V8: the Engine's categoryKeyFor falls back to the merchant name when
-    // r.category is empty — so we ONLY stamp a category when a household
-    // rule actually matched. Stamping 'uncategorized' everywhere would
-    // collapse the whole briefing into one bucket.
-    var catId = null, basis = 'default: no category rule matched';
-    if (t.kind === 'purchase' || t.kind === 'cash_advance') {
-      var mr = String(t.merchantRaw || t.rawDescription || '').toLowerCase();
-      for (var ri = 0; ri < rules.length; ri++) {
-        var sub = String(rules[ri].appMatch.merchantContains || '').toLowerCase();
-        if (sub && mr.indexOf(sub) !== -1) { catId = rules[ri].appMatch.setCategory; basis = 'household rule #' + rules[ri].id; break; }
-      }
-    } else { basis = 'n/a: not spend'; }
-    if (catId) byCat[catId] = (byCat[catId] || 0) + 1;
-    // V9: the txn category field is `category` on the W1 schema (null = unset).
-    t.category = catId;
     var amt = t.spendAmountMinor;
     if (amt === null || amt === undefined) amt = t.amountMinor;
-    return { rowIndex: i, categoryId: catId, amountMinor: amt, basis: basis };
+    return { rowIndex: i, categoryId: t.category || null, amountMinor: amt,
+             basis: t.categoryReason || 'default: no category matched' };
   });
-  var detail = '<ul>' + Object.keys(byCat).map(function (c) {
+  var nCat = Object.keys(byCat).length;
+  var detail = '<ul>' + Object.keys(byCat).sort().map(function (c) {
     return '<li><strong>' + byCat[c] + '</strong> → ' + esc(catName(c)) + '</li>';
-  }).join('') + '</ul><p class="small">Change any transaction\'s category in the statement view — you can turn a correction into a reusable rule.</p>';
-  App.setStage('allocate', 'done', Object.keys(byCat).length + ' categories used', detail || '<p class="small">No spend to allocate.</p>');
+  }).join('') + '</ul>' +
+    '<p class="small">' + (bySource.rule || 0) + ' by household rule · ' +
+    (bySource.auto || 0) + ' automatic · ' + (bySource.user || 0) + ' kept from your corrections.</p>' +
+    '<p class="small">Change any transaction\'s category in the statement view — you can turn a correction into a reusable rule.</p>';
+  App.setStage('allocate', 'done', nCat + ' categories used', nCat ? detail : '<p class="small">No spend to categorize.</p>');
 };
 
 App.stageReconcile = async function (pipe) {
@@ -1950,27 +1953,41 @@ App.vReceiptsThumbs = function (v, receipts) {
   });
 };
 
+/** Pure receipt-coverage math over an explicit txn list + confirmed
+ * matches: ratio of gross purchase spend with a confirmed receipt. */
+App.coverageOfTxns = function (txns, matches) {
+  var gross = 0;
+  (txns || []).forEach(function (t) {
+    if ((t.kind === 'purchase' || t.kind === 'cash_advance') && !t.excluded)
+      gross += Math.abs(t.spendAmountMinor != null ? t.spendAmountMinor : (t.amountMinor || 0));
+  });
+  var txnById = {};
+  (txns || []).forEach(function (t) { txnById[String(t.id)] = t; });
+  var matched = 0;
+  (matches || []).forEach(function (m) {
+    var t = txnById[String(m.txnId)];
+    if (t) matched += Math.abs(t.spendAmountMinor != null ? t.spendAmountMinor : (t.amountMinor || 0));
+  });
+  return { ratio: gross > 0 ? Math.min(1, matched / gross) : 0, matchedMinor: matched, grossMinor: gross };
+};
+
 App.receiptCoverage = async function () {
   var stmts = await sAll('statements');
   if (!stmts.length) return { ratio: 0, matchedMinor: 0, grossMinor: 0, scopeLabel: '' };
   stmts.sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
   var st = stmts[0];
   var txns = await sQuery('txns', 'statementId', st.id);
-  var gross = 0;
-  txns.forEach(function (t) {
-    if ((t.kind === 'purchase' || t.kind === 'cash_advance') && !t.excluded)
-      gross += Math.abs(t.spendAmountMinor != null ? t.spendAmountMinor : (t.amountMinor || 0));
-  });
   var matches = (await sAll('matches')).filter(function (m) { return m.status === 'confirmed'; });
-  var txnById = {};
-  txns.forEach(function (t) { txnById[String(t.id)] = t; });
-  var matched = 0;
-  matches.forEach(function (m) {
-    var t = txnById[String(m.txnId)];
-    if (t) matched += Math.abs(t.spendAmountMinor != null ? t.spendAmountMinor : (t.amountMinor || 0));
-  });
-  return { ratio: gross > 0 ? Math.min(1, matched / gross) : 0, matchedMinor: matched, grossMinor: gross,
-           scopeLabel: st.scopeLabel || st.periodLabel };
+  var cov = App.coverageOfTxns(txns, matches);
+  cov.scopeLabel = st.scopeLabel || st.periodLabel;
+  return cov;
+};
+
+/** Month-scoped receipt coverage over an explicit txn list (all accounts,
+ * selected month only). Matches can only attach to txns in the list. */
+App.receiptCoverageFor = async function (txns) {
+  var matches = (await sAll('matches')).filter(function (m) { return m.status === 'confirmed'; });
+  return App.coverageOfTxns(txns, matches);
 };
 
 var pendingReceiptBlob = null;
@@ -2164,6 +2181,35 @@ var SFILTERS = [
   ['uncertain', 'Uncertain'], ['excluded', 'Excluded']
 ];
 
+/** A spend row (purchase/refund) with no category: it belongs in the review
+ * queue ("Needs a category") while staying in its kind tab. Excluded and
+ * duplicate rows are never flagged. */
+function needsCategory(t) {
+  t = t || {};
+  var k = t.kind || 'uncertain';
+  if (k !== 'purchase' && k !== 'refund') return false;
+  var cat = (t.category !== null && t.category !== undefined && t.category !== '')
+    ? t.category : (t.categoryId || null);
+  if (cat) return false;
+  if (t.excluded) return false;
+  if (t.status === 'duplicate') return false;
+  return true;
+}
+
+/** Review-queue rows for a txn list: uncertain kinds, needs_review row
+ * confidence, row errors, and uncategorized spend — deduplicated, so an
+ * uncategorized purchase with needs_review confidence counts once. */
+App.reviewTxns = function (txns) {
+  var seen = {}, out = [];
+  (txns || []).forEach(function (t) {
+    if (t.kind === 'uncertain' || t.confidence === 'needs_review' || t._error || needsCategory(t)) {
+      var k = String(t.id);
+      if (!seen[k]) { seen[k] = 1; out.push(t); }
+    }
+  });
+  return out;
+};
+
 /** Map the Engine's reconcile balanceCheck for statements that carry no
  * reported baseline (CSV imports, manual-entry scopes): the Engine reports
  * 'no_baseline', which the UI presents as 'unavailable' — the check cannot
@@ -2221,6 +2267,7 @@ App.vStatement = async function (v, seq) {
   txns.forEach(function (t) {
     var k = txnTab(t); counts[k]++;
     if (k === 'uncertain' || k === 'duplicates') counts.review++;
+    else if (needsCategory(t)) counts.review++; // uncategorized spend also needs a human look
   });
 
   var html = '<h1>Statement</h1>';
@@ -2343,6 +2390,7 @@ App.txnRowHtml = function (t) {
   var pills = '';
   if (t.status === 'duplicate') pills += ' <span class="pill bad">duplicate</span>';
   else if (t.kind === 'uncertain' || t.confidence === 'needs_review') pills += ' <span class="pill warn">review</span>';
+  if (needsCategory(t)) pills += ' <span class="pill warn">no category</span>';
   if (t.excluded && t.status !== 'duplicate') pills += ' <span class="pill dim">excluded</span>';
   if (t.splits && t.splits.length) pills += ' <span class="pill dim">split</span>';
   return '<button class="txn" data-action="open-txn" data-id="' + esc(t.id) + '">' +
@@ -2357,7 +2405,12 @@ App.txnListHtml = function (txns, filter, counts, limit) {
   if (filter === 'review') {
     var pairs = App.dupPairs();
     var unc = txns.filter(function (t) { return txnTab(t) === 'uncertain'; });
-    if (!pairs.length && !unc.length)
+    // Every uncategorized spend row belongs in the "Needs a category"
+    // section — even when it is also kind-uncertain (the common case: kind
+    // confidence 'needs_review' puts purchases in the uncertain tab). Rows
+    // shown there are not repeated in the plain uncertain list below.
+    var noCat = txns.filter(function (t) { return needsCategory(t); });
+    if (!pairs.length && !unc.length && !noCat.length)
       return '<div class="empty">Nothing needs review. 🎉</div>';
     html += '<p class="small"><strong>Review queue</strong> — resolve only what is material. ' +
       'Each fix can become a reusable rule.</p>';
@@ -2373,9 +2426,19 @@ App.txnListHtml = function (txns, filter, counts, limit) {
           '<button class="btn ghost smallbtn" data-action="dup-markdup" data-id="' + esc(b.id) + '" data-other="' + esc(a.id) + '">Mark as duplicate</button></div>' +
         '</div><button class="btn ghost smallbtn" data-action="dup-keep" data-a="' + esc(a.id) + '" data-b="' + esc(b.id) + '">Keep both — not duplicates</button></div>';
     });
-    var upg = App._paginate(unc, limit);
+    var uncRest = unc.filter(function (t) { return !needsCategory(t); });
+    var upg = App._paginate(uncRest, limit);
     upg.rows.forEach(function (t) { html += App.txnRowHtml(t); });
     if (upg.remaining) html += App._moreBtn(upg.remaining);
+    if (noCat.length) {
+      html += '<p class="small" style="margin-top:14px"><strong>Needs a category</strong> — ' +
+        noCat.length + ' purchase' + (noCat.length === 1 ? '' : 's') +
+        ' couldn\u2019t be categorized automatically. Tap one and choose its category, or run ' +
+        'Auto-categorize under More.</p>';
+      var ncg = App._paginate(noCat, limit);
+      ncg.rows.forEach(function (t) { html += App.txnRowHtml(t); });
+      if (ncg.remaining) html += App._moreBtn(ncg.remaining);
+    }
     return html;
   }
   if (filter === 'search') {
@@ -2504,8 +2567,17 @@ App.vTxnDetail = async function (v, seq) {
   if (App.state.ruleOffer && String(App.state.ruleOffer.txnId) === String(t.id)) {
     var off = App.state.ruleOffer;
     html += '<div class="card" style="border-color:var(--accent)"><h3 style="margin-top:0">Make this a rule?</h3>' +
-      '<p>' + esc(off.scopeDescription || 'This correction can be reused.') + '</p>' +
-      '<p class="small">The rule will apply to <strong>future imports</strong> automatically. You can disable or delete it any time under More → Rules.</p>' +
+      '<p>' + esc(off.scopeDescription || 'This correction can be reused.') + '</p>';
+    if (off.field === 'category') {
+      // Category corrections: let the user pick the rule's category before
+      // saving (the txn already got the chosen one via the detail form).
+      html += '<label class="f" for="rule-cat-sel">Category this rule will apply</label>' +
+        '<select id="rule-cat-sel" data-change="rule-cat-select">' +
+        App.categories.map(function (c) {
+          return '<option value="' + esc(c.id) + '"' + (String(off.newValue) === String(c.id) ? ' selected' : '') + '>' + esc(c.name) + '</option>';
+        }).join('') + '</select>';
+    }
+    html += '<p class="small">The rule will apply to <strong>future imports</strong> automatically. You can disable or delete it any time under More → Rules.</p>' +
       '<div class="btn-row"><button class="btn" data-action="confirm-rule">Save rule</button>' +
       '<button class="btn ghost" data-action="cancel-rule">Not now</button></div></div>';
   }
@@ -2660,7 +2732,14 @@ App.applyCorrection = async function (txnId, field, newValue) {
     t.kind = newValue;
     t.classificationSource = 'user'; // V4: applyRules never overrides user corrections
   }
-  else if (field === 'category') t.category = newValue;
+  else if (field === 'category') {
+    t.category = newValue;
+    // A user-set category is sacred: autoCategorize and applyRules never
+    // overwrite it (categorySource==='user'), and backfill skips it.
+    t.categorySource = 'user';
+    t.categoryConfidence = 1.0;
+    t.categoryReason = 'set by user';
+  }
   else if (field === 'excluded') t.excluded = newValue ? 1 : 0; // V7: reconcile checks ===1
   if (t.status === 'new') t.status = 'reviewed';
   await Store.put('txns', t); // put() with an existing id upserts
@@ -2671,8 +2750,9 @@ App.applyCorrection = async function (txnId, field, newValue) {
   audit('correction.applied', 'txn', txnId, { field: field, oldValue: corr.oldValue, newValue: corr.newValue });
 
   // Offer a reusable household rule for future imports.
-  // V5: the Engine builds KIND rules only (makeRuleFromCorrection throws
-  // otherwise). Category rules are app-level (we own category assignment).
+  // The Engine builds BOTH kind and category rules via makeRuleFromCorrection
+  // (deterministic ids; category folded into the id hash). App-owned
+  // appMatch payloads travel alongside for UI scope text and the dropdown.
   var pastRows = await sQuery('txns', 'statementId', t.statementId);
   var core = merchantCore(t.merchantRaw || t.rawDescription);
   var offer = null;
@@ -2690,10 +2770,18 @@ App.applyCorrection = async function (txnId, field, newValue) {
       }
     } catch (e) { offer = null; }
   } else if (field === 'category') {
-    offer = { correctionId: corrId, txnId: txnId, field: field,
-      oldValue: corr.oldValue, newValue: corr.newValue, rule: null,
-      scopeDescription: 'Future rows from "' + core + '" will get the category "' + catName(newValue) + '".',
-      appMatch: { merchantContains: core, field: field, setCategory: newValue } };
+    try {
+      var resC = Engine.makeRuleFromCorrection(
+        { merchantRaw: t.merchantRaw || t.rawDescription, category: newValue,
+          label: 'Category: ' + catName(newValue) + ' — ' + core },
+        pastRows);
+      if (resC && resC.rule) {
+        offer = { correctionId: corrId, txnId: txnId, field: field,
+          oldValue: corr.oldValue, newValue: corr.newValue,
+          rule: resC.rule, scopeDescription: resC.scopeDescription,
+          appMatch: { merchantContains: resC.rule.matchMerchant || core, field: field, setCategory: newValue } };
+      }
+    } catch (e) { offer = null; }
   }
   App.state.ruleOffer = offer;
   App.render();
@@ -2724,12 +2812,30 @@ App.Actions['confirm-kind'] = function (d) {
 };
 
 App.Actions['make-rule'] = function () { /* offer renders automatically after a correction */ };
+/** Change the pending category rule's category before saving it. The
+ * Engine rule is rebuilt so its deterministic id folds in the new
+ * category; the appMatch payload keeps the UI scope text in sync. */
+App.Changes['rule-cat-select'] = function (el) {
+  var off = App.state.ruleOffer;
+  if (!off || off.field !== 'category' || !el.value) return;
+  off.newValue = el.value;
+  try {
+    var res = Engine.makeRuleFromCorrection(
+      { merchantRaw: off.appMatch.merchantContains, category: el.value,
+        label: 'Category: ' + catName(el.value) + ' — ' + off.appMatch.merchantContains },
+      []);
+    if (res && res.rule) { off.rule = res.rule; off.scopeDescription = res.scopeDescription; }
+  } catch (e) { /* keep the previous offer on rebuild failure */ }
+  off.appMatch.setCategory = el.value;
+  App.render();
+};
 App.Actions['confirm-rule'] = async function () {
   var off = App.state.ruleOffer;
   if (!off) return;
   // V4/V9: store FLAT in the Engine's applyRules shape {id, enabled,
-  // priority, matchMerchant, kind, label} + our metadata. Deterministic ids
-  // make re-saving the same rule an upsert, not a duplicate.
+  // priority, matchMerchant, kind, category, label} + our metadata.
+  // Deterministic ids (Engine.makeRuleFromCorrection) make re-saving the
+  // same rule an upsert, not a duplicate.
   var ruleId = (off.rule && off.rule.id) ||
     ('catrule_' + sha256Hex(off.appMatch.merchantContains + '|' + off.newValue).slice(0, 16));
   var rec = {
@@ -2738,6 +2844,11 @@ App.Actions['confirm-rule'] = async function () {
     priority: (off.rule && off.rule.priority) || 100,
     matchMerchant: (off.rule && off.rule.matchMerchant) || off.appMatch.merchantContains,
     kind: (off.rule && off.rule.kind) || null,
+    // Category rides on the flat rule record: Engine.applyRules and
+    // Engine.autoCategorize both honor it (rule.category wins over
+    // built-in suggestions). Legacy appMatch.setCategory is kept for
+    // already-stored rules; ruleCategoryOf() reads both.
+    category: (off.rule && off.rule.category) || (off.field === 'category' ? off.newValue : null),
     label: (off.rule && off.rule.label) || ('Category: ' + catName(off.newValue)),
     source: 'correction',
     createdAt: Date.now(),
@@ -2805,9 +2916,12 @@ function lastNMonths(anchor, n) {
 
 /** Trends section: last 6 calendar months ending at the latest statement's
  * periodEnd (else the current month), via pure Engine.monthlyNetSpend. */
-App.trendsHtml = async function () {
+/** Net-spend trend chart. monthAnchor: 'YYYY-MM' to end the 6-month window
+ * at (Month tab, month-scoped); defaults to the Plan/statement default. */
+App.trendsHtml = async function (monthAnchor) {
   var stmts = await sAll('statements');
-  var anchor = App.defaultBudgetMonth(stmts);
+  var anchor = (/^\d{4}-\d{2}$/.test(monthAnchor || ''))
+    ? monthAnchor : App.defaultBudgetMonth(stmts);
   var windowMonths = lastNMonths(anchor, 6);
   var monthly = [];
   try { monthly = Engine.monthlyNetSpend(await sAll('txns')) || []; } catch (e) { monthly = []; }
@@ -2890,12 +3004,13 @@ App.drawTrends = function (canvas, data) {
   });
 };
 
-/** Top-3 month-over-month movers: latest full month vs the previous one,
+/** Top-3 month-over-month movers: monthAnchor vs the previous month,
  * per-category spend deltas from split-aware totals. Categories at zero in
  * both months are skipped. */
-App.moversHtml = async function () {
+App.moversHtml = async function (monthAnchor) {
   var stmts = await sAll('statements');
-  var anchor = App.defaultBudgetMonth(stmts); // latest statement's period month
+  var anchor = (/^\d{4}-\d{2}$/.test(monthAnchor || ''))
+    ? monthAnchor : App.defaultBudgetMonth(stmts); // latest statement's period month
   var prev = prevMonthOf(anchor);
   var txns = await sAll('txns');
   var curT = {}, prevT = {};
@@ -2930,13 +3045,16 @@ App.moversHtml = async function () {
   return html;
 };
 
-/** Budgets summary card for App.state.budgetMonth (or the Plan default):
+/** Budgets summary card for monthOverride (Month tab, month-scoped), else
+ * App.state.budgetMonth (Plan tab's chosen month) or the Plan default:
  * "X of Y on track" (on track = spent <= limit, split-aware). Hidden when
  * the month has no budgets. */
-App.budgetSummaryHtml = async function () {
+App.budgetSummaryHtml = async function (monthOverride) {
   var stmts = await sAll('statements');
-  var month = App.state.budgetMonth && /^\d{4}-\d{2}$/.test(App.state.budgetMonth)
-    ? App.state.budgetMonth : App.defaultBudgetMonth(stmts);
+  var month = (/^\d{4}-\d{2}$/.test(monthOverride || ''))
+    ? monthOverride
+    : (App.state.budgetMonth && /^\d{4}-\d{2}$/.test(App.state.budgetMonth)
+      ? App.state.budgetMonth : App.defaultBudgetMonth(stmts));
   var budgets = (await sAll('budgets')).filter(function (b) { return b.month === month; });
   if (!budgets.length) return '';
   var txns = await sAll('txns');
@@ -2952,76 +3070,205 @@ App.budgetSummaryHtml = async function () {
     '<p class="small" style="margin-bottom:0">' + esc(fmtPeriod(month)) + ' budgets — spent vs limit, split-aware.</p></div>';
 };
 
+/* ============================================================================
+ * Screen 5 — Your Month (home after first import)
+ * An OVERALL month view: aggregates ALL non-excluded transactions whose
+ * date falls in the chosen calendar month (date prefix 'YYYY-MM', NOT
+ * statement periods — periods span month boundaries), across every
+ * statement on the device. Sections are the same honest building blocks
+ * (Engine.buildBriefing / reconcile / split-aware totals), now month-
+ * scoped, plus a per-account breakdown so each statement's contribution
+ * and balance-check state stay visible. The aggregate balance check is
+ * meaningless (balances never sum across accounts), so it reads
+ * 'n/a (per-account below)'.
+ * ========================================================================== */
+
+/** Sorted 'YYYY-MM' months that have at least one transaction date. */
+App.monthsWithData = function (txns) {
+  var seen = {};
+  (txns || []).forEach(function (t) {
+    var m = /^(\d{4}-\d{2})-\d{2}$/.exec(String((t && t.date) || ''));
+    if (m) seen[m[1]] = true;
+  });
+  return Object.keys(seen).sort();
+};
+
+/** Latest month present in any txn date ('YYYY-MM'), else null. */
+App.latestTxnMonth = function (txns) {
+  var months = App.monthsWithData(txns);
+  return months.length ? months[months.length - 1] : null;
+};
+
+/** Transactions whose ISO date starts with the 'YYYY-MM' prefix. */
+App.txnsInMonth = function (txns, month) {
+  return (txns || []).filter(function (t) {
+    return typeof t.date === 'string' && t.date.indexOf(month) === 0;
+  });
+};
+
+/** How a statement's period covers a calendar month:
+ * 'full' (periodStart <= month start AND periodEnd >= month end),
+ * 'partial' (period overlaps the month but doesn't cover it),
+ * 'outside' (no overlap — the statement still has txns dated in-month),
+ * 'unknown' (missing/malformed period — never guess). */
+App.statementCoverage = function (st, month) {
+  var last = Engine._monthLastDay(month);
+  var first = month + '-01';
+  if (!st || last === null) return 'unknown';
+  var ps = st.periodStart, pe = st.periodEnd;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(ps || '') || !/^\d{4}-\d{2}-\d{2}$/.test(pe || '')) return 'unknown';
+  if (ps <= first && pe >= last) return 'full';
+  if (ps <= last && pe >= first) return 'partial';
+  return 'outside';
+};
+
+App.Actions['month-prev'] = async function () {
+  var months = App.monthsWithData(await sAll('txns'));
+  var i = months.indexOf(App.state.month);
+  if (i > 0) { App.state.month = months[i - 1]; App.render(); }
+};
+App.Actions['month-next'] = async function () {
+  var months = App.monthsWithData(await sAll('txns'));
+  var i = months.indexOf(App.state.month);
+  if (i >= 0 && i < months.length - 1) { App.state.month = months[i + 1]; App.render(); }
+};
+App.Changes['month-select'] = function (el) {
+  if (/^\d{4}-\d{2}$/.test(el.value || '')) { App.state.month = el.value; App.render(); }
+};
+
 App.vMonth = async function (v, seq) {
+  var txns = await sAll('txns');
   var stmts = await sAll('statements');
-  if (!stmts.length) {
+  if (!txns.length) {
     App.show(v, seq, '<h1>Your Month</h1><div class="empty">Nothing here yet — import a statement to get your first briefing.<br><br>' +
       '<button class="btn" data-action="tab" data-tab="add">Add a statement</button></div>');
     return;
   }
-  stmts.sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
-  var st = stmts.filter(function (s) { return String(s.id) === String(App.state.statementId); })[0] || stmts[0];
-  App.state.statementId = st.id;
-  var txns = await sQuery('txns', 'statementId', st.id);
-  var briefs = (await sAll('briefings')).filter(function (b) { return String(b.statementId) === String(st.id); });
-  briefs.sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
-  var briefing = briefs[0] || null;
-  var facts = (briefing && briefing.facts) || null;
+  var months = App.monthsWithData(txns);
+  if (!App.state.month || months.indexOf(App.state.month) === -1) {
+    App.state.month = months[months.length - 1]; // default: latest month with data
+  }
+  var month = App.state.month;
+  var prev = prevMonthOf(month);
+  var lastDay = Engine._monthLastDay(month);
 
+  var mTxns = App.txnsInMonth(txns, month);
+  var pTxns = App.txnsInMonth(txns, prev);
+  var stmtById = {};
+  stmts.forEach(function (s) { stmtById[String(s.id)] = s; });
+
+  // Engine briefing over the whole month, across ALL statements.
+  var facts = null;
+  try {
+    facts = Engine.buildBriefing(mTxns, month + '-01', lastDay, pTxns.length ? pTxns : null, fmtPeriod(month), null);
+  } catch (e) { facts = null; }
   var recon = null;
-  var monthReported = (st && typeof st.reportedStartMinor === 'number' && typeof st.reportedEndMinor === 'number')
-    ? { startMinor: st.reportedStartMinor, endMinor: st.reportedEndMinor } : null;
-  try { recon = Engine.reconcile(txns, monthReported); } catch (e) { recon = null; }
-  if (!recon) recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'unavailable' };
-  recon = App.applyBalanceCheckPolicy(recon, st);
+  try { recon = Engine.reconcile(mTxns, null); } catch (e) { recon = null; }
+  if (!recon) recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'no_baseline', gapMinor: 0 };
+
+  // Contributors: statements with transactions dated in this month.
+  var byStmt = {};
+  mTxns.forEach(function (t) {
+    var k = String(t.statementId);
+    if (!byStmt[k]) byStmt[k] = [];
+    byStmt[k].push(t);
+  });
+  var contributors = Object.keys(byStmt).map(function (id) {
+    return { id: id, statement: stmtById[id] || null, txns: byStmt[id] };
+  });
+  contributors.sort(function (a, b) {
+    var ac = (a.statement && a.statement.createdAt) || 0;
+    var bc = (b.statement && b.statement.createdAt) || 0;
+    return bc - ac;
+  });
+  // Per-statement balance-check state: each statement's OWN import-time
+  // check over its full rows (stored briefing facts); statements without
+  // reported balances honestly read 'unavailable'.
+  var briefs = await sAll('briefings');
+  var latestFactsByStmt = {};
+  briefs.forEach(function (b) {
+    var k = String(b.statementId);
+    if (!latestFactsByStmt[k] || (b.createdAt || 0) > (latestFactsByStmt[k].createdAt || 0)) {
+      latestFactsByStmt[k] = { facts: b.facts, createdAt: b.createdAt || 0 };
+    }
+  });
+  contributors.forEach(function (c) {
+    var st = c.statement;
+    var hasBaseline = !!(st && typeof st.reportedStartMinor === 'number' && typeof st.reportedEndMinor === 'number');
+    var lf = latestFactsByStmt[c.id];
+    c.checkState = (hasBaseline && lf && lf.facts && lf.facts.balanceCheck) ? String(lf.facts.balanceCheck) : 'unavailable';
+    c.coverage = App.statementCoverage(st, month);
+    try { c.netMinor = Engine.reconcile(c.txns, null).netSpendMinor; } catch (e) { c.netMinor = 0; }
+  });
 
   var html = '<h1>Your Month</h1>';
-  html += '<p class="small">' + esc(st.scopeLabel || fmtPeriod(st.periodLabel)) + ' · ' + txns.length + ' transactions</p>';
 
-  // Headline: the Engine's own first line (V8 honesty rule — no final number
+  // Month navigator: back | Month Year (dropdown) | next.
+  var idx = months.indexOf(month);
+  html += '<div class="card"><div class="month-nav">' +
+    '<button class="btn ghost" data-action="month-prev" aria-label="Previous month"' + (idx <= 0 ? ' disabled' : '') + '>&#8249;</button>' +
+    '<select id="month-select" data-change="month-select" aria-label="Choose month">' +
+    months.map(function (m) {
+      return '<option value="' + m + '"' + (m === month ? ' selected' : '') + '>' + esc(fmtPeriod(m)) + '</option>';
+    }).join('') + '</select>' +
+    '<button class="btn ghost" data-action="month-next" aria-label="Next month"' + (idx >= months.length - 1 ? ' disabled' : '') + '>&#8250;</button>' +
+    '</div>';
+  // Honest coverage note: periods only partially covering the month say so.
+  var partialN = contributors.filter(function (c) { return c.coverage === 'partial'; }).length;
+  var unknownN = contributors.filter(function (c) { return c.coverage === 'unknown' || c.coverage === 'outside'; }).length;
+  var covNote = contributors.length + ' statement' + (contributors.length === 1 ? '' : 's') +
+    ' contribute' + (contributors.length === 1 ? 's' : '') + ' to ' + esc(fmtPeriod(month));
+  if (partialN) covNote += ' · ' + partialN + ' partial';
+  if (unknownN) covNote += ' · ' + unknownN + ' without a full period';
+  html += '<p class="small" style="margin-bottom:0">' + covNote + ' · ' + mTxns.length + ' transactions</p></div>';
+
+  // Headline: the Engine's own first line (honesty rule — no final number
   // while anything is unresolved), plus the net figure as a magnitude.
-  var headline = facts ? String((briefing.text || '').split('\n')[0] || '') : '';
+  var headline = '';
+  try { headline = facts ? String(Engine.renderBriefingText(facts).split('\n')[0] || '') : ''; } catch (e) { headline = ''; }
   html += '<div class="card"><div class="headline-label">Net spend after refunds</div>' +
     '<div class="headline-num">' + spendAbs(recon.netSpendMinor) + '</div>' +
-    '<p class="small" style="margin-bottom:0">' + esc(headline || ('Across ' + (st.rowCount || 0) + ' transactions in ' + fmtPeriod(st.periodLabel) + '.')) + '</p></div>';
+    '<p class="small" style="margin-bottom:0">' + esc(headline || ('Across ' + mTxns.length + ' transactions in ' + fmtPeriod(month) + ', all accounts.')) + '</p></div>';
 
-  // What changed: Engine deltas vs previous period (V8).
+  // What changed: Engine deltas vs previous calendar month aggregate.
   html += '<div class="section-head"><h2>What changed</h2>' +
     '<button class="linklike" data-action="wrong" data-filter="purchases">This explanation is wrong</button></div>';
   var deltas = facts ? (facts.deltas || []) : [];
   if (deltas.length) {
-    html += '<div class="card">';
+    html += '<div class="card"><p class="tiny" style="margin-top:0">' + esc(fmtPeriod(month)) + ' vs ' + esc(fmtPeriod(prev)) + ' · all accounts</p>';
     deltas.slice(0, 3).forEach(function (d) {
       var up = d.deltaMinor > 0;
-      html += '<div class="bar-row"><span class="b-label">' + esc(prettify(String(d.category || ''))) + '</span>' +
+      html += '<div class="bar-row"><span class="b-label">' + esc(catLabelSmart(d.category || '')) + '</span>' +
         '<span class="b-amt">' + (up ? 'up ' : 'down ') + spendAbs(d.deltaMinor) +
         ' <span class="tiny">(' + (d.txnCount || 0) + ' txn)</span></span></div>';
     });
     html += '</div>';
   } else {
-    html += '<div class="card"><p style="margin:0">First statement on this device — no previous period to compare against yet.</p></div>';
+    html += '<div class="card"><p style="margin:0">' + (pTxns.length
+      ? 'Spending was flat across categories vs ' + esc(fmtPeriod(prev)) + '.'
+      : 'No ' + esc(fmtPeriod(prev)) + ' data to compare against yet.') + '</p></div>';
   }
 
-  // Where it went: Engine top drivers (V8), each linking to its transactions.
+  // Where it went: Engine top drivers (real categories now), each linking
+  // to its first transaction.
   html += '<div class="section-head"><h2>Where it went</h2>' +
     '<button class="linklike" data-action="wrong" data-filter="purchases">This explanation is wrong</button></div>';
   var drivers = facts ? (facts.topDrivers || []) : [];
   if (drivers.length) {
-    var maxD = Math.max.apply(null, drivers.map(function (d) { return Math.abs(d.totalMinor || 0); }).concat([1]));
     drivers.slice(0, 5).forEach(function (d) {
-      var link = App.driverTxnId(txns, d.category);
+      var link = App.driverTxnId(mTxns, d.category);
       html += '<button class="driver" data-action="open-txn" data-id="' + esc(link || '') + '"' + (link ? '' : ' disabled') + '>' +
-        '<span class="d-main"><span class="d-name">' + esc(prettify(String(d.category || ''))) + '</span><br>' +
+        '<span class="d-main"><span class="d-name">' + esc(catLabelSmart(d.category || '')) + '</span><br>' +
         '<span class="d-sub">' + (d.txnCount || 0) + ' transaction' + ((d.txnCount || 0) === 1 ? '' : 's') + '</span></span>' +
         '<span class="d-amt">' + spendAbs(d.totalMinor) + '</span></button>';
     });
-  } else html += '<p class="small">No spend drivers this period.</p>';
+  } else html += '<p class="small">No spend drivers this month.</p>';
 
-  // Refunds & money movement.
+  // Refunds & money movement, month-scoped.
   html += '<div class="section-head"><h2>Refunds &amp; money movement</h2>' +
     '<button class="linklike" data-action="wrong" data-filter="refunds">This explanation is wrong</button></div>';
   var rs = facts ? facts.refundsSummary : null;
-  var move = txns.filter(function (t) { return ['refund', 'payment', 'transfer', 'fee'].indexOf(t.kind) !== -1 && !t.excluded; });
+  var move = mTxns.filter(function (t) { return ['refund', 'payment', 'transfer', 'fee'].indexOf(t.kind) !== -1 && !t.excluded; });
   if (move.length) {
     html += '<div class="card">';
     move.slice(0, 8).forEach(function (t) {
@@ -3031,41 +3278,69 @@ App.vMonth = async function (v, seq) {
     });
     html += '<p class="small">Refunds received: <strong>' + spendAbs(rs ? rs.totalMinor : recon.refundsTotalMinor) + '</strong>' +
       (rs ? ' across ' + rs.count + ' transaction(s)' : '') + ' (already subtracted from net spend).</p></div>';
-  } else html += '<p class="small">No refunds, payments, transfers or fees this period.</p>';
+  } else html += '<p class="small">No refunds, payments, transfers or fees this month.</p>';
 
-  // Needs your review.
-  var unCount = facts ? (facts.unresolvedCount || 0) : (recon.unresolvedCount || 0);
+  // Per-account breakdown: each contributing statement's net spend for the
+  // month + its own balance-check state. Tap to drill into the statement.
+  html += '<h2>Per-account breakdown</h2><div class="card">';
+  contributors.forEach(function (c) {
+    var label = c.statement ? (c.statement.scopeLabel || c.statement.periodLabel || 'Statement') : '(statement removed)';
+    var checkPill = c.checkState === 'ok' ? 'ok' : (c.checkState === 'gap' ? 'bad' : 'dim');
+    html += '<button class="driver" data-action="goto" data-tab="statement" data-sid="' + esc(c.id) + '"' + (c.statement ? '' : ' disabled') + '>' +
+      '<span class="d-main"><span class="d-name">' + esc(label) + '</span><br>' +
+      '<span class="d-sub">' + c.txns.length + ' transaction' + (c.txns.length === 1 ? '' : 's') + ' · ' +
+      esc(c.coverage === 'full' ? 'full month' : (c.coverage === 'partial' ? 'partial month' : c.coverage)) +
+      ' · <span class="pill ' + checkPill + '">check: ' + esc(c.checkState) + '</span></span></span>' +
+      '<span class="d-amt">' + spendAbs(c.netMinor) + '</span></button>';
+  });
+  html += '<p class="tiny" style="margin-bottom:0">Net spend per account for ' + esc(fmtPeriod(month)) +
+    ', magnitudes. Tap an account to drill into its statement.</p></div>';
+
+  // Needs your review: uncertain rows + uncategorized spend, month-scoped
+  // and deduplicated (an uncategorized purchase with needs_review row
+  // confidence belongs to both sets but is one row to review).
+  var reviewTxns = App.reviewTxns(mTxns);
+  var reviewN = reviewTxns.length;
+  var noCatMonth = mTxns.filter(function (t) { return needsCategory(t); }).length;
   html += '<div class="section-head"><h2>Needs your review</h2>' +
     '<button class="linklike" data-action="wrong" data-filter="review">This explanation is wrong</button></div>';
-  if (unCount) {
-    html += '<div class="card"><p><strong>' + unCount + '</strong> transaction' + (unCount === 1 ? '' : 's') +
-      ' need' + (unCount === 1 ? 's' : '') + ' a human look.</p>' +
-      '<button class="btn" data-action="goto" data-tab="statement" data-filter="review">Open review queue</button></div>';
+  if (reviewN) {
+    html += '<div class="card"><p><strong>' + reviewN + '</strong> transaction' + (reviewN === 1 ? '' : 's') +
+      ' need' + (reviewN === 1 ? 's' : '') + ' a human look' +
+      (noCatMonth ? ', including <strong>' + noCatMonth + '</strong> under \u201cNeeds a category\u201d' : '') + '.</p>' +
+      '<button class="btn" data-action="goto" data-tab="statement" data-filter="review"' +
+      (contributors.length ? ' data-sid="' + esc(contributors[0].id) + '"' : '') + '>Open review queue</button></div>';
   } else html += '<div class="banner ok">All clear — nothing needs review.</div>';
 
-  // Evidence quality.
-  var cov = await App.receiptCoverage();
+  // Evidence quality. The aggregate balance check is meaningless (balances
+  // never sum across accounts) — per-statement states are above.
+  var cov = await App.receiptCoverageFor(mTxns);
   var rules = await sAll('householdRules');
   html += '<h2>Evidence quality</h2><div class="card"><table class="kv">' +
-    '<tr><th>Transactions</th><td>' + txns.length + '</td></tr>' +
-    '<tr><th>Receipt coverage</th><td>' + Math.round(cov.ratio * 100) + '% of purchases (' + spendAbs(cov.matchedMinor) + ' / ' + spendAbs(cov.grossMinor) + ')</td></tr>' +
-    (facts && facts.receiptCoveragePct != null ? '<tr><th>Coverage at import</th><td>' + facts.receiptCoveragePct + '%</td></tr>' : '') +
+    '<tr><th>Transactions</th><td>' + mTxns.length + ' across ' + contributors.length + ' statement' + (contributors.length === 1 ? '' : 's') + '</td></tr>' +
+    '<tr><th>Receipt coverage</th><td>' + Math.round(cov.ratio * 100) + '% of ' + esc(fmtPeriod(month)) + ' purchases (' + spendAbs(cov.matchedMinor) + ' / ' + spendAbs(cov.grossMinor) + ')</td></tr>' +
     '<tr><th>Household rules</th><td>' + rules.length + ' (' + rules.filter(function (r) { return r.enabled !== false; }).length + ' active)</td></tr>' +
-    '<tr><th>Unresolved</th><td>' + unCount + '</td></tr>' +
-    (facts ? '<tr><th>Balance check</th><td>' + esc(String(facts.balanceCheck)) + (facts.gapMinor ? ' · gap ' + money(facts.gapMinor) : '') + '</td></tr>' : '') +
+    '<tr><th>Unresolved</th><td>' + reviewN + '</td></tr>' +
+    '<tr><th>Balance check</th><td>n/a (per-account above)</td></tr>' +
     '</table></div>';
 
-  // Trends, biggest movers, budgets summary (Phase 3 depth on this tab).
-  html += await App.trendsHtml();
-  html += await App.moversHtml();
-  html += await App.budgetSummaryHtml();
+  // Trends, biggest movers, budgets summary — month-scoped.
+  html += await App.trendsHtml(month);
+  html += await App.moversHtml(month);
+  html += await App.budgetSummaryHtml(month);
 
-  // Full deterministic briefing text.
-  if (briefing && briefing.text) {
-    html += '<details class="more"><summary>Full briefing text</summary><pre class="brief">' + esc(briefing.text) + '</pre>';
+  // Full deterministic briefing text (month-scoped facts).
+  var briefingText = '';
+  try { briefingText = facts ? Engine.renderBriefingText(facts) : ''; } catch (e) { briefingText = ''; }
+  if (briefingText) {
+    html += '<details class="more"><summary>Full briefing text</summary><pre class="brief">' + esc(briefingText) + '</pre>';
     if (typeof LLM !== 'undefined' && LLM.isActive()) {
       html += '<div style="margin-top:8px"><button class="btn ghost smallbtn" data-action="llm-rephrase-briefing">Rephrase with AI</button> <span class="tiny">Rewords only — the facts stay on this device.</span></div>';
-      App._lastBriefing = { briefing: briefing, st: st, recon: recon };
+      App._lastBriefing = {
+        briefing: { text: briefingText, facts: facts },
+        st: { periodLabel: month, scopeLabel: 'All accounts · ' + fmtPeriod(month) },
+        recon: recon
+      };
     }
     html += '</details><div id="llm-preview"></div>';
   }
@@ -3076,6 +3351,7 @@ App.vMonth = async function (v, seq) {
     if (c) App.drawTrends(c, App._trendData || []);
   }
 };
+
 
 /** Find a txn id for a driver category (V8: categoryTotals keys are
     category ids, falling back to merchant names). */
@@ -3557,6 +3833,10 @@ App.vMore = async function (v, seq) {
     '<div class="card"><div class="section-head"><h3 style="margin:0">Household rules</h3><span class="pill">' + active + ' active</span></div>' +
     '<p class="small">Corrections you turned into reusable rules. They apply to future imports automatically.</p>' +
     '<button class="btn ghost" data-action="goto" data-tab="more" data-more="rules">Manage rules</button></div>' +
+    '<div class="card"><h3 style="margin:0 0 6px">Auto-categorize</h3>' +
+    '<p class="small">Assign categories to imported transactions that don’t have one yet — your household rules first, then built-in Canadian merchant keywords. <strong>Never overwrites categories you set yourself.</strong></p>' +
+    (App.state.backfillMsg ? '<div class="banner ok">' + esc(App.state.backfillMsg) + '</div>' : '') +
+    '<button class="btn ghost" data-action="autocat-backfill">Auto-categorize transactions</button></div>' +
     '<div class="card"><h3 style="margin:0 0 6px">Privacy &amp; data</h3>' +
     '<p class="small"><strong>Your data stays on this device.</strong> The only network use is optional AI phrasing, which you preview and approve per call. Export or delete any time.</p>' +
     '<button class="btn ghost" data-action="goto" data-tab="more" data-more="privacy">Privacy, export &amp; delete</button></div>' +
@@ -3625,6 +3905,38 @@ App.Changes['account-rename'] = async function (el) {
 };
 
 /* ---------------- Sample data (More menu) ---------------- */
+
+/**
+ * App.Actions['autocat-backfill']: run Engine.autoCategorize over ALL stored
+ * transactions. Rows with a user-set category (categorySource==='user' or
+ * classificationSource==='user') are never touched. Reports how many
+ * transactions newly received a category.
+ */
+App.Actions['autocat-backfill'] = async function () {
+  var txns = await sAll('txns');
+  var rules = rulePayloads(await enabledRules());
+  var before = {};
+  txns.forEach(function (t) { before[String(t.id)] = t.category || ''; });
+  Engine.autoCategorize(txns, rules);
+  var added = 0, refreshed = 0;
+  for (var i = 0; i < txns.length; i++) {
+    var t = txns[i];
+    var was = before[String(t.id)] || '';
+    var now = t.category || '';
+    if (now !== was) {
+      await Store.put('txns', t);
+      if (!was && now) added++;
+      else refreshed++;
+    }
+  }
+  audit('categories.backfilled', 'ledger', null, { added: added, refreshed: refreshed, total: txns.length });
+  App.state.backfillMsg = 'Auto-categorized ' + added + ' of ' + txns.length +
+    ' transaction' + (txns.length === 1 ? '' : 's') + '.' +
+    (refreshed ? ' ' + refreshed + ' refreshed by newer rules.' : '') +
+    ' Your own categories were never touched.';
+  App.bumpDataRev();
+  App.render();
+};
 
 /** Insert Engine.sampleData(seed) into the stores, remapping local stmtKeys to real statement ids. */
 App.insertSampleData = async function (data) {
@@ -3759,15 +4071,26 @@ App.vRules = async function (v, seq) {
   }
   rules.forEach(function (r) {
     var on = r.enabled !== false;
-    // Flat V4 shape: {id, enabled, priority, matchMerchant, kind, label}.
+    // Flat V4 shape: {id, enabled, priority, matchMerchant, kind, category,
+    // label} + legacy appMatch.setCategory for older category rules.
+    var ruleCat = r.category || (r.appMatch && r.appMatch.setCategory) || null;
     var effect = r.kind ? ('kind → ' + kindLabel(r.kind))
-      : ('category → ' + esc(catName(r.appMatch && r.appMatch.setCategory)));
+      : ('category → ' + esc(catName(ruleCat)));
     html += '<div class="rule"><div class="r-head">' +
       '<span class="r-name">' + esc(r.label || (r.ruleType === 'category' ? 'Category rule' : 'Kind rule')) + '</span>' +
       '<span class="pill ' + (on ? 'ok' : 'dim') + '">' + (on ? 'on' : 'off') + '</span></div>' +
       '<div class="r-scope">' + esc(r.scopeDescription || '(no description)') + '</div>' +
-      (r.matchMerchant ? '<div class="tiny">Matches merchant containing “' + esc(r.matchMerchant) + '” → ' + effect + '</div>' : '') +
-      '<div class="r-actions">' +
+      (r.matchMerchant ? '<div class="tiny">Matches merchant containing “' + esc(r.matchMerchant) + '” → ' + effect + '</div>' : '');
+    if (r.ruleType === 'category' || (!r.kind && ruleCat)) {
+      // Let the user change the rule's category; stored on both the flat
+      // field and the legacy appMatch so old and new readers agree.
+      html += '<label class="f" for="rule-cat-' + esc(r.id) + '">Category</label>' +
+        '<select id="rule-cat-' + esc(r.id) + '" data-change="rule-cat-change" data-id="' + esc(r.id) + '">' +
+        App.categories.map(function (c) {
+          return '<option value="' + esc(c.id) + '"' + (String(ruleCat) === String(c.id) ? ' selected' : '') + '>' + esc(c.name) + '</option>';
+        }).join('') + '</select>';
+    }
+    html += '<div class="r-actions">' +
       '<label class="switch"><input type="checkbox" data-change="rule-toggle" data-id="' + esc(r.id) + '"' + (on ? ' checked' : '') + '> Enabled</label>' +
       '<button class="btn ghost smallbtn" data-action="rule-delete" data-id="' + esc(r.id) + '">Delete</button>' +
       '</div></div>';
@@ -3782,6 +4105,20 @@ App.Changes['rule-toggle'] = async function (el) {
   r.enabled = el.checked;
   await Store.put('householdRules', r);
   audit(el.checked ? 'rule.enabled' : 'rule.disabled', 'householdRule', r.id, {});
+  App.bumpDataRev();
+  App.render();
+};
+
+/** Change a category rule's category (writes both the flat field and the
+ * legacy appMatch.setCategory so old and new readers agree). */
+App.Changes['rule-cat-change'] = async function (el) {
+  var r = await sGet('householdRules', el.dataset.id);
+  if (!r || !el.value) { App.render(); return; }
+  var old = r.category || (r.appMatch && r.appMatch.setCategory) || null;
+  r.category = el.value;
+  if (r.appMatch) r.appMatch.setCategory = el.value;
+  await Store.put('householdRules', r);
+  audit('rule.category_changed', 'householdRule', r.id, { from: old, to: el.value });
   App.bumpDataRev();
   App.render();
 };
@@ -3875,7 +4212,7 @@ App.Actions['wipe-go'] = async function () {
                 pending: null, pipe: null, dupPairs: null, txnShown: 60, txnSearch: '',
                 splitForm: null, manualMsg: '', dataRev: 0,
                 planView: 'budgets', budgetMonth: null, budgetEditId: null,
-                goalEditId: null, planMsg: '' };
+                goalEditId: null, planMsg: '', month: null, backfillMsg: '' };
   App.categories = [];
   await App.seedCategories();
   App.go('add');
@@ -4307,6 +4644,10 @@ App._test = {
   parseDollarsToMinor: App.parseDollarsToMinor, subDismissSlug: App.subDismissSlug,
   matchQuestion: App.matchQuestion, shortHash: shortHash,
   _paginate: App._paginate, _dupCacheKey: App._dupCacheKey, TXN_PAGE_SIZE: App.TXN_PAGE_SIZE,
+  /* Auto-categorization (Problem A) + Month aggregation (Problem B). */
+  needsCategory: needsCategory, reviewTxns: App.reviewTxns, monthsWithData: App.monthsWithData,
+  latestTxnMonth: App.latestTxnMonth, txnsInMonth: App.txnsInMonth,
+  statementCoverage: App.statementCoverage,
   /* PDF job controller (node-testable via the fakes in tests/pdf-resume.node.js). */
   runPdfJob: App.runPdfJob, pdfJobLoop: App.pdfJobLoop,
   pdfJobExtractPage: App.pdfJobExtractPage, pdfJobVisibility: App.pdfJobVisibility,

@@ -28,10 +28,12 @@
  *   confidenceNote   human-readable reason for the confidence level.
  *
  * Formats: the two validated templates (pc_financial, cibc_costco) are
- * tried first and refuse to guess. Anything else falls back to
- * Parsers.parseGeneric, a heuristic reader for any bank/credit-card
- * statement: date+amount line detection, amount-column clustering,
- * header-driven sign inference, balance keyword metadata, year inference.
+ * tried first and refuse to guess. Anything else falls back to the
+ * layout-inference reader in js/generic-table.js (column geometry,
+ * header-driven roles, section-aware signing, reconciliation against
+ * stated totals), mapped onto this same raw-row contract by
+ * Parsers.parseGenericTable. The older line-based heuristic
+ * (Parsers.parseGeneric) remains as a secondary fallback.
  *
  * Money is ALWAYS integer minor units. No parseFloat anywhere near money.
  * Nothing is silently dropped: unparsed table-region lines raise.
@@ -1518,6 +1520,81 @@
   /* Top-level PDF driver                                                 */
   /* ================================================================== */
 
+  /* ================================================================== */
+  /* Generic layout-inference reader (js/generic-table.js) as the primary  */
+  /* fallback for unknown statement formats.                               */
+  /* ================================================================== */
+
+  /**
+   * Parsers.parseGenericTable(frags) ->
+   *   Promise<{format, templateId, institution, rows, meta, warnings?}>.
+   * Runs the layout-inference engine (GenericTable) over the pdf.js
+   * fragments and maps its output onto the raw-row contract. Falls back
+   * to the legacy line-based Parsers.parseGeneric when the layout engine
+   * is unavailable, throws, or finds no rows (different detection
+   * trade-offs); a noStatement result from the legacy path propagates so
+   * parseFrags can raise its friendly error.
+   */
+  Parsers.parseGenericTable = async function (frags) {
+    var gt = null;
+    try {
+      if (typeof GenericTable !== 'undefined' && GenericTable && GenericTable.parseFrags) {
+        await yieldToUI();
+        gt = GenericTable.parseFrags(frags || []);
+        await yieldToUI();
+      }
+    } catch (e) { gt = null; /* fall through to legacy heuristic */ }
+    if (!gt || !gt.rows || !gt.rows.length) {
+      return Parsers.parseGeneric(frags);
+    }
+    var rows = gt.rows.map(function (r, i) {
+      var c = r.confidence >= 0.8 ? 'high' : (r.confidence >= 0.6 ? 'medium' : 'low');
+      var note = r.reviewReason || r.signSource || 'layout-inference read';
+      return {
+        rawDateText: r.rawDateText != null ? String(r.rawDateText) : '',
+        rawDescription: r.description != null ? String(r.description) : '',
+        rawAmountText: r.rawAmountText != null ? String(r.rawAmountText) : '',
+        rawCurrency: (gt.anchors && gt.anchors.currency) || 'CAD',
+        signedAmountMinor: r.amountMinor,
+        dateInferred: r.date || null,
+        pageNumber: r.page || 1,
+        rowIndex: (typeof r.rowIndex === 'number' ? r.rowIndex : i),
+        confidence: c,
+        confidenceNote: note + ((r.needsReview && !/review/i.test(note)) ? ' — needs review' : '')
+      };
+    });
+    var a = gt.anchors || {}, tbs = a.totalsBySection || {};
+    function absOrNull(v) { return (v == null || !isFinite(v)) ? null : Math.abs(Math.round(v)); }
+    var meta = {
+      period_start: a.periodStart || null,
+      period_end: a.periodEnd || null,
+      reported_start_balance_minor: absOrNull(a.prevBalanceMinor),
+      reported_end_balance_minor: absOrNull(a.newBalanceMinor),
+      minimum_payment_minor: absOrNull(a.minPaymentMinor),
+      due_date: a.dueDate || null,
+      credit_limit_minor: absOrNull(a.creditLimitMinor),
+      purchases_minor: absOrNull(tbs.purchases),
+      payments_minor: absOrNull(tbs.payments),
+      fees_minor: absOrNull(tbs.fees),
+      interest_minor: absOrNull(tbs.interest)
+    };
+    var warnings = (gt.notes || []).slice();
+    (gt.excluded || []).forEach(function (e) {
+      warnings.push('excluded line (' + e.reason + '): ' + String(e.line).slice(0, 80));
+    });
+    var low = rows.filter(function (r) { return r.confidence === 'low'; }).length;
+    if (low) warnings.push(low + ' of ' + rows.length + ' rows are low-confidence and need review');
+    return {
+      format: 'generic_statement',
+      templateId: GENERIC.templateId,
+      institution: GENERIC.institution,
+      rows: rows,
+      meta: meta,
+      warnings: warnings,
+      engine: 'generic-table-v1'
+    };
+  };
+
   /**
    * Parsers.parseFrags(frags) ->
    *   Promise<{format, templateId, institution, rows, meta, warnings?}>.
@@ -1537,7 +1614,7 @@
     var firstPageText = detectLines.map(function (l) { return l.text; }).join('\n');
     var format = Parsers.detectFormat(firstPageText);
     if (!format) {
-      var generic = await Parsers.parseGeneric(frags);
+      var generic = await Parsers.parseGenericTable(frags);
       if (generic.noStatement) {
         var n = generic.pageCount || 0;
         throw new Error('This PDF doesn\'t look like a bank or credit-card ' +

@@ -372,6 +372,12 @@ details.more summary::-webkit-details-marker { color: var(--accent); }
 .linklike { background: none; border: 0; color: var(--accent-dark); font-weight: 700; font-size: 14px;
   cursor: pointer; padding: 8px 4px; min-height: var(--tap); text-decoration: underline; }
 
+/* Month tab: ‹ Month Year › navigator row */
+.month-nav { display: flex; align-items: center; gap: 8px; }
+.month-nav select { flex: 1; font-size: 17px; font-weight: 700; padding: 8px 10px; border: 1px solid var(--line);
+  border-radius: 10px; background: var(--card); color: var(--ink); min-height: var(--tap); }
+.month-nav .btn { min-width: 44px; }
+
 @media (min-width: 560px) {
   .view { padding-left: 24px; padding-right: 24px; }
 }

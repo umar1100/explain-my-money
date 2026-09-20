@@ -20,6 +20,7 @@ const SHELL = [
   './js/app.js',
   './js/engine.js',
   './js/parsers.js',
+  './js/generic-table.js',
   './js/store.js',
   './js/ocr.js',
   './js/llm.js',

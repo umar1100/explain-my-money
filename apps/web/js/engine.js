@@ -499,16 +499,22 @@
   /**
    * Engine.applyRules(rows, rules) -> rows.
    * Deterministic application of enabled household rules, highest priority
-   * first. A rule: {id, enabled, priority, matchMerchant, kind, label}.
-   * matchMerchant is a case-insensitive substring of merchantRaw.
-   * Stamps classificationSource='rule', kindConfidence=1.0 (the household's
-   * own rule outranks any heuristic). Never touches rows the user corrected
-   * directly (classificationSource==='user').
+   * first. A rule: {id, enabled, priority, matchMerchant, kind, category,
+   * label}. matchMerchant is a case-insensitive substring of merchantRaw.
+   * Applies rule.kind (stamps classificationSource='rule', kindConfidence=1.0
+   * — the household's own rule outranks any heuristic) and/or rule.category
+   * (stamps categorySource='rule', categoryConfidence=1.0). Legacy
+   * app-level category rules carry their category in appMatch.setCategory
+   * and are honored too. Never touches rows the user corrected directly
+   * (classificationSource==='user'). Category-only rules do NOT stamp
+   * classificationSource, so built-in kind classification still runs for
+   * those rows.
    */
   Engine.applyRules = function (rows, rules) {
     var active = [];
     for (var i = 0; i < (rules || []).length; i++) {
-      if (rules[i] && rules[i].enabled !== false && rules[i].matchMerchant && rules[i].kind) {
+      if (rules[i] && rules[i].enabled !== false && rules[i].matchMerchant &&
+          (rules[i].kind || ruleCategoryOf(rules[i]))) {
         active.push(rules[i]);
       }
     }
@@ -521,9 +527,18 @@
       for (var a = 0; a < active.length; a++) {
         var rule = active[a];
         if (hay.indexOf(String(rule.matchMerchant).toUpperCase()) !== -1) {
-          applyKindToRow(row, rule.kind, 1.0,
-            'household rule: ' + (rule.label || rule.id), 'rule');
-          break;
+          var label = 'household rule: ' + (rule.label || rule.id);
+          var changed = false;
+          if (rule.kind) {
+            applyKindToRow(row, rule.kind, 1.0, label, 'rule');
+            changed = true;
+          }
+          var cat = ruleCategoryOf(rule);
+          if (cat) {
+            stampCategory(row, cat, 'rule', 1.0, label);
+            changed = true;
+          }
+          if (changed) break;
         }
       }
     }
@@ -549,27 +564,40 @@
 
   /**
    * Engine.makeRuleFromCorrection(correction, pastRows) -> {rule, scopeDescription}.
-   * correction: {merchantRaw (or merchant), kind, label?}
+   * correction: {merchantRaw (or merchant), kind?, category?, label?}
    * Builds a household rule matching the corrected merchant text. The rule id
-   * is a deterministic hash of match-key + kind (no timestamps/randomness in
-   * the engine). scopeDescription states the blast radius: how many past
-   * records the rule WOULD apply to.
+   * is a deterministic hash of match-key + kind + category (kind-only rules
+   * keep their historic id shape; adding a category changes the id, so a
+   * category-bearing rule never collides with a kind-only one).
+   * scopeDescription states the blast radius: how many past records the rule
+   * WOULD apply to.
    */
   Engine.makeRuleFromCorrection = function (correction, pastRows) {
     correction = correction || {};
     pastRows = pastRows || [];
     var key = trimStr(correction.merchantRaw || correction.merchant || '').toUpperCase().replace(/\s+/g, ' ');
     var kind = correction.kind;
-    if (key === '' || Engine.KINDS.indexOf(kind) === -1) {
-      throw new Error('makeRuleFromCorrection: need a merchant string and a valid kind');
+    var kindOk = Engine.KINDS.indexOf(kind) !== -1;
+    var category = trimStr(correction.category || '');
+    if (category !== '' && !KNOWN_CATEGORY_IDS[category]) {
+      throw new Error('makeRuleFromCorrection: unknown category "' + category + '"');
     }
+    if (key === '' || (!kindOk && category === '')) {
+      throw new Error('makeRuleFromCorrection: need a merchant string and a valid kind or category');
+    }
+    // Deterministic id: kind-only rules keep the historic hash input
+    // (key|kind) so existing stored rules stay upsert-stable; the category
+    // is folded in whenever one is present.
+    var hashInput = key + '|' + (kindOk ? kind : '');
+    if (category !== '') hashInput += '|' + category;
     var rule = {
-      id: 'rule_' + hashStr(key + '|' + kind),
+      id: 'rule_' + hashStr(hashInput),
       enabled: true,
       priority: 100,
       matchMerchant: key,
-      kind: kind,
-      label: correction.label || ('Correction: "' + key + '" -> ' + kind),
+      kind: kindOk ? kind : null,
+      category: category === '' ? null : category,
+      label: correction.label || ('Correction: "' + key + '" -> ' + (kindOk ? kind : category)),
       source: 'correction'
     };
     var n = 0;
@@ -1302,6 +1330,150 @@
       { id: 'fees',           name: 'Fees',            parentId: null },
       { id: 'other',          name: 'Other',           parentId: null }
     ];
+  };
+
+  // Known category ids (defensive: keyword rules can never invent one).
+  var KNOWN_CATEGORY_IDS = {};
+  (function () {
+    var cats = Engine.defaultCategories();
+    for (var i = 0; i < cats.length; i++) KNOWN_CATEGORY_IDS[cats[i].id] = true;
+  })();
+
+  /**
+   * Engine.categoryKeywordRules: ORDERED list of {category, confidence,
+   * keywords[]}. Applied FIRST MATCH WINS, so specific multi-word keys come
+   * before their generic single-word cousins ('COSTCO GAS' -> transport must
+   * beat 'COSTCO' -> groceries; 'UBER EATS' -> dining must beat 'UBER' ->
+   * transport; 'CANADIAN TIRE GAS' -> transport must beat 'CANADIAN TIRE' ->
+   * household). Substring match against the uppercase merchantRaw.
+   *
+   * Confidence: the rule's confidence applies when the matched keyword is
+   * multi-word (specific); generic single-word matches are capped at 0.75.
+   * Engine.autoCategorize only stamps suggestions at >= 0.6 — anything less
+   * certain stays blank (honest: never invent a category).
+   *
+   * Canadian-merchant focused, but these are guesses with a stated
+   * confidence, not facts: user corrections and household rules always win.
+   */
+  Engine.categoryKeywordRules = [
+    // --- specific keys that must beat a generic rule below ---
+    { category: 'transport', confidence: 0.95, keywords: ['COSTCO GAS', 'COSTCO FUEL', 'CANADIAN TIRE GAS', 'GO TRANSIT', 'PRESTO CARD', 'GREEN P PARKING', 'VIA RAIL'] },
+    { category: 'groceries', confidence: 0.92, keywords: ['LOBLAWS', 'REAL CANADIAN SUPERSTORE', 'SUPERSTORE', 'NO FRILLS', 'NOFRILLS', 'SOBEYS', 'FRESHCO', 'FOOD BASICS', 'LONGOS', 'FORTINOS', 'FARM BOY', 'SAVE-ON-FOODS', 'SAVE ON FOODS', 'SAFEWAY', 'MARCHE ADONIS', 'T&T SUPERMARKET', 'H MART', 'COSTCO WHOLESALE'] },
+    { category: 'dining', confidence: 0.92, keywords: ['TIM HORTONS', 'MCDONALD', 'SKIPTHEDISHES', 'SKIP THE DISHES', 'DOORDASH', 'UBER EATS', 'PIZZA PIZZA', 'THE KEG', 'STEAKHOUSE', 'HARVEYS', 'WENDY', 'SUBWAY', 'STARBUCKS', 'SECOND CUP', 'SUSHI', 'RESTAURANT', 'FOOD COURT', 'PIZZERIA', 'COFFEE', 'CAFE'] },
+    { category: 'health_pharmacy', confidence: 0.92, keywords: ['SHOPPERS DRUG', 'DRUG MART', 'SHOPPERS', 'REXALL', 'PHARMAPRIX', 'JEAN COUTU', 'PHARMACY', 'LIFE LABS', 'LIFELABS', 'DENTAL', 'OPTICAL', 'PHYSIO', 'WALK-IN CLINIC', 'MEDICAL CENTRE'] },
+    { category: 'subscriptions', confidence: 0.92, keywords: ['NETFLIX', 'SPOTIFY', 'DISNEY+', 'AMAZON PRIME', 'PRIME VIDEO', 'YOUTUBE PREMIUM', 'APPLE.COM/BILL', 'GOOGLE ONE', 'DROPBOX', 'ICLOUD', 'MICROSOFT 365', 'ROGERS WIRELESS', 'ROGERS', 'BELL MOBILITY', 'TELUS', 'KOODO', 'FREEDOM MOBILE', 'FIDO', 'VIRGIN MOBILE', 'GOODLIFE FITNESS', 'GOODLIFE', 'FITNESS'] },
+    { category: 'household', confidence: 0.88, keywords: ['HYDRO ONE', 'HYDRO', 'ENBRIDGE', 'TORONTO WATER', 'CANADIAN TIRE', 'HOME DEPOT', 'RONA', 'LOWES', "LOWE'S", 'IKEA', 'DOLLARAMA', 'BED BATH', 'UTILITY', 'PROPERTY TAX'] },
+    { category: 'shopping', confidence: 0.88, keywords: ['BEST BUY', 'SPORT CHEK', 'SPORTCHEK', 'WINNERS', 'HOMESENSE', 'MARKS WORK', 'AMAZON', 'COSTCO.CA'] },
+    // --- generic single-word keys (lower confidence, still >= 0.6) ---
+    { category: 'transport', confidence: 0.90, keywords: ['SHELL', 'ESSO', 'PETRO', 'PIONEER', 'ULTRAMAR', 'HUSKY', 'PRESTO', 'TTC', 'PARKING', 'UBER', 'LYFT', 'AIR CANADA', 'PORTER AIRLINES', 'WESTJET', 'AVIS', 'BUDGET RENT', 'TAXI'] },
+    { category: 'groceries', confidence: 0.80, keywords: ['COSTCO', 'METRO', 'GROCERY', 'PRODUCE', 'BAKERY', 'BUTCHER', 'MEAT MARKET'] },
+    { category: 'shopping', confidence: 0.80, keywords: ['WALMART', 'SEPHORA', 'OLD NAVY', 'ZARA', 'H&M'] },
+    { category: 'fees', confidence: 0.90, keywords: ['ANNUAL FEE', 'LATE FEE', 'INTEREST CHARGE', 'INTEREST CHARGED', 'SERVICE CHARGE', 'BANK FEE', 'OVERDRAFT', 'CASH ADVANCE FEE', 'NSF FEE'] },
+    { category: 'other', confidence: 0.70, keywords: ['LCBO', 'BEER STORE', 'CANADA POST', 'POST OFFICE', 'DONATION', 'CHARITY', 'GOVERNMENT', 'CITY OF'] }
+  ];
+
+  /**
+   * Engine.suggestCategory(row) -> {categoryId, confidence, reason} | null.
+   * Built-in, on-device category guess for one row. Honest by design:
+   *  - kind==='fee' -> 'fees' @ 0.9 (a fee is a fee).
+   *  - kind in (payment, transfer) -> null (money movement, not spend).
+   *  - kind in (purchase, refund) -> first keyword-rule match (ordered, so
+   *    specific beats generic); multi-word keyword -> rule confidence,
+   *    generic single-word -> capped at 0.75.
+   *  - anything else (uncertain, cash_advance, ...) -> null.
+   *  - NO keyword match -> null. Blank stays blank; never invent a category.
+   */
+  Engine.suggestCategory = function (row) {
+    row = row || {};
+    var kind = row.kind;
+    if (kind === 'fee') {
+      return { categoryId: 'fees', confidence: 0.90, reason: 'kind is fee' };
+    }
+    if (kind === 'payment' || kind === 'transfer') return null;
+    if (kind !== 'purchase' && kind !== 'refund') return null;
+    var hay = String(row.merchantRaw || '');
+    if (hay === '') return null;
+    var rules = Engine.categoryKeywordRules || [];
+    for (var i = 0; i < rules.length; i++) {
+      var rule = rules[i];
+      if (!rule || !KNOWN_CATEGORY_IDS[rule.category]) continue;
+      var kws = rule.keywords || [];
+      for (var k = 0; k < kws.length; k++) {
+        var kw = String(kws[k] || '').toUpperCase();
+        if (kw !== '' && hay.indexOf(kw) !== -1) {
+          var multi = kw.indexOf(' ') !== -1;
+          var conf = multi ? rule.confidence : Math.min(rule.confidence, 0.75);
+          return { categoryId: rule.category, confidence: conf,
+                   reason: 'merchant contains "' + kw + '" \u2192 ' + rule.category };
+        }
+      }
+    }
+    return null;
+  };
+
+  /** Stamp {category, categorySource, categoryConfidence, categoryReason}. */
+  function stampCategory(row, category, source, confidence, reason) {
+    row.category = category;
+    row.categorySource = source; // 'rule' | 'auto' | 'user'
+    row.categoryConfidence = confidence;
+    row.categoryReason = reason;
+  }
+
+  /** Household rule's category: new flat `category`, else legacy
+   * appMatch.setCategory (app-level category rules). */
+  function ruleCategoryOf(rule) {
+    if (!rule) return null;
+    if (rule.category && KNOWN_CATEGORY_IDS[rule.category]) return rule.category;
+    var ac = rule.appMatch && rule.appMatch.setCategory;
+    if (ac && KNOWN_CATEGORY_IDS[ac]) return ac;
+    return null;
+  }
+
+  /**
+   * Engine.autoCategorize(rows, rules) -> rows.
+   * Pipeline step AFTER classifyRows: assigns spend categories.
+   *  - Rows the user touched (classificationSource==='user' or a user-set
+   *    category, categorySource==='user') are NEVER overwritten.
+   *  - A household rule carrying a category wins (matchMerchant substring,
+   *    highest priority first): {categorySource:'rule', categoryConfidence:1.0}.
+   *  - Otherwise the built-in keyword suggestion stamps the row only when
+   *    confidence >= 0.6 ({categorySource:'auto'}).
+   *  - No suggestion -> the row's category is left as-is (blank stays
+   *    blank; honest, never invented).
+   */
+  Engine.autoCategorize = function (rows, rules) {
+    rows = rows || [];
+    rules = rules || [];
+    var active = [];
+    for (var i = 0; i < rules.length; i++) {
+      var r = rules[i];
+      if (!r || r.enabled === false || !r.matchMerchant) continue;
+      var cat = ruleCategoryOf(r);
+      if (!cat) continue;
+      active.push({ rule: r, category: cat, key: String(r.matchMerchant).toUpperCase() });
+    }
+    // ES2019 sort is stable: equal priorities keep original order.
+    active.sort(function (a, b) { return (b.rule.priority || 0) - (a.rule.priority || 0); });
+    for (var t = 0; t < rows.length; t++) {
+      var row = rows[t];
+      if (!row) continue;
+      if (row.classificationSource === 'user' || row.categorySource === 'user') continue;
+      var hay = String(row.merchantRaw || '');
+      var matched = null;
+      for (var a = 0; a < active.length; a++) {
+        if (hay.indexOf(active[a].key) !== -1) { matched = active[a]; break; }
+      }
+      if (matched) {
+        stampCategory(row, matched.category, 'rule', 1.0,
+          'household rule: ' + (matched.rule.label || matched.rule.id));
+      } else {
+        var sug = Engine.suggestCategory(row);
+        if (sug && sug.confidence >= 0.6) {
+          stampCategory(row, sug.categoryId, 'auto', sug.confidence, sug.reason);
+        }
+      }
+    }
+    return rows;
   };
 
   /* ================================================================== */
