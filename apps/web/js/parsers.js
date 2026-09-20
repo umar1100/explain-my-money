@@ -116,9 +116,41 @@
   }
 
   /**
+   * Parsers.collectPageItems(pdf, pageNum) -> Promise<[{page,x,y,cx,text}]>.
+   * Single-page fragment extraction: one fragment per pdf.js text item
+   * (embedded newlines split). Exact (page,x,y,text) duplicates dropped
+   * (some statements emit ops twice). This is the resumable primitive —
+   * the job controller calls it page by page so a stalled or backgrounded
+   * read can resume from the last completed page instead of restarting.
+   */
+  Parsers.collectPageItems = async function (pdf, pageNum) {
+    var frags = [];
+    var page = await pdf.getPage(pageNum);
+    var tc = await page.getTextContent();
+    var items = (tc && tc.items) || [];
+    var seen = {};
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      if (it.str === null || it.str === undefined) continue;
+      var x = it.transform[4], y = it.transform[5];
+      var w = (typeof it.width === 'number' && isFinite(it.width)) ? it.width : 0;
+      var parts = sanitize(it.str).split('\n');
+      for (var k = 0; k < parts.length; k++) {
+        var part = parts[k];
+        if (!part || !part.replace(/\s/g, '')) continue;
+        var key = pageNum + '|' + x.toFixed(2) + '|' + y.toFixed(2) + '|' + part;
+        if (seen[key]) continue;
+        seen[key] = 1;
+        frags.push({ page: pageNum, x: x, y: y, cx: x + w / 2, text: part });
+      }
+    }
+    if (page.cleanup) page.cleanup();
+    return frags;
+  };
+
+  /**
    * Parsers.collectItems(pdf, maxPages, onProgress) -> Promise<[{page,x,y,cx,text}]>.
-   * One fragment per pdf.js text item (embedded newlines split). Exact
-   * (page,x,y,text) duplicates dropped (some statements emit ops twice).
+   * Thin wrapper over collectPageItems (kept for tests + parsePdf).
    * onProgress(page, numPages) is optional and fires once per page so the
    * UI can show "Reading page X of Y…" instead of a dead spinner.
    */
@@ -126,26 +158,8 @@
     var frags = [];
     var n = Math.min(pdf.numPages, maxPages || pdf.numPages);
     for (var p = 1; p <= n; p++) {
-      var page = await pdf.getPage(p);
-      var tc = await page.getTextContent();
-      var items = (tc && tc.items) || [];
-      var seen = {};
-      for (var i = 0; i < items.length; i++) {
-        var it = items[i];
-        if (it.str === null || it.str === undefined) continue;
-        var x = it.transform[4], y = it.transform[5];
-        var w = (typeof it.width === 'number' && isFinite(it.width)) ? it.width : 0;
-        var parts = sanitize(it.str).split('\n');
-        for (var k = 0; k < parts.length; k++) {
-          var part = parts[k];
-          if (!part || !part.replace(/\s/g, '')) continue;
-          var key = p + '|' + x.toFixed(2) + '|' + y.toFixed(2) + '|' + part;
-          if (seen[key]) continue;
-          seen[key] = 1;
-          frags.push({ page: p, x: x, y: y, cx: x + w / 2, text: part });
-        }
-      }
-      if (page.cleanup) page.cleanup();
+      var pageFrags = await Parsers.collectPageItems(pdf, p);
+      for (var i = 0; i < pageFrags.length; i++) frags.push(pageFrags[i]);
       // Yield to the event loop per page so the "Reading page X of Y…"
       // progress actually paints on phones instead of freezing the UI.
       await yieldToUI();
@@ -154,6 +168,47 @@
       }
     }
     return frags;
+  };
+
+  /**
+   * Parsers.compactFrags(frags) -> [[page,x,y,cx,text], ...].
+   * Compact array form for the on-device pdfCache (IndexedDB): coordinates
+   * rounded to 2 decimals (the dedupe key already quantises to 2dp, so
+   * nothing is lost). Parsers.rehydrateFrags reverses it.
+   */
+  Parsers.compactFrags = function (frags) {
+    var out = [];
+    for (var i = 0; i < frags.length; i++) {
+      var f = frags[i];
+      out.push([f.page, Math.round(f.x * 100) / 100, Math.round(f.y * 100) / 100,
+                Math.round(f.cx * 100) / 100, String(f.text)]);
+    }
+    return out;
+  };
+
+  /** Parsers.rehydrateFrags(compact) -> [{page,x,y,cx,text}, ...]. */
+  Parsers.rehydrateFrags = function (compact) {
+    var out = [];
+    for (var i = 0; i < (compact || []).length; i++) {
+      var c = compact[i];
+      out.push({ page: c[0], x: c[1], y: c[2], cx: c[3], text: c[4] });
+    }
+    return out;
+  };
+
+  /**
+   * Parsers.etaSeconds(pageTimesMs, pagesRemaining) -> int|null.
+   * Rolling-average ETA for the "about Xs left" display: mean of the
+   * recent per-page times × pages remaining, rounded up. Null when there
+   * is nothing to average yet. Pure function (node-testable).
+   */
+  Parsers.etaSeconds = function (pageTimesMs, pagesRemaining) {
+    var ts = pageTimesMs || [];
+    if (!ts.length || !(pagesRemaining > 0)) return null;
+    var sum = 0;
+    for (var i = 0; i < ts.length; i++) sum += ts[i];
+    var ms = (sum / ts.length) * pagesRemaining;
+    return Math.max(1, Math.ceil(ms / 1000));
   };
 
   // Y-grouping tolerance (points) when rebuilding lines — validated value.
@@ -1464,6 +1519,54 @@
   /* ================================================================== */
 
   /**
+   * Parsers.parseFrags(frags) ->
+   *   Promise<{format, templateId, institution, rows, meta, warnings?}>.
+   * Pure-ish (async only because the generic path yields): format detect
+   * + template/generic parse over already-extracted fragments. Extracted
+   * from parsePdf so the resumable job controller can parse cached frags
+   * without re-running pdf.js. Raises an Error naming the problem when
+   * the fragments hold no readable statement content.
+   */
+  Parsers.parseFrags = async function (frags) {
+    frags = frags || [];
+    // Detect on page-1 lines rebuilt in reading order (pdf.js emits one
+    // word per item on some statements, so raw fragments never contain
+    // multi-word markers like "statement date").
+    var page1 = frags.filter(function (f) { return f.page === 1; });
+    var detectLines = extractLines(page1, null);
+    var firstPageText = detectLines.map(function (l) { return l.text; }).join('\n');
+    var format = Parsers.detectFormat(firstPageText);
+    if (!format) {
+      var generic = await Parsers.parseGeneric(frags);
+      if (generic.noStatement) {
+        var n = generic.pageCount || 0;
+        throw new Error('This PDF doesn\'t look like a bank or credit-card ' +
+          'statement we can read: found ' + n + ' pages but no lines with ' +
+          'both a date and an amount.');
+      }
+      return generic;
+    }
+    var P = format === 'pc_financial' ? PC : CIBC;
+    var lines = P.extractLines(frags);
+    var parsed = P.parseTextLines(lines);
+    if (parsed.unparsed.length) {
+      var details = parsed.unparsed.slice(0, 5).map(function (u) {
+        return 'page ' + u.pageNumber + ': ' + JSON.stringify(String(u.text).slice(0, 80));
+      }).join('; ');
+      throw new Error(parsed.unparsed.length + ' transaction-table line(s) could not ' +
+        'be parsed (refusing to guess): ' + details);
+    }
+    var meta = P.parseMetadata(lines);
+    return {
+      format: format,
+      templateId: P.templateId,
+      institution: P.institution,
+      rows: parsed.rows,
+      meta: meta
+    };
+  };
+
+  /**
    * Parsers.parsePdf(arrayBuffer, pdfjsLib, onProgress) ->
    *   Promise<{format, templateId, institution, rows, meta, warnings?}>.
    * Rows follow the raw-row contract (see file header). The two validated
@@ -1482,41 +1585,7 @@
     }).promise;
     try {
       var frags = await Parsers.collectItems(pdf, null, onProgress);
-      // Detect on page-1 lines rebuilt in reading order (pdf.js emits one
-      // word per item on some statements, so raw fragments never contain
-      // multi-word markers like "statement date").
-      var page1 = frags.filter(function (f) { return f.page === 1; });
-      var detectLines = extractLines(page1, null);
-      var firstPageText = detectLines.map(function (l) { return l.text; }).join('\n');
-      var format = Parsers.detectFormat(firstPageText);
-      if (!format) {
-        var generic = await Parsers.parseGeneric(frags);
-        if (generic.noStatement) {
-          var n = generic.pageCount || 0;
-          throw new Error('This PDF doesn\'t look like a bank or credit-card ' +
-            'statement we can read: found ' + n + ' pages but no lines with ' +
-            'both a date and an amount.');
-        }
-        return generic;
-      }
-      var P = format === 'pc_financial' ? PC : CIBC;
-      var lines = P.extractLines(frags);
-      var parsed = P.parseTextLines(lines);
-      if (parsed.unparsed.length) {
-        var details = parsed.unparsed.slice(0, 5).map(function (u) {
-          return 'page ' + u.pageNumber + ': ' + JSON.stringify(String(u.text).slice(0, 80));
-        }).join('; ');
-        throw new Error(parsed.unparsed.length + ' transaction-table line(s) could not ' +
-          'be parsed (refusing to guess): ' + details);
-      }
-      var meta = P.parseMetadata(lines);
-      return {
-        format: format,
-        templateId: P.templateId,
-        institution: P.institution,
-        rows: parsed.rows,
-        meta: meta
-      };
+      return await Parsers.parseFrags(frags);
     } finally {
       if (pdf && pdf.destroy) { try { await pdf.destroy(); } catch (e) { /* ignore */ } }
     }

@@ -61,7 +61,7 @@
   var Store = {};
 
   /** Schema version. Bump when object stores/indexes change (add migration). */
-  Store.SCHEMA_VERSION = 2;
+  Store.SCHEMA_VERSION = 3;
   Store.DB_NAME = 'emmdb';
 
   var LS_PREFIX = 'emm_';
@@ -92,7 +92,14 @@
     qaEvidence:       { indexes: [] },
     budgets:          { indexes: [] },
     goals:            { indexes: [] },
-    prefs:            { keyPath: 'key', autoIncrement: false, indexes: [] }
+    prefs:            { keyPath: 'key', autoIncrement: false, indexes: [] },
+    /* Resumable PDF import cache (on-device). Key is 'pdfjob:' + sha256 hex
+     * (prefixed so the numeric-string key coercion can never collide).
+     * Holds extracted text fragments + parse results only — no financial
+     * data beyond what the parse already produced. Best-effort: import
+     * works without it; entries are evicted oldest-first (max 5). */
+    pdfCache:         { keyPath: 'hash', autoIncrement: false,
+                        indexes: [{ name: 'updatedAt', keyPath: 'updatedAt', unique: false }] }
   };
 
   var STORE_NAMES = Object.keys(STORES);

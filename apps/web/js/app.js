@@ -502,6 +502,9 @@ function wireGlobalEvents() {
     if (App.Changes[c]) App.Changes[c](el);
   });
   // Pipe view re-renders while running; keep file inputs working after render.
+  if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+    document.addEventListener('visibilitychange', function () { App.pdfJobVisibility(); });
+  }
 }
 
 App.Actions = {};
@@ -530,6 +533,7 @@ App.Actions['back-more'] = function () { App.go('more', { more: 'menu' }); };
 
 App.vAdd = function (v, seq) {
   var s = App.state;
+  if (s.addView === 'reading') return App.vPdfReading(v, seq);
   if (s.addView === 'processing' && s.pipe) return App.vProcessing(v, seq);
   if (s.addView === 'receipts') return App.vReceipts(v, seq);
   if (s.addView === 'manual') return App.vManualEntry(v, seq);
@@ -541,6 +545,12 @@ App.vAddHome = async function (v, seq) {
   var files = await sAll('sourceFiles');
   var receipts = await sAll('receipts');
   var html = '<h1>Add</h1>';
+  // Persistent job card: a PDF read keeps running (or stays resumable)
+  // even when the user leaves the reading view for another tab.
+  var job = App._pdfJob;
+  if (job && !job.done && job.status !== 'done') {
+    html += '<div class="card" id="pdfjob-card">' + App.pdfJobCardInner(job) + '</div>';
+  }
   if (!files.length) {
     html += '<div class="banner info"><strong>Welcome — your data stays on this phone.</strong><br>' +
       'Import a credit-card statement (PDF or CSV) to build your first clean ledger. ' +
@@ -561,7 +571,8 @@ App.vAddHome = async function (v, seq) {
           '<li><strong>Statement PDF</strong> — any bank or credit-card statement, read entirely on this device:<br>' +
           '<span class="small">Familiar layouts (President\u2019s Choice Financial Mastercard, CIBC Costco World Mastercard) ' +
           'are read exactly. Unfamiliar layouts get a careful heuristic read, and uncertain rows are flagged for your review. ' +
-          'Large statements can take a minute on a phone \u2014 progress is shown while reading.</span></li>' +
+          'Large statements can take a minute on a phone \u2014 progress is shown while reading, and you can leave ' +
+          'this tab: reading resumes where it stopped.</span></li>' +
           '<li><strong>CSV</strong> — supported now. Any column order; we detect date / description / amount columns.</li>' +
         '</ul>' +
       '</details>' +
@@ -701,7 +712,7 @@ App.Changes['statement-file'] = async function (input) {
   v.innerHTML = '<div class="empty"><div class="spin" style="margin:0 auto 12px"></div>Reading file…</div>';
   var isPdf = /\.pdf$/i.test(file.name || '');
 
-  if (isPdf) return App.handlePdfFile(input, file, v);
+  if (isPdf) { App.runPdfJob(input, file); return; }
 
   var text;
   try { text = await readFileAsText(file); }
@@ -736,36 +747,346 @@ App.Changes['statement-file'] = async function (input) {
 
 /* ---------- PDF statement chosen -> on-device parse + preview ---------- */
 
-App.handlePdfFile = async function (input, file, v) {
-  var buf;
-  try { buf = await readFileAsArrayBuffer(file); }
-  catch (e) { v.innerHTML = '<div class="banner bad">Could not read that file.</div>'; return; }
-  v.innerHTML = '<div class="empty"><div class="spin" style="margin:0 auto 12px"></div><span id="pdf-prog">Reading PDF on this device…</span></div>';
-  var result;
+/* ---------- resumable PDF import job ----------
+ * Why this exists: on iPhone, leaving the tab mid-read suspends the page
+ * and can kill the pdf.js worker, so a single long await chain hangs
+ * forever with no error. Instead we read page by page, persist partial
+ * progress to the on-device pdfCache after every page, and can resume
+ * from the last completed page — after backgrounding, a stall, or even
+ * a full app restart (re-pick the file; the hash matches the cache).
+ * A completed parse is cached too, so importing the same file twice is
+ * instant. All state lives on-device; nothing is uploaded.
+ *
+ * Job lifecycle: runPdfJob creates the job -> pdfJobLoop runs in the
+ * background (never awaited by UI code) -> completion sets pending and
+ * goes to the preview; errors/cancel keep the partial cache for resume.
+ * The loop never writes into a view element directly: progress ticks
+ * update #pdfjob-prog in place when present; structural transitions set
+ * job._needsRender and call App.render() (guarded by the seq check).
+ */
+App._pdfJob = null; // active/cancelled/errored job, or null
+
+/** Per-page watchdog: abandon a page the pdf.js worker never finishes. */
+App.PDF_PAGE_TIMEOUT_MS = 90000;
+/** Watchdog tick granularity (also lets a recover() abandon in-flight work). */
+App.PDF_WATCHDOG_TICK_MS = 1000;
+/** Stall threshold for the background-return check. */
+App.PDF_STALL_MS = 30000;
+/** Max pdfCache entries; oldest evicted first. */
+App.PDF_CACHE_MAX = 5;
+
+App.pdfJobYield = function () {
+  return new Promise(function (res) { setTimeout(res, 0); });
+};
+
+App.pdfJobWaitResume = function (job) {
+  return new Promise(function (res) { job._resumeResolve = res; });
+};
+
+App.pdfJobNotifyResume = function (job) {
+  var r = job._resumeResolve;
+  job._resumeResolve = null;
+  if (typeof r === 'function') { try { r(); } catch (e) {} }
+};
+
+/** Screen wake lock so iOS doesn't sleep the display mid-read. Best-effort. */
+App.pdfJobWakeLock = function (job) {
   try {
-    ensurePdfWorker();
-    result = await Parsers.parsePdf(buf, (typeof pdfjsLib !== 'undefined') ? pdfjsLib : null,
-      function (page, numPages) {
-        var el = document.getElementById('pdf-prog');
-        if (el) el.textContent = 'Reading page ' + page + ' of ' + numPages + ' on this device…';
-      });
+    var nav = (typeof navigator !== 'undefined') ? navigator : null;
+    if (!nav || !nav.wakeLock || typeof nav.wakeLock.request !== 'function') return;
+    if (job.wakeLock && typeof job.wakeLock.release === 'function') {
+      try { job.wakeLock.release(); } catch (e) {}
+    }
+    job.wakeLock = null;
+    nav.wakeLock.request('screen').then(function (wl) {
+      job.wakeLock = wl;
+      if (wl && typeof wl.addEventListener === 'function') {
+        wl.addEventListener('release', function () { if (job.wakeLock === wl) job.wakeLock = null; });
+      }
+    }, function () { /* denied or unavailable — reading still works */ });
+  } catch (e) { /* never break the job for a lock */ }
+};
+
+App.pdfJobReleaseWakeLock = function (job) {
+  try {
+    if (job.wakeLock && typeof job.wakeLock.release === 'function') job.wakeLock.release();
+  } catch (e) {}
+  job.wakeLock = null;
+};
+
+/** Rolling-average ETA text for the progress display. Pure-ish. */
+App.pdfJobEtaText = function (job) {
+  var remaining = (job.total || 0) - (job.pagesDone || 0);
+  if (!job.total || remaining <= 0) return '';
+  var secs = Parsers.etaSeconds(job.pageTimes, remaining);
+  if (secs === null) return '';
+  if (secs < 3) return 'almost done…';
+  return 'about ' + secs + 's left';
+};
+
+App.pdfJobStatusText = function (job) {
+  if (job.status === 'parsing') return 'All ' + job.total + ' pages read — building your statement…';
+  if (job.status === 'paused') {
+    return 'Paused — ' + (job.wasPausedByHidden
+      ? 'this tab was put in the background. It resumes when you return.'
+      : 'tap Resume to continue.') + ' Page ' + job.pagesDone + ' of ' + job.total + ' is saved.';
+  }
+  var base = 'Reading page ' + Math.min(job.pagesDone + 1, job.total || 1) + ' of ' + (job.total || '…') + ' on this device…';
+  var eta = App.pdfJobEtaText(job);
+  return base + (eta ? ' ' + eta : '') + (job.resumed ? ' (resumed where it stopped)' : '');
+};
+
+/** Shared status card inner HTML for the reading view + Add-home job card. */
+App.pdfJobCardInner = function (job) {
+  var pct = job.total ? Math.round(100 * job.pagesDone / job.total) : 0;
+  var head = '<strong>' + esc(job.fileName || 'statement.pdf') + '</strong><br>';
+  if (job.status === 'error') {
+    return head + '<div class="banner bad" style="margin:8px 0"><strong>Reading paused:</strong> ' +
+      esc(job.error || 'unknown error') + '</div>' +
+      '<div class="btn-row"><button class="btn" data-action="pdfjob-retry">Retry reading</button>' +
+      '<button class="btn ghost" data-action="pdfjob-dismiss">Dismiss</button></div>';
+  }
+  if (job.status === 'cancelled') {
+    return head + '<p class="small">Cancelled — progress through page ' + job.pagesDone + ' of ' + job.total +
+      ' is saved on this device. Pick the file again to resume.</p>' +
+      '<div class="btn-row"><button class="btn ghost" data-action="pdfjob-dismiss">Dismiss</button></div>';
+  }
+  var bar = '<div class="pbar" aria-hidden="true"><div class="pfill" id="pdfjob-bar" style="width:' + pct + '%"></div></div>';
+  var prog = '<span id="pdfjob-prog">' + esc(App.pdfJobStatusText(job)) + '</span>';
+  if (job.status === 'paused') {
+    return head + '<p class="small">' + prog + '</p>' + bar +
+      '<div class="btn-row"><button class="btn" data-action="pdfjob-resume">Resume</button>' +
+      '<button class="btn ghost" data-action="pdfjob-cancel">Cancel</button></div>';
+  }
+  return head + '<div class="empty" style="padding:12px"><div class="spin" style="margin:0 auto 12px"></div>' +
+    prog + '</div>' + bar +
+    '<div class="btn-row"><button class="btn ghost" data-action="pdfjob-pause">Pause</button>' +
+    '<button class="btn ghost" data-action="pdfjob-cancel">Cancel</button></div>';
+};
+
+/** In-place progress update; full re-render only on structural transitions. */
+App.pdfJobRender = function (job) {
+  if (typeof document !== 'undefined' && document.getElementById) {
+    var el = document.getElementById('pdfjob-prog');
+    if (el) el.textContent = App.pdfJobStatusText(job);
+    var bar = document.getElementById('pdfjob-bar');
+    if (bar && job.total) bar.style.width = Math.round(100 * job.pagesDone / job.total) + '%';
+  }
+  if (job._needsRender) {
+    job._needsRender = false;
+    if (App.state && App.state.tab === 'add') App.render();
+  }
+};
+
+/** Persist partial/complete progress to the on-device pdfCache. Best-effort. */
+App.pdfCacheSave = async function (job, status, result) {
+  var rec = {
+    hash: job.key,
+    fileName: job.fileName,
+    fileSize: job.fileSize,
+    pagesTotal: job.total,
+    pagesDone: job.pagesDone,
+    fragsCompact: status === 'complete' ? [] : Parsers.compactFrags(job.frags),
+    status: status,
+    result: status === 'complete' ? (result || null) : null,
+    updatedAt: Date.now()
+  };
+  try { await Store.put('pdfCache', rec); } catch (e) { /* cache is best-effort */ }
+};
+
+/** Evict oldest pdfCache entries beyond App.PDF_CACHE_MAX. Best-effort. */
+App.pdfCacheEvict = async function () {
+  try {
+    var all = await Store.all('pdfCache');
+    if (!all || all.length <= App.PDF_CACHE_MAX) return;
+    all.sort(function (a, b) { return (b.updatedAt || 0) - (a.updatedAt || 0); });
+    for (var i = App.PDF_CACHE_MAX; i < all.length; i++) {
+      try { await Store.delete('pdfCache', all[i].hash); } catch (e) {}
+    }
+  } catch (e) {}
+};
+
+/** Open a fresh pdf.js document from the job's pristine buffer copy. */
+App.pdfJobOpenDoc = async function (job, lib) {
+  var data = new Uint8Array(job.buf); // copy: pdf.js may detach the buffer we hand it
+  var pdf = await lib.getDocument({ data: data, useWorkerFetch: false, isEvalSupported: false }).promise;
+  return pdf;
+};
+
+/**
+ * Extract one page with a watchdog. Rejects with __abandoned when the job
+ * was recovered (gen bumped) or cancelled mid-page, or __timeout when the
+ * worker stalls. The caller, not this function, decides retry policy.
+ */
+App.pdfJobExtractPage = function (job, p) {
+  var gen = job.gen;
+  var timeoutMs = App.PDF_PAGE_TIMEOUT_MS;
+  var tickMs = App.PDF_WATCHDOG_TICK_MS;
+  var start = Date.now();
+  return new Promise(function (resolve, reject) {
+    var settled = false;
+    function finish(fn, val) { if (!settled) { settled = true; clearInterval(timer); fn(val); } }
+    function abandoned() { var e = new Error('abandoned'); e.__abandoned = true; return e; }
+    var timer = setInterval(function () {
+      if (job.cancelled || job.gen !== gen) finish(reject, abandoned());
+      else if (Date.now() - start > timeoutMs) finish(reject, new Error('__timeout__'));
+    }, tickMs);
+    var pdf = job.pdf;
+    if (!pdf) { finish(reject, abandoned()); return; }
+    Parsers.collectPageItems(pdf, p).then(
+      function (frags) { finish(resolve, frags); },
+      function (err) { finish(reject, err || new Error('page extraction failed')); }
+    );
+  });
+};
+
+/** The background page loop. Never throws to callers; errors land on the job. */
+App.pdfJobLoop = async function (job, libOverride) {
+  /* NOTE: the second parameter must NOT be named pdfjsLib — that would shadow
+   * the global pdf.js handle and break every call that omits the override
+   * (retry, visibility auto-resume, runPdfJob), yielding "engine failed to load". */
+  var lib = libOverride ||
+    ((typeof window !== 'undefined' && window.pdfjsLib) ? window.pdfjsLib :
+      ((typeof pdfjsLib !== 'undefined') ? pdfjsLib : null));
+  try {
+    if (!lib || typeof lib.getDocument !== 'function') throw new Error('PDF engine failed to load.');
+    App.pdfJobWakeLock(job);
+    job.pdf = await App.pdfJobOpenDoc(job, lib);
+    job.total = job.pdf.numPages;
+    job.lastProgressAt = Date.now();
+    await App.pdfCacheSave(job, 'partial');
+    App.pdfJobRender(job);
+    while (job.pagesDone < job.total) {
+      if (job.cancelled) break;
+      while (job.paused && !job.cancelled) await App.pdfJobWaitResume(job);
+      if (job.cancelled) break;
+      if (!job.pdf) job.pdf = await App.pdfJobOpenDoc(job, lib);
+      var p = job.pagesDone + 1;
+      var gen = job.gen;
+      var t0 = Date.now();
+      var frags = null;
+      try {
+        frags = await App.pdfJobExtractPage(job, p);
+      } catch (e) {
+        if (job.cancelled) break;
+        if (e && e.__abandoned) continue; // recovered mid-page; doc re-opens at loop top
+        job.stallCount = (job.stallCount || 0) + 1;
+        if (job.stallCount > 1) {
+          throw new Error('Could not read page ' + p + ' of ' + job.fileName +
+            ' (the reader stalled). Progress through page ' + job.pagesDone +
+            ' of ' + job.total + ' is saved on this device — tap Retry to resume.');
+        }
+        // One retry with a fresh document before giving up on the page.
+        try { if (job.pdf && job.pdf.destroy) await job.pdf.destroy(); } catch (e2) {}
+        job.pdf = null;
+        continue;
+      }
+      if (job.gen !== gen) continue; // stale success after a recover — retry the page
+      var dt = Date.now() - t0;
+      job.pageTimes.push(dt);
+      if (job.pageTimes.length > 5) job.pageTimes.shift();
+      for (var i = 0; i < frags.length; i++) job.frags.push(frags[i]);
+      job.pagesDone = p;
+      job.stallCount = 0;
+      job.lastProgressAt = Date.now();
+      await App.pdfCacheSave(job, 'partial');
+      App.pdfJobRender(job);
+      await App.pdfJobYield();
+    }
+    if (job.cancelled) {
+      // Persist whatever we have — even an empty partial when cancelled before
+      // page 1 — so a re-import never silently drops the attempt from history.
+      await App.pdfCacheSave(job, 'partial');
+      App.pdfJobFinish(job, 'cancelled');
+      return;
+    }
+    job.status = 'parsing';
+    job._needsRender = true;
+    App.pdfJobRender(job);
+    var result = await Parsers.parseFrags(job.frags);
+    var rows = (result && result.rows) || [];
+    if (!rows.length) throw new Error('No transaction rows found in this PDF.');
+    await App.pdfCacheSave(job, 'complete', result);
+    App.pdfCacheEvict();
+    App.pdfJobShowPreview(job, result);
+    App.pdfJobFinish(job, 'done');
   } catch (e) {
-    v.innerHTML = '<div class="banner bad"><strong>Could not parse this PDF:</strong> ' +
-      esc(e.message || e) + '</div>' +
-      '<button class="btn ghost" data-action="goto" data-tab="add" data-addview="home">Back</button>';
+    job.error = (e && e.message) || String(e);
+    App.pdfJobFinish(job, 'error');
+  }
+};
+
+/** Terminal bookkeeping. 'done' clears the job; error/cancel keep it for Retry/Dismiss. */
+App.pdfJobFinish = function (job, how) {
+  job.done = true;
+  job.status = how;
+  App.pdfJobReleaseWakeLock(job);
+  App.pdfJobNotifyResume(job);
+  var pdf = job.pdf; job.pdf = null;
+  if (pdf && typeof pdf.destroy === 'function') { try { pdf.destroy(); } catch (e) {} }
+  if (how === 'done') App._pdfJob = null;
+  else { job._needsRender = true; App.pdfJobRender(job); }
+};
+
+/** Destroy the hung document and let the loop re-open it; abandon in-flight work. */
+App.pdfJobRecover = async function (job) {
+  job.gen++;
+  job.paused = false;
+  job.wasPausedByHidden = false;
+  job.manuallyPaused = false;
+  job.status = 'reading';
+  try { if (job.pdf && typeof job.pdf.destroy === 'function') await job.pdf.destroy(); } catch (e) {}
+  job.pdf = null;
+  job.lastProgressAt = Date.now();
+  App.pdfJobNotifyResume(job);
+  job._needsRender = true;
+  App.pdfJobRender(job);
+};
+
+/** visibilitychange: pause when hidden; on return, resume or recover. */
+App.pdfJobVisibility = function () {
+  var job = App._pdfJob;
+  if (!job || job.done || job.cancelled) return;
+  if (typeof document === 'undefined') return;
+  if (document.hidden) {
+    if (job.status === 'reading') {
+      job.paused = true;
+      job.wasPausedByHidden = true;
+      job.status = 'paused'; // card + text reflect the background pause
+      job._needsRender = true;
+      App.pdfJobRender(job);
+    }
     return;
   }
-  var rows = result.rows || [];
-  if (!rows.length) {
-    v.innerHTML = '<div class="banner warn">No transaction rows found in this PDF.</div>' +
-      '<button class="btn ghost" data-action="goto" data-tab="add" data-addview="home">Back</button>';
-    return;
+  // Visible again.
+  App.pdfJobWakeLock(job);
+  if (job.manuallyPaused) return; // user paused it themselves — wait for Resume
+  if (job.wasPausedByHidden) {
+    // While hidden-paused the status is 'paused'; a stall means iOS likely
+    // killed the reader, so re-open the document and resume from the cache.
+    var stalled = Date.now() - job.lastProgressAt > App.PDF_STALL_MS;
+    if (stalled) App.pdfJobRecover(job);
+    else {
+      job.wasPausedByHidden = false;
+      job.paused = false;
+      job.status = 'reading';
+      job.lastProgressAt = Date.now();
+      App.pdfJobNotifyResume(job);
+      job._needsRender = true;
+      App.pdfJobRender(job);
+    }
   }
-  var hash = sha256HexBytes(new Uint8Array(buf));
-  var dup = (await sAll('sourceFiles')).some(function (f) { return f.sha256 === hash; });
+};
+
+/** Build the import preview from a parse result (fresh or cached). */
+App.pdfJobShowPreview = async function (jobLike, result) {
+  var rows = (result && result.rows) || [];
+  var hash = jobLike.hash;
+  var dup = false;
+  try { dup = (await sAll('sourceFiles')).some(function (f) { return f.sha256 === hash; }); } catch (e) {}
   var isGenericPdf = result.templateId === 'generic_statement_v1';
   App.state.pending = {
-    fileName: file.name, fileSize: file.size, text: null,
+    fileName: jobLike.fileName, fileSize: jobLike.fileSize, text: null,
     rows: rows, errors: [], hash: hash, duplicate: dup,
     fileKind: 'pdf',
     formatLabel: isGenericPdf ? 'Generic statement (heuristic read)' : result.institution + ' statement',
@@ -774,7 +1095,138 @@ App.handlePdfFile = async function (input, file, v) {
   };
   App.state.addView = 'preview';
   App.render();
-  input.value = '';
+};
+
+/** Entry point from the file picker. Replaces the old fire-and-forget handlePdfFile. */
+App.runPdfJob = async function (input, file) {
+  if (input) input.value = '';
+  var active = App._pdfJob;
+  if (active && !active.done && (active.status === 'reading' || active.status === 'parsing' || active.status === 'paused')) {
+    // A read is already in flight — show it instead of starting a second one.
+    App.state.tab = 'add';
+    App.state.addView = 'reading';
+    App.render();
+    return;
+  }
+  var buf;
+  try { buf = await readFileAsArrayBuffer(file); }
+  catch (e) {
+    App._pdfJob = null;
+    App.state.pdfJobError = 'Could not read that file.';
+    App.state.tab = 'add';
+    App.state.addView = 'reading';
+    App.render();
+    return;
+  }
+  var u8 = new Uint8Array(buf);
+  var hash = sha256HexBytes(u8);
+  var key = 'pdfjob:' + hash;
+  var cached = null;
+  try { cached = await Store.get('pdfCache', key); } catch (e) { cached = null; }
+  if (cached && cached.status === 'complete' && cached.fileSize === file.size &&
+      cached.result && cached.result.rows && cached.result.rows.length) {
+    // Instant: this exact file was fully read before. The preview still
+    // runs the normal duplicate-file guard via sourceFiles.
+    App.pdfJobShowPreview({ fileName: file.name, fileSize: file.size, hash: hash }, cached.result);
+    return;
+  }
+  var job = {
+    key: key, hash: hash, fileName: file.name, fileSize: file.size,
+    buf: u8.slice(0), // pristine copy; pdf.js may detach the buffer we hand it
+    total: 0, pagesDone: 0, frags: [], pageTimes: [],
+    status: 'reading', paused: false, manuallyPaused: false, wasPausedByHidden: false,
+    resumed: false, cancelled: false, done: false, error: null,
+    gen: 0, stallCount: 0, lastProgressAt: Date.now(),
+    wakeLock: null, pdf: null, _resumeResolve: null, _needsRender: false
+  };
+  if (cached && cached.status === 'partial' && cached.fileSize === file.size &&
+      (cached.pagesTotal || 0) > 0 && (cached.pagesDone || 0) > 0 &&
+      cached.fragsCompact && cached.fragsCompact.length) {
+    job.frags = Parsers.rehydrateFrags(cached.fragsCompact);
+    job.pagesDone = cached.pagesDone;
+    job.total = cached.pagesTotal;
+    job.resumed = true;
+  }
+  App._pdfJob = job;
+  App.state.pdfJobError = '';
+  App.state.tab = 'add';
+  App.state.addView = 'reading';
+  App.render();
+  App.pdfJobLoop(job); // background; all errors land on the job, never throw here
+};
+
+/* Job control actions (buttons in the reading view + Add-home job card). */
+App.Actions['pdfjob-pause'] = function () {
+  var job = App._pdfJob;
+  if (!job || job.done || job.cancelled) return;
+  job.paused = true;
+  job.manuallyPaused = true;
+  job.status = 'paused'; // card swaps Pause -> Resume, text explains the state
+  job._needsRender = true;
+  App.pdfJobRender(job);
+};
+App.Actions['pdfjob-resume'] = function () {
+  var job = App._pdfJob;
+  if (!job || job.done || job.cancelled) return;
+  job.paused = false;
+  job.manuallyPaused = false;
+  job.wasPausedByHidden = false;
+  job.status = 'reading';
+  job.lastProgressAt = Date.now(); // a long pause is not a stall
+  App.pdfJobWakeLock(job);
+  App.pdfJobNotifyResume(job);
+  job._needsRender = true;
+  App.pdfJobRender(job);
+};
+App.Actions['pdfjob-cancel'] = function () {
+  var job = App._pdfJob;
+  if (!job || job.done || job.cancelled) return;
+  job.cancelled = true;
+  job.paused = false;
+  job.manuallyPaused = false;
+  App.pdfJobNotifyResume(job);
+  // The loop breaks, keeps the partial cache, and finishes as cancelled.
+};
+App.Actions['pdfjob-retry'] = function () {
+  var job = App._pdfJob;
+  if (!job || job.status !== 'error') return;
+  job.error = null;
+  job.cancelled = false;
+  job.done = false;
+  job.paused = false;
+  job.manuallyPaused = false;
+  job.wasPausedByHidden = false;
+  job.stallCount = 0;
+  job.status = 'reading';
+  App.state.tab = 'add';
+  App.state.addView = 'reading';
+  App.render();
+  App.pdfJobLoop(job);
+};
+App.Actions['pdfjob-dismiss'] = function () {
+  App._pdfJob = null;
+  App.state.pdfJobError = '';
+  App.state.addView = 'home';
+  App.render();
+};
+
+/** The "reading" sub-view of Add: live job status, never a dead spinner. */
+App.vPdfReading = function (v, seq) {
+  var html = '<h1>Add</h1>';
+  var job = App._pdfJob;
+  if (App.state.pdfJobError && !job) {
+    html += '<div class="banner bad"><strong>Could not read that file.</strong> ' +
+      esc(App.state.pdfJobError) + '</div>';
+  } else if (!job) {
+    html += '<div class="empty">No PDF is being read right now.</div>';
+  } else {
+    html += '<div class="card">' + App.pdfJobCardInner(job) + '</div>';
+    html += '<p class="small">You can leave this tab — reading resumes where it stopped, ' +
+      'even if this tab was put in the background. If the reader stalls, progress is saved ' +
+      'and you can retry from the last completed page.</p>';
+  }
+  html += '<button class="btn ghost" data-action="goto" data-tab="add" data-addview="home">Back to Add</button>';
+  App.show(v, seq, html);
 };
 
 App.vImportPreview = function (v, seq) {
@@ -3854,7 +4306,14 @@ App._test = {
   defaultBudgetMonth: App.defaultBudgetMonth, catLabelSmart: catLabelSmart,
   parseDollarsToMinor: App.parseDollarsToMinor, subDismissSlug: App.subDismissSlug,
   matchQuestion: App.matchQuestion, shortHash: shortHash,
-  _paginate: App._paginate, _dupCacheKey: App._dupCacheKey, TXN_PAGE_SIZE: App.TXN_PAGE_SIZE
+  _paginate: App._paginate, _dupCacheKey: App._dupCacheKey, TXN_PAGE_SIZE: App.TXN_PAGE_SIZE,
+  /* PDF job controller (node-testable via the fakes in tests/pdf-resume.node.js). */
+  runPdfJob: App.runPdfJob, pdfJobLoop: App.pdfJobLoop,
+  pdfJobExtractPage: App.pdfJobExtractPage, pdfJobVisibility: App.pdfJobVisibility,
+  pdfJobRecover: App.pdfJobRecover, pdfJobStatusText: App.pdfJobStatusText,
+  pdfJobEtaText: App.pdfJobEtaText, pdfJobCardInner: App.pdfJobCardInner,
+  pdfCacheSave: App.pdfCacheSave, pdfCacheEvict: App.pdfCacheEvict,
+  pdfJobShowPreview: App.pdfJobShowPreview, vPdfReading: App.vPdfReading
 };
 
 /* ============================================================================

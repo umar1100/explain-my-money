@@ -284,6 +284,9 @@ input[type="file"].hidden-file {
 @keyframes spin { to { transform: rotate(360deg); } }
 .progress { height: 8px; background: #efece4; border-radius: 999px; overflow: hidden; margin: 10px 0; }
 .progress > div { height: 100%; background: var(--accent); width: 0%; transition: width .2s; }
+/* PDF import job progress bar (mirrors .progress; id pdfjob-bar is updated in place). */
+.pbar { height: 8px; background: #efece4; border-radius: 999px; overflow: hidden; margin: 10px 0; }
+.pfill { height: 100%; background: var(--accent); width: 0%; transition: width .2s; }
 
 /* ---------- detail tables ---------- */
 .kv { width: 100%; border-collapse: collapse; font-size: 14px; }
