@@ -241,13 +241,24 @@
     });
   };
 
+  /**
+   * Normalize a primary key for IndexedDB. All object stores use
+   * keyPath 'id' with autoIncrement, so keys are numbers — but DOM
+   * data-id attributes arrive as strings ("1" !== 1 in IndexedDB).
+   * Coerce numeric strings to numbers; leave everything else alone.
+   */
+  function toKey(id) {
+    if (typeof id === 'string' && id !== '' && !isNaN(Number(id))) return Number(id);
+    return id;
+  }
+
   /** Store.get(store, id) -> Promise<object|null>. */
   Store.get = function (store, id) {
     return ensureOpen().then(function () {
       if (STORES[store] === undefined) return Promise.reject(new Error('Unknown store: ' + store));
       if (backend === 'idb') {
         var tx = db.transaction(store, 'readonly');
-        return reqToPromise(tx.objectStore(store).get(id)).then(function (v) {
+        return reqToPromise(tx.objectStore(store).get(toKey(id))).then(function (v) {
           return (v === undefined) ? null : v;
         });
       }
@@ -309,7 +320,7 @@
       if (STORES[store] === undefined) return Promise.reject(new Error('Unknown store: ' + store));
       if (backend === 'idb') {
         var tx = db.transaction(store, 'readwrite');
-        return reqToPromise(tx.objectStore(store).delete(id)).then(function () {
+        return reqToPromise(tx.objectStore(store).delete(toKey(id))).then(function () {
           return txComplete(tx);
         });
       }

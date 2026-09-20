@@ -15,6 +15,7 @@ window.OCR = (() => {
           workerPath: 'vendor/tesseract-worker.min.js',
           corePath: 'vendor/tesseract-core.wasm.js',
           langPath: 'vendor',
+          gzip: false, // we vendor uncompressed eng.traineddata (no .gz file)
           cacheMethod: 'none',
           logger: (m) => { if (onProgress) { try { onProgress(m); } catch (e) {} } }
         });
