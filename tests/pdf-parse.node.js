@@ -126,6 +126,68 @@ async function testFile(label, pdfPath, expected) {
     check('cibc: full month name parses', cibcDate('July 16, 2026') === '2026-07-16', cibcDate('July 16, 2026'));
   }
 
+  // PC: foreign-currency detail printed as ONE line (amount + code + rate),
+  // e.g. "5.25 USA 1.445714285" — seen in the wild with no standalone
+  // currency-code line before it. It belongs to the row above and must not
+  // pause the import as "could not be parsed".
+  if (Parsers.PC && typeof Parsers.PC.parseTextLines === 'function') {
+    // Rolling 3-line header: the third line completes the detection
+    // window and is consumed as the header.
+    const pcTableHead = [
+      { page: 1, text: 'Account activity' },
+      { page: 1, text: 'Transaction history' },
+      { page: 1, text: 'dd/mm dd/mm Description Amount' },
+    ];
+    const fxOneLine = [
+      ...pcTableHead,
+      { page: 1, text: '16/07 16/07 FOREIGN PURCHASE $7.60' },
+      { page: 1, text: '5.25 USA 1.445714285' },
+      { page: 1, text: '15/07 15/07 GROCERY STORE $120.00' },
+    ];
+    const r1 = Parsers.PC.parseTextLines(fxOneLine);
+    check('pc: one-line FX detail does not pause import',
+      r1.unparsed.length === 0 && r1.rows.length === 2,
+      JSON.stringify(r1.unparsed.map((u) => u.text)));
+    check('pc: one-line FX detail attaches to the row above',
+      r1.rows[0] && r1.rows[0].rawDescription.indexOf('5.25 USA 1.445714285') !== -1 &&
+        r1.rows[0].signedAmountMinor === 760,
+      r1.rows[0] ? r1.rows[0].rawDescription : 'no row');
+    check('pc: following row is untouched by FX line',
+      r1.rows[1] && r1.rows[1].rawDescription === 'GROCERY STORE',
+      r1.rows[1] ? r1.rows[1].rawDescription : 'no row');
+    // Same line after a standalone currency-code line: the rate is consumed,
+    // no dangling armed state leaks into the next row.
+    const r2 = Parsers.PC.parseTextLines([
+      ...pcTableHead,
+      { page: 1, text: '16/07 16/07 FOREIGN PURCHASE $7.60' },
+      { page: 1, text: 'USD' },
+      { page: 1, text: '5.25 USD 1.445714285' },
+      { page: 1, text: '15/07 15/07 GROCERY STORE $120.00' },
+    ]);
+    check('pc: one-line FX detail after code line attaches cleanly',
+      r2.unparsed.length === 0 && r2.rows.length === 2 &&
+        r2.rows[0].rawDescription.indexOf('5.25 USD 1.445714285') !== -1 &&
+        r2.rows[1].rawDescription === 'GROCERY STORE',
+      JSON.stringify(r2.unparsed.map((u) => u.text)));
+    // Negative: with no row above (or a row on another page) we still refuse
+    // to guess — the line must be flagged, not silently attached.
+    const r3 = Parsers.PC.parseTextLines([
+      ...pcTableHead,
+      { page: 1, text: '5.25 USA 1.445714285' },
+    ]);
+    check('pc: one-line FX detail with no row above is still flagged',
+      r3.unparsed.length === 1 && r3.rows.length === 0,
+      'unparsed=' + r3.unparsed.length + ' rows=' + r3.rows.length);
+    const r4 = Parsers.PC.parseTextLines([
+      ...pcTableHead,
+      { page: 1, text: '16/07 16/07 FOREIGN PURCHASE $7.60' },
+      { page: 2, text: '5.25 USA 1.445714285' },
+    ]);
+    check('pc: one-line FX detail on another page is still flagged',
+      r4.unparsed.length === 1,
+      'unparsed=' + r4.unparsed.length);
+  }
+
   /* ---------- generic template: synthetic PDFs (hand-built, zero deps) ---------- */
   console.log('== generic template (synthetic PDFs)');
 

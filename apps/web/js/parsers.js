@@ -337,6 +337,11 @@
   var PC_RE_FX_CODE = /^\s*[A-Z]{3}\s*$/;
   var PC_RE_FX_DETAIL = /^\s*[\d,]+\.\d+\s+[A-Z]{3}\b/;
   var PC_RE_FX_RATE_ONLY = /^\s*\d[\d,]*\.\d+\s*$/;
+  // FX detail printed as a single line: foreign amount + currency code + rate
+  // (e.g. "5.25 USA 1.445714285"). Some statements combine the amount/code
+  // line and the rate line, so this must be checked before the two-step
+  // detail flow (which would leave a dangling armed rate otherwise).
+  var PC_RE_FX_COMBINED = /^\s*[\d,]+\.\d+\s+[A-Z]{3}\s+\d+\.\d+\s*$/;
   var PC_RE_AMOUNT = /\$[\d,]+\.\d{2}-|-?\$[\d,]+\.\d{2}/;
   var PC_RE_AMOUNT_LOOSE = /\$[\d,]+\.\d{1,2}/g;
 
@@ -585,6 +590,15 @@
         continue;
       }
 
+      // Foreign-currency detail printed on ONE line (amount + code + rate),
+      // e.g. "5.25 USA 1.445714285": belongs to the row above even when no
+      // standalone currency-code line armed the FX flow.
+      if (PC_RE_FX_COMBINED.test(t) && rows.length &&
+          rows[rows.length - 1].pageNumber === page) {
+        rows[rows.length - 1].rawDescription += ' ' + t;
+        fxArmed = false; fxRateArmed = false;
+        continue;
+      }
       // Foreign-currency detail: belongs to the row above.
       if (PC_RE_FX_CODE.test(t) && rows.length && rows[rows.length - 1].pageNumber === page) {
         rows[rows.length - 1].rawDescription += ' ' + t;
