@@ -678,6 +678,34 @@
     return result;
   };
 
+  /**
+   * Engine.monthlyNetSpend(txns) -> [{month 'YYYY-MM', netMinor}, ...] oldest -> newest.
+   * Groups txns by calendar month (valid ISO dates only) and reports each
+   * month's net spend = Engine.reconcile(monthTxns, null).netSpendMinor
+   * (signed minor units; the app displays magnitudes).
+   */
+  Engine.monthlyNetSpend = function (txns) {
+    var byMonth = {};
+    txns = txns || [];
+    for (var i = 0; i < txns.length; i++) {
+      var t = txns[i];
+      if (!t || typeof t.date !== 'string') continue;
+      var m = /^(\d{4})-(\d{2})-\d{2}$/.exec(t.date);
+      if (!m) continue;
+      var key = m[1] + '-' + m[2];
+      if (!byMonth[key]) byMonth[key] = [];
+      byMonth[key].push(t);
+    }
+    var months = Object.keys(byMonth).sort();
+    var out = [];
+    for (var k = 0; k < months.length; k++) {
+      var rec = null;
+      try { rec = Engine.reconcile(byMonth[months[k]], null); } catch (e) { rec = null; }
+      out.push({ month: months[k], netMinor: rec ? rec.netSpendMinor : 0 });
+    }
+    return out;
+  };
+
   /* ================================================================== */
   /* Briefing (deterministic facts only — NO LLM)                          */
   /* ================================================================== */
@@ -691,15 +719,30 @@
 
   function totalsByCategory(rows) {
     // Spend rows only: purchases (positive) and refunds (negative credits).
+    // Split-aware: a split purchase contributes each split's share to its
+    // split category. Share sign follows the txn's signed spend, so a split
+    // purchase sums to exactly the row's original signed spend and briefing
+    // deltas stay in the same sign convention as unsplit rows.
     var totals = {};
     var counts = {};
-    for (var i = 0; i < rows.length; i++) {
-      var r = rows[i];
+    var expanded = Engine.expandSplits(rows);
+    var counted = {};
+    for (var i = 0; i < expanded.length; i++) {
+      var ex = expanded[i], r = ex.txn;
+      if (!r) continue;
       if (r.kind !== 'purchase' && r.kind !== 'refund') continue;
-      var key = categoryKeyFor(r);
-      var amt = (r.amountMinor === null || r.amountMinor === undefined) ? 0 : r.amountMinor;
+      var key = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(r);
+      var amt;
+      if (ex.fromSplit) {
+        var tAmt = (r.amountMinor === null || r.amountMinor === undefined) ? 0 : r.amountMinor;
+        amt = tAmt < 0 ? -(ex.amountMinor || 0) : (ex.amountMinor || 0);
+      } else {
+        amt = (r.amountMinor === null || r.amountMinor === undefined) ? 0 : r.amountMinor;
+      }
       totals[key] = (totals[key] || 0) + amt;
-      counts[key] = (counts[key] || 0) + 1;
+      // counts track SOURCE rows per category (a split txn counts once).
+      var ck = ex.row + '|' + key;
+      if (!counted[ck]) { counted[ck] = 1; counts[key] = (counts[key] || 0) + 1; }
     }
     return { totals: totals, counts: counts };
   }
@@ -966,6 +1009,262 @@
   };
 
   /* ================================================================== */
+  /* Splits: one purchase across several categories                     */
+  /* ================================================================== */
+
+  /**
+   * Engine.splitEvenly(totalMinor, n) -> [shareMinor, ...] (n integer shares).
+   * Divides a positive magnitude into n integer shares: base=floor(total/n)
+   * each, and the first `total % n` rows get one extra penny — remainder
+   * pennies go to the first rows (the largest shares). The shares always
+   * sum to exactly totalMinor. Integer math only.
+   */
+  Engine.splitEvenly = function (totalMinor, n) {
+    var total = Math.abs(Math.floor(totalMinor || 0));
+    n = Math.floor(n || 0);
+    if (n <= 0 || total <= 0) return [];
+    var base = Math.floor(total / n);
+    var rem = total - base * n;
+    var out = [];
+    for (var i = 0; i < n; i++) out.push(base + (i < rem ? 1 : 0));
+    return out;
+  };
+
+  // A stored split is valid only when every row has a non-blank category, a
+  // positive integer magnitude, and the parts sum to exactly |spend|.
+  // Invalid splits are treated as unsplit (the single-category row) —
+  // a corrupt split must never silently change a total.
+  function validSplit(splits, txn) {
+    if (!Array.isArray(splits) || splits.length === 0) return false;
+    var total = 0;
+    for (var i = 0; i < splits.length; i++) {
+      var s = splits[i] || {};
+      if (trimStr(s.category) === '') return false;
+      var a = s.amountMinor;
+      if (typeof a !== 'number' || !isFinite(a) || Math.floor(a) !== a || a <= 0) return false;
+      total += a;
+    }
+    if (!txn) return false;
+    var m = txn.spendAmountMinor;
+    if (m === null || m === undefined) m = txn.amountMinor;
+    return total === Math.abs(m || 0);
+  }
+
+  /**
+   * Engine.expandSplits(txns) -> [{txn, row, category, amountMinor, fromSplit}]
+   * Expands per-category splits: a txn carrying a valid t.splits
+   * ([{category, amountMinor}] positive magnitudes summing to exactly |spend|)
+   * yields one row per split; anything else yields one row with the txn's own
+   * category. amountMinor is always a positive MAGNITUDE — callers apply the
+   * kind's sign convention themselves. row is the index into txns (for
+   * stable per-txn counting).
+   */
+  Engine.expandSplits = function (txns) {
+    var out = [];
+    txns = txns || [];
+    for (var i = 0; i < txns.length; i++) {
+      var t = txns[i];
+      if (!t) continue;
+      if (validSplit(t.splits, t)) {
+        for (var s = 0; s < t.splits.length; s++) {
+          out.push({ txn: t, row: i, category: t.splits[s].category,
+                     amountMinor: t.splits[s].amountMinor, fromSplit: true });
+        }
+      } else {
+        var m = t.spendAmountMinor;
+        if (m === null || m === undefined) m = t.amountMinor;
+        out.push({ txn: t, row: i, category: t.category || '',
+                   amountMinor: Math.abs(m || 0), fromSplit: false });
+      }
+    }
+    return out;
+  };
+
+  /**
+   * Engine.splitAwareCategoryTotals(txns, monthPrefix) -> {category: minor}.
+   * Purchase-only spend totals for one 'YYYY-MM' month, honoring splits:
+   * a split purchase contributes each split's magnitude to its split
+   * category. Excluded and duplicate txns never count. Integer math only.
+   * Category keys mirror buildBriefing's: the expanded category, falling
+   * back to the merchant name when the row has no category.
+   */
+  Engine.splitAwareCategoryTotals = function (txns, monthPrefix) {
+    var totals = {};
+    var expanded = Engine.expandSplits(txns || []);
+    for (var i = 0; i < expanded.length; i++) {
+      var ex = expanded[i], t = ex.txn;
+      if (!t || t.kind !== 'purchase') continue;
+      if (t.excluded) continue;
+      if (t.status === 'duplicate') continue;
+      if (typeof t.date !== 'string' || t.date.indexOf(monthPrefix) !== 0) continue;
+      var key = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(t);
+      totals[key] = (totals[key] || 0) + (ex.amountMinor || 0);
+    }
+    return totals;
+  };
+
+  /* ================================================================== */
+  /* Planning: budget spend + recurring-charge detection                  */
+  /* ================================================================== */
+
+  /**
+   * Engine.categorySpendMinor(txns, categoryId, monthPrefix) -> int minor.
+   * Spend magnitude summed over txns with kind==='purchase', matching
+   * category, date starting with monthPrefix ('YYYY-MM'), not excluded,
+   * and status!=='duplicate'. Split-aware via splitAwareCategoryTotals.
+   * Integer math only.
+   */
+  Engine.categorySpendMinor = function (txns, categoryId, monthPrefix) {
+    var totals = Engine.splitAwareCategoryTotals(txns, monthPrefix);
+    var v = totals[String(categoryId)];
+    return v === undefined ? 0 : v;
+  };
+
+  /**
+   * Engine._normSubMerchant(raw) -> lowercase, whitespace-collapsed merchant
+   * with trailing store-number tokens stripped ("#138", "no 138", "no. 12").
+   * More aggressive than normalizeMerchant(): subscription grouping needs
+   * "NETFLIX #138" and "NETFLIX" to land in one bucket.
+   */
+  Engine._normSubMerchant = function (raw) {
+    var s = String(raw == null ? '' : raw).toLowerCase().replace(/\s+/g, ' ');
+    s = s.replace(/^\s+|\s+$/g, '');
+    s = s.replace(/\s*(#\s*\d+|no\.?\s*\d+)$/, '');
+    return s.replace(/\s+/g, ' ').replace(/^\s+|\s+$/g, '');
+  };
+
+  // Median of a SORTED numeric array (even n -> average of the middle two).
+  function medianSorted(sorted) {
+    var n = sorted.length;
+    if (n === 0) return 0;
+    var mid = Math.floor(n / 2);
+    if (n % 2 === 1) return sorted[mid];
+    return (sorted[mid - 1] + sorted[mid]) / 2;
+  }
+
+  // ISO date -> integer day number (UTC); day number -> ISO date.
+  function utcDayNumber(iso) {
+    var p = String(iso).split('-');
+    return Math.floor(Date.UTC(+p[0], +p[1] - 1, +p[2]) / 86400000);
+  }
+  function isoFromDayNumber(dn) {
+    var d = new Date(dn * 86400000);
+    return d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate());
+  }
+
+  /**
+   * Engine.detectSubscriptions(txns) -> [ {merchant (normalized),
+   *   displayName (most common raw text), cadence ('monthly'|'weekly'|'yearly'),
+   *   amountMinor (median, rounded to int), occurrences, lastDate,
+   *   nextExpected ('YYYY-MM-DD'), priceChanged, monthlyCostMinor}, ... ]
+   * sorted by monthlyCostMinor desc.
+   *
+   * Heuristic, deliberately conservative (uncertain groups are DISCARDED,
+   * never presented as fact):
+   *  - only kind==='purchase', !excluded, status!=='duplicate', valid date;
+   *  - group by normalized merchant; require >= 3 occurrences;
+   *  - median gap between consecutive dates sets cadence:
+   *      25-35 days -> monthly, 6-8 -> weekly, 360-370 -> yearly, else discard;
+   *  - amounts (|amountMinor|): earlier occurrences must each sit within 5%
+   *    of the earlier median (|a-m|*100 > m*5 discards the group). The LATEST
+   *    occurrence is compared separately: a >5% move vs the earlier median
+   *    sets priceChanged instead of discarding (needs >= 2 earlier, which the
+   *    >= 3 occurrences rule guarantees). Zero-cost medians are discarded.
+   *  - nextExpected = lastDate + median gap (UTC); monthlyCostMinor normalizes
+   *    the median to a monthly figure (weekly: median*30/7, yearly: median/12).
+   */
+  Engine.detectSubscriptions = function (txns) {
+    var groups = {};
+    txns = txns || [];
+    for (var i = 0; i < txns.length; i++) {
+      var t = txns[i];
+      if (!t || t.kind !== 'purchase') continue;
+      if (t.excluded) continue;
+      if (t.status === 'duplicate') continue;
+      if (!looksLikeISODate(t.date)) continue;
+      if (typeof t.amountMinor !== 'number' || !isFinite(t.amountMinor)) continue;
+      var key = Engine._normSubMerchant(t.merchantRaw);
+      if (!key) continue;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push({ date: t.date, raw: t.merchantRaw, amount: Math.abs(t.amountMinor), order: i });
+    }
+
+    var out = [];
+    var keys = Object.keys(groups);
+    for (var g = 0; g < keys.length; g++) {
+      var items = groups[keys[g]];
+      if (items.length < 3) continue;
+      items.sort(function (a, b) {
+        if (a.date < b.date) return -1;
+        if (a.date > b.date) return 1;
+        return a.order - b.order;
+      });
+
+      // Gaps between consecutive DISTINCT dates (same-day repeats collapse;
+      // they are re-purchases, not a cadence signal).
+      var gaps = [];
+      for (var d = 1; d < items.length; d++) {
+        var gp = utcDayNumber(items[d].date) - utcDayNumber(items[d - 1].date);
+        if (gp > 0) gaps.push(gp);
+      }
+      if (gaps.length < 2) continue; // < 3 distinct dates: no cadence to infer
+      gaps.sort(function (a, b) { return a - b; });
+      var medGap = medianSorted(gaps);
+      var cadence = null;
+      if (medGap >= 25 && medGap <= 35) cadence = 'monthly';
+      else if (medGap >= 6 && medGap <= 8) cadence = 'weekly';
+      else if (medGap >= 360 && medGap <= 370) cadence = 'yearly';
+      if (!cadence) continue;
+
+      // Amounts: earlier history must be stable; the latest occurrence is
+      // evaluated separately as a possible price change.
+      var earlier = [];
+      for (d = 0; d < items.length - 1; d++) earlier.push(items[d].amount);
+      earlier.sort(function (a, b) { return a - b; });
+      var medEarlier = medianSorted(earlier);
+      if (!(medEarlier > 0)) continue;
+      var noisy = false;
+      for (d = 0; d < earlier.length; d++) {
+        if (Math.abs(earlier[d] - medEarlier) * 100 > medEarlier * 5) { noisy = true; break; }
+      }
+      if (noisy) continue;
+      var latest = items[items.length - 1].amount;
+      var priceChanged = Math.abs(latest - medEarlier) * 100 > medEarlier * 5;
+
+      var allSorted = earlier.concat([latest]).sort(function (a, b) { return a - b; });
+      var medMinor = Math.round(medianSorted(allSorted)); // minor units: int
+      var monthlyCostMinor;
+      if (cadence === 'weekly') monthlyCostMinor = Math.round(medMinor * 30 / 7);
+      else if (cadence === 'yearly') monthlyCostMinor = Math.round(medMinor / 12);
+      else monthlyCostMinor = medMinor;
+
+      // displayName: most common raw merchant text (first-seen wins ties).
+      var counts = {};
+      var best = items[0].raw || '', bestN = 0;
+      for (d = 0; d < items.length; d++) {
+        var rn = items[d].raw || '';
+        counts[rn] = (counts[rn] || 0) + 1;
+        if (counts[rn] > bestN) { bestN = counts[rn]; best = rn; }
+      }
+
+      var lastDate = items[items.length - 1].date;
+      out.push({
+        merchant: keys[g],
+        displayName: best,
+        cadence: cadence,
+        amountMinor: medMinor,
+        occurrences: items.length,
+        lastDate: lastDate,
+        nextExpected: isoFromDayNumber(utcDayNumber(lastDate) + Math.round(medGap)),
+        priceChanged: priceChanged,
+        monthlyCostMinor: monthlyCostMinor
+      });
+    }
+    out.sort(function (a, b) { return b.monthlyCostMinor - a.monthlyCostMinor; });
+    return out;
+  };
+
+  /* ================================================================== */
   /* Money formatting                                                     */
   /* ================================================================== */
 
@@ -1003,6 +1302,239 @@
       { id: 'fees',           name: 'Fees',            parentId: null },
       { id: 'other',          name: 'Other',           parentId: null }
     ];
+  };
+
+  /* ================================================================== */
+  /* Statement coverage + sample data (Phase 4)                           */
+  /* ================================================================== */
+
+  /**
+   * Engine._mulberry32(seed) -> () -> [0,1).
+   * Small seeded PRNG used only for synthetic sample data. Integer
+   * arithmetic only (Math.imul, ^, >>>): the sequence is bit-identical on
+   * every platform, so Engine.sampleData is deterministic per seed.
+   */
+  Engine._mulberry32 = function (seed) {
+    var a = (seed === null || seed === undefined) ? 1 : (seed >>> 0);
+    return function () {
+      a = (a + 0x6D2B79F5) >>> 0;
+      var t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  };
+
+  /** Current calendar month as 'YYYY-MM' (local time). */
+  Engine._currentMonth = function () {
+    var n = new Date();
+    return n.getFullYear() + '-' + ('0' + (n.getMonth() + 1)).slice(-2);
+  };
+
+  /** Previous calendar month as 'YYYY-MM' (pure; ES2019). */
+  Engine._prevMonth = function (ym) {
+    var y = +String(ym).slice(0, 4), m = +String(ym).slice(5, 7);
+    m -= 1;
+    if (m < 1) { m = 12; y -= 1; }
+    return y + '-' + ('0' + m).slice(-2);
+  };
+
+  /** Last day of month ym as 'YYYY-MM-DD' (pure; null when ym is invalid). */
+  Engine._monthLastDay = function (ym) {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(ym || ''))) return null;
+    var y = +ym.slice(0, 4), m = +ym.slice(5, 7);
+    var d = (m === 2)
+      ? (((y % 4 === 0 && y % 100 !== 0) || y % 400 === 0) ? 29 : 28)
+      : ((m === 4 || m === 6 || m === 9 || m === 11) ? 30 : 31);
+    return ym + '-' + (d < 10 ? '0' : '') + d;
+  };
+
+  /**
+   * Engine.monthCovered(statements, monthPrefix) -> bool.
+   * True when any statement's [periodStart, periodEnd] overlaps month M
+   * (ISO date strings compare lexicographically). A statement covers M if
+   * periodStart <= last-day-of-M AND periodEnd >= first-day-of-M.
+   * Missing/malformed periodStart or periodEnd counts as uncovered —
+   * never guess.
+   */
+  Engine.monthCovered = function (statements, monthPrefix) {
+    var ym = String(monthPrefix || '');
+    var first = ym + '-01';
+    var last = Engine._monthLastDay(ym);
+    if (last === null) return false;
+    statements = statements || [];
+    for (var i = 0; i < statements.length; i++) {
+      var s = statements[i] || {};
+      var ps = s.periodStart, pe = s.periodEnd;
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(ps || '') || !/^\d{4}-\d{2}-\d{2}$/.test(pe || '')) continue;
+      if (ps <= last && pe >= first) return true;
+    }
+    return false;
+  };
+
+  /* Neutral fictional merchants for sample data (~4 per category). */
+  var SAMPLE_MERCHANTS = {
+    groceries:       ['FRESHCO', 'LOBLAWS', 'SOBEYS', 'COSTCO'],
+    household:       ['CANADIAN TIRE', 'HOME DEPOT', 'DOLLARAMA', 'IKEA'],
+    dining:          ['TIM HORTONS', 'STARBUCKS', 'PIZZA PIZZA', 'HARVEYS'],
+    transport:       ['UBER', 'SHELL', 'PETRO-CANADA', 'TTC'],
+    health_pharmacy: ['SHOPPERS DRUG', 'REXALL', 'DENTAL CARE', 'LIFE LABS'],
+    subscriptions:   ['SPOTIFY', 'NETFLIX', 'DROPBOX', 'GITHUB'],
+    shopping:        ['AMAZON', 'WALMART', 'BEST BUY', 'ZARA'],
+    fees:            ['BANK FEE', 'SERVICE FEE', 'ANNUAL FEE', 'OVERDRAFT FEE'],
+    other:           ['POST OFFICE', 'CITY TAXES', 'DONATION', 'LIBRARY']
+  };
+  var SAMPLE_BATCH = 'v2-sample';
+
+  /**
+   * Engine.sampleData(seed, baseMonth) -> {account, statements, txns}.
+   * Deterministic synthetic ledger for the "Try with sample data" button.
+   * PURE: no Date.now(), no Math.random — the same (seed, baseMonth) pair
+   * always yields JSON-identical output. baseMonth ('YYYY-MM', default
+   * current month) anchors the 3 consecutive months (oldest -> newest).
+   *
+   * Shape notes for the app layer:
+   *  - statements carry a local `stmtKey` (their 'YYYY-MM'); the app must
+   *    remap it to the real statement id when inserting.
+   *  - accountId on statements is null; the app fills it after inserting
+   *    the account.
+   *  - reportedStartMinor/EndMinor are null, so Engine.reconcile() reports
+   *    balanceCheck 'no_baseline' -> the app maps this to 'unavailable'.
+   *    Honest: synthetic data has no real balances to check against.
+   *  - Every record is tagged sample:true + sampleBatch 'v2-sample' so the
+   *    whole batch is findable and removable.
+   */
+  Engine.sampleData = function (seed, baseMonth) {
+    var rnd = Engine._mulberry32(seed);
+    var ym = /^\d{4}-(0[1-9]|1[0-2])$/.test(String(baseMonth || ''))
+      ? String(baseMonth) : Engine._currentMonth();
+    var m0 = Engine._prevMonth(Engine._prevMonth(ym));
+    var m1 = Engine._prevMonth(ym);
+    var months = [m0, m1, ym];
+
+    var cats = Engine.defaultCategories().map(function (c) { return c.id; });
+    var pickCat = function () { return cats[Math.floor(rnd() * cats.length)]; };
+    var pickMerchant = function (cat) {
+      var list = SAMPLE_MERCHANTS[cat] || SAMPLE_MERCHANTS.other;
+      return list[Math.floor(rnd() * list.length)];
+    };
+    var dollarsTextMinor = function (minor) {
+      var m = minor < 0 ? -minor : minor;
+      return Math.floor(m / 100) + '.' + ('0' + (m % 100)).slice(-2);
+    };
+
+    var statements = months.map(function (m) {
+      return {
+        stmtKey: m,
+        accountId: null,
+        sourceFileId: null,
+        periodStart: m + '-01',
+        periodEnd: Engine._monthLastDay(m),
+        scopeLabel: 'Sample data \u00B7 ' + m,
+        reportedStartMinor: null,
+        reportedEndMinor: null,
+        createdAt: 0,
+        sample: true,
+        sampleBatch: SAMPLE_BATCH
+      };
+    });
+
+    var txns = [];
+    for (var mi = 0; mi < months.length; mi++) {
+      var m = months[mi];
+      var daysInMonth = +Engine._monthLastDay(m).slice(8, 10);
+      var count = 26 + mi + Math.floor(rnd() * 7); // 26-34 per month
+      var monthTxns = [];
+      for (var i = 0; i < count; i++) {
+        var r = rnd();
+        var cat = pickCat();
+        var merchant = pickMerchant(cat);
+        var kind, amountMinor;
+        if (r < 0.08) { // a few refunds (positive per CSV convention)
+          kind = 'refund';
+          amountMinor = 500 + Math.floor(rnd() * 4501); // $5.00-$50.00
+        } else {        // mostly purchases (negative per CSV convention)
+          kind = 'purchase';
+          amountMinor = -(300 + Math.floor(rnd() * 17701)); // -$3.00 to -$180.00
+        }
+        var day = 1 + Math.floor(rnd() * daysInMonth);
+        var dd = day < 10 ? '0' + day : String(day);
+        var date = m + '-' + dd;
+        monthTxns.push({
+          stmtKey: m,
+          statementId: null,
+          rowIndex: 0, // assigned after sorting
+          date: date,
+          rawDateText: date,
+          merchantRaw: merchant,
+          rawDescription: merchant,
+          rawAmountText: dollarsTextMinor(amountMinor),
+          rawCurrency: 'CAD',
+          amountMinor: amountMinor,
+          spendAmountMinor: amountMinor < 0 ? -amountMinor : amountMinor,
+          currency: 'CAD',
+          kind: kind,
+          kindConfidence: 'high',
+          kindReason: 'sample data',
+          classificationSource: 'sample',
+          category: cat,
+          excluded: 0,
+          confidence: 'high',
+          status: 'new',
+          sample: true,
+          sampleBatch: SAMPLE_BATCH
+        });
+      }
+      // One payment per month (negative: money into the card account, per
+      // the card-statement convention used by the generic parser).
+      var payDay = 1 + Math.floor(rnd() * daysInMonth);
+      var pdd = payDay < 10 ? '0' + payDay : String(payDay);
+      var pdate = m + '-' + pdd;
+      var payMinor = -(20000 + Math.floor(rnd() * 60001)); // -$200.00 to -$800.00
+      monthTxns.push({
+        stmtKey: m,
+        statementId: null,
+        rowIndex: 0,
+        date: pdate,
+        rawDateText: pdate,
+        merchantRaw: 'ONLINE PAYMENT',
+        rawDescription: 'ONLINE PAYMENT',
+        rawAmountText: dollarsTextMinor(payMinor),
+        rawCurrency: 'CAD',
+        amountMinor: payMinor,
+        spendAmountMinor: -payMinor,
+        currency: 'CAD',
+        kind: 'payment',
+        kindConfidence: 'high',
+        kindReason: 'sample data',
+        classificationSource: 'sample',
+        category: 'other',
+        excluded: 0,
+        confidence: 'high',
+        status: 'new',
+        sample: true,
+        sampleBatch: SAMPLE_BATCH
+      });
+      monthTxns.sort(function (a, b) {
+        if (a.date < b.date) return -1;
+        if (a.date > b.date) return 1;
+        return a.merchantRaw < b.merchantRaw ? -1 : 1;
+      });
+      for (var k = 0; k < monthTxns.length; k++) monthTxns[k].rowIndex = k;
+      txns = txns.concat(monthTxns);
+    }
+
+    return {
+      account: {
+        name: 'Sample Bank',
+        type: 'sample',
+        createdAt: 0,
+        sample: true,
+        sampleBatch: SAMPLE_BATCH
+      },
+      statements: statements,
+      txns: txns
+    };
   };
 
   /* Expose global (ES2019-safe global lookup). */

@@ -84,6 +84,17 @@
     return String(s).replace(/[‘’\u0091\u0092`]/g, "'");
   }
 
+  /**
+   * Yield to the event loop so progress paints on phones. No-op when
+   * setTimeout is unavailable (e.g. the node test sandbox).
+   */
+  function yieldToUI() {
+    if (typeof setTimeout === 'function') {
+      return new Promise(function (r) { setTimeout(r, 0); });
+    }
+    return Promise.resolve();
+  }
+
   function looksLikeISODate(s) {
     if (typeof s !== 'string') return false;
     var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trim(s));
@@ -135,6 +146,9 @@
         }
       }
       if (page.cleanup) page.cleanup();
+      // Yield to the event loop per page so the "Reading page X of Y…"
+      // progress actually paints on phones instead of freezing the UI.
+      await yieldToUI();
       if (typeof onProgress === 'function') {
         try { onProgress(p, n); } catch (e) { /* progress must never break parsing */ }
       }
@@ -1158,7 +1172,7 @@
    * meta, warnings} or {rows: [], noStatement: true, reason, pageCount}.
    * Pure function over collectItems fragments.
    */
-  Parsers.parseGeneric = function (frags) {
+  Parsers.parseGeneric = async function (frags) {
     var warnings = [];
     var lines = genericBuildLines(frags || []);
     var pageCount = 0;
@@ -1177,6 +1191,8 @@
     // Pass 1: balance/summary lines + candidate rows.
     var candidates = [], skippedUndated = 0;
     for (var li = 0; li < lines.length; li++) {
+      // Yield every ~200 lines so long documents don't freeze the UI.
+      if (li % 200 === 0) await yieldToUI();
       var line = lines[li], text = line.text;
       if (GENERIC_RE_PAGE_FOOTER.test(text)) continue;
       var dateSpans = genericFindDates(text);
@@ -1474,7 +1490,7 @@
       var firstPageText = detectLines.map(function (l) { return l.text; }).join('\n');
       var format = Parsers.detectFormat(firstPageText);
       if (!format) {
-        var generic = Parsers.parseGeneric(frags);
+        var generic = await Parsers.parseGeneric(frags);
         if (generic.noStatement) {
           var n = generic.pageCount || 0;
           throw new Error('This PDF doesn\'t look like a bank or credit-card ' +

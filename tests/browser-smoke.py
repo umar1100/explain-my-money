@@ -3,9 +3,9 @@
 MANUAL / LOCAL-ONLY: requires Playwright + a local Chromium install, so it
 is NOT run in CI. Serves nothing itself; expects the app at the base URL
 (passed as argv[1] or EMM_SMOKE_URL, default http://localhost:8080).
-Checks: boot, CSV import + pipeline, Month briefing, Statement detail,
-Ask answer + AI-off default, Privacy screen, zero non-local requests,
-service worker registration. Screenshots to tests/shots/.
+Checks: boot, onboarding overlay, CSV import + pipeline, Month briefing, Statement detail,
+Ask answer + AI-off default, Privacy screen, More (accounts + sample data + replay tour),
+zero non-local requests, service worker registration. Screenshots to tests/shots/.
 Run: python3 tests/browser-smoke.py [url]
 """
 import sys, os, json
@@ -42,9 +42,17 @@ def main():
         page.goto(BASE, wait_until="networkidle")
         page.wait_for_selector(".tabbar .tab", timeout=15000)
         tabs = page.locator(".tabbar .tab").count()
-        check("boot: 5 tabs render", tabs == 5, f"found {tabs}")
+        check("boot: 6 tabs render", tabs == 6, f"found {tabs}")
         check("boot: Add screen first-run", page.locator("#stmt-file").count() == 1)
         page.screenshot(path=f"{SHOTS}/01-add.png")
+
+        # 1b. Onboarding overlay (first run: zero statements, tour not done).
+        # It covers the screen, so dismiss it before the import flow.
+        check("onboarding: overlay shown on first run", page.locator("#onboard").count() == 1)
+        page.screenshot(path=f"{SHOTS}/01b-onboarding.png")
+        page.click('button[data-action="onboard-skip"]')
+        page.wait_for_timeout(400)
+        check("onboarding: skip dismisses overlay", page.locator("#onboard").count() == 0)
 
         # 2. CSV import
         page.set_input_files("#stmt-file", str(CSV))
@@ -104,6 +112,19 @@ def main():
         check("privacy: screen renders", "Your data never leaves this device" in body)
         check("privacy: network row honest", "Optional AI phrasing is the only network use" in body)
         page.screenshot(path=f"{SHOTS}/07-privacy.png")
+
+        # 6b. More → accounts + sample data (Phase 4)
+        page.click('button[data-action="back-more"]')
+        page.wait_for_timeout(600)
+        check("more: sample-data add button present", page.locator('button[data-action="sample-add"]').count() == 1)
+        check("more: replay-tour button present", page.locator('button[data-action="onboard-replay"]').count() == 1)
+        page.click('button[data-action="goto"][data-more="accounts"]')
+        page.wait_for_timeout(800)
+        body = page.inner_text("#view")
+        check("accounts: screen renders", "Accounts" in body)
+        check("accounts: per-account totals", "across" in body and "transaction" in body)
+        check("accounts: coverage legend", "last 12 months" in body)
+        page.screenshot(path=f"{SHOTS}/08-accounts.png")
 
         # 7. Network audit
         check("network: zero requests outside the app server", len(ext_requests) == 0,

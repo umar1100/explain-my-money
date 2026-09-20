@@ -43,6 +43,15 @@
  *   briefings(id, periodStart, periodEnd, scopeLabel, factsJson, createdAt)
  *   qaEvidence(id, checkName, result, details, createdAt)
  *
+ * SCHEMA (v2) additions (Phase 2: Plan tab):
+ *   budgets(id, category, month 'YYYY-MM', limitMinor)
+ *   goals(id, name, targetMinor, savedMinor, targetDate 'YYYY-MM-DD'|null,
+ *         note, createdAt)
+ *   prefs: natural-key store (keyPath 'key', NO autoIncrement).
+ *     Holds single-value UI/app preferences, e.g. {key:'sub_dismissed_x', value:'1'}.
+ *     Keys are arbitrary non-numeric strings; toKey() coerces numeric strings,
+ *     so callers must use non-numeric keys.
+ *
  * ES2019-compatible plain script: no modules, no bundler. Exposes global
  * `Store`. Load order in index.html: engine.js, store.js, app.js.
  * ========================================================================== */
@@ -52,12 +61,13 @@
   var Store = {};
 
   /** Schema version. Bump when object stores/indexes change (add migration). */
-  Store.SCHEMA_VERSION = 1;
+  Store.SCHEMA_VERSION = 2;
   Store.DB_NAME = 'emmdb';
 
   var LS_PREFIX = 'emm_';
 
-  // Object-store definitions: keyPath 'id', autoIncrement, plus indexes.
+  // Object-store definitions. Default keyPath is 'id' with autoIncrement;
+  // a store may override with its own keyPath/autoIncrement (e.g. prefs).
   var STORES = {
     sourceFiles:      { indexes: [{ name: 'sha256', keyPath: 'sha256', unique: false }] },
     accounts:         { indexes: [] },
@@ -79,10 +89,32 @@
     corrections:      { indexes: [] },
     auditEvents:      { indexes: [{ name: 'timestamp', keyPath: 'timestamp', unique: false }] },
     briefings:        { indexes: [] },
-    qaEvidence:       { indexes: [] }
+    qaEvidence:       { indexes: [] },
+    budgets:          { indexes: [] },
+    goals:            { indexes: [] },
+    prefs:            { keyPath: 'key', autoIncrement: false, indexes: [] }
   };
 
   var STORE_NAMES = Object.keys(STORES);
+
+  /** Primary-key field for a store (default 'id'; prefs uses 'key'). */
+  function keyField(store) {
+    var def = STORES[store];
+    return (def && def.keyPath) || 'id';
+  }
+
+  /** Sort records by primary key: numeric for 'id' stores, lexical otherwise. */
+  function sortByKey(arr, store) {
+    var kf = keyField(store);
+    arr.sort(function (a, b) {
+      if (kf === 'id') return ((a && a.id) || 0) - ((b && b.id) || 0);
+      var ak = String((a && a[kf]) || ''), bk = String((b && b[kf]) || '');
+      if (ak < bk) return -1;
+      if (ak > bk) return 1;
+      return 0;
+    });
+    return arr;
+  }
 
   var backend = null; // 'idb' | 'local'
   var db = null;
@@ -128,13 +160,17 @@
         var d = req.result;
         for (var i = 0; i < STORE_NAMES.length; i++) {
           var name = STORE_NAMES[i];
+          var def = STORES[name];
           var os;
           if (d.objectStoreNames.contains(name)) {
             os = req.transaction.objectStore(name);
           } else {
-            os = d.createObjectStore(name, { keyPath: 'id', autoIncrement: true });
+            os = d.createObjectStore(name, {
+              keyPath: def.keyPath || 'id',
+              autoIncrement: (def.autoIncrement === undefined) ? true : def.autoIncrement
+            });
           }
-          var idxDefs = STORES[name].indexes;
+          var idxDefs = def.indexes;
           for (var j = 0; j < idxDefs.length; j++) {
             var idef = idxDefs[j];
             if (!os.indexNames.contains(idef.name)) {
@@ -217,24 +253,28 @@
 
   /**
    * Store.put(store, obj) -> Promise<id>.
-   * Insert (no obj.id) or upsert (obj.id present). Returns the record id.
+   * Insert (no primary key) or upsert (primary key present). The primary key
+   * field comes from the store def: 'id' for auto-increment stores, 'key'
+   * for prefs. Returns the record's primary key.
    */
   Store.put = function (store, obj) {
     return ensureOpen().then(function () {
       if (STORES[store] === undefined) return Promise.reject(new Error('Unknown store: ' + store));
       obj = obj || {};
+      var kf = keyField(store);
+      var kval = obj[kf];
       if (backend === 'idb') {
         var tx = db.transaction(store, 'readwrite');
         var os = tx.objectStore(store);
-        var req = (obj.id === null || obj.id === undefined) ? os.add(obj) : os.put(obj);
+        var req = (kval === null || kval === undefined) ? os.add(obj) : os.put(obj);
         return reqToPromise(req).then(function (key) {
           return txComplete(tx).then(function () { return key; });
         });
       }
       // localStorage fallback: identical semantics.
       var records = lsRead(store);
-      var id = (obj.id === null || obj.id === undefined) ? lsNextId(store) : obj.id;
-      obj.id = id;
+      var id = (kval === null || kval === undefined) ? lsNextId(store) : kval;
+      obj[kf] = id;
       records[String(id)] = obj;
       lsWrite(store, records);
       return id;
@@ -242,10 +282,11 @@
   };
 
   /**
-   * Normalize a primary key for IndexedDB. All object stores use
-   * keyPath 'id' with autoIncrement, so keys are numbers — but DOM
-   * data-id attributes arrive as strings ("1" !== 1 in IndexedDB).
-   * Coerce numeric strings to numbers; leave everything else alone.
+   * Normalize a primary key for IndexedDB. 'id' stores are auto-increment
+   * numbers — but DOM data-id attributes arrive as strings ("1" !== 1 in
+   * IndexedDB). Coerce numeric strings to numbers; leave everything else
+   * alone. Callers of the natural-key 'prefs' store must use NON-numeric
+   * string keys (numeric strings would be coerced and miss).
    */
   function toKey(id) {
     if (typeof id === 'string' && id !== '' && !isNaN(Number(id))) return Number(id);
@@ -268,21 +309,19 @@
     });
   };
 
-  /** Store.all(store) -> Promise<object[]> (all records, id-ascending). */
+  /** Store.all(store) -> Promise<object[]> (all records, key-ascending). */
   Store.all = function (store) {
     return ensureOpen().then(function () {
       if (STORES[store] === undefined) return Promise.reject(new Error('Unknown store: ' + store));
       if (backend === 'idb') {
         var tx = db.transaction(store, 'readonly');
         return reqToPromise(tx.objectStore(store).getAll()).then(function (arr) {
-          arr.sort(function (a, b) { return (a.id || 0) - (b.id || 0); });
-          return arr;
+          return sortByKey(arr, store);
         });
       }
       var records = lsRead(store);
       var out = Object.keys(records).map(function (k) { return records[k]; });
-      out.sort(function (a, b) { return (a.id || 0) - (b.id || 0); });
-      return out;
+      return sortByKey(out, store);
     });
   };
 
@@ -309,8 +348,7 @@
         var rec = records[keys[i]];
         if (rec && rec[index] === value) out.push(rec);
       }
-      out.sort(function (a, b) { return (a.id || 0) - (b.id || 0); });
-      return out;
+      return sortByKey(out, store);
     });
   };
 

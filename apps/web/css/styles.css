@@ -375,3 +375,25 @@ details.more summary::-webkit-details-marker { color: var(--accent); }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }
 }
+
+/* Phase 4: account coverage strip + inline rename */
+.acct-head { display: flex; align-items: center; gap: 8px; }
+.acct-name { font-size: 17px; font-weight: 700; border: 1px solid transparent; border-radius: 8px;
+  padding: 4px 8px; background: transparent; width: 100%; max-width: 260px; }
+.acct-name:hover { border-color: var(--line); }
+.acct-name:focus { border-color: var(--accent); background: #fff; outline: none; }
+.cov-strip { display: flex; gap: 4px; margin: 4px 0 2px; }
+.cov { display: inline-block; width: 16px; height: 16px; border-radius: 4px; }
+.cov.hit { background: var(--accent); }
+.cov.miss { border: 1.5px solid var(--muted); background: transparent; }
+.cov.legend { width: 12px; height: 12px; border-radius: 3px; vertical-align: -1px; }
+
+/* Phase 4: first-run onboarding overlay */
+#onboard { position: fixed; inset: 0; z-index: 200; background: rgba(30, 26, 20, 0.45);
+  display: flex; align-items: center; justify-content: center; padding: 24px; }
+.onboard-card { background: #fff; border-radius: 14px; padding: 22px; max-width: 340px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25); }
+.onboard-card h2 { margin: 4px 0 8px; font-size: 20px; }
+.onboard-card p { margin: 0 0 16px; color: var(--muted); font-size: 15px; line-height: 1.5; }
+.onboard-step { font-size: 12px; font-weight: 700; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--accent-dark); }

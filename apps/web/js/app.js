@@ -295,6 +295,7 @@ function nt(t) {
     confidence: t.confidence || '',
     status: t.status || 'new',
     category: cat,
+    splits: t.splits || null, // per-category split shares [{category, amountMinor}] or null
     receiptId: t.receiptId || null,
     error: t._error ? (t._errorReasons || []).join('; ') : null,
     _raw: t
@@ -319,6 +320,21 @@ function merchantCore(merchantRaw) {
   return String(merchantRaw || '').toUpperCase().replace(/[#\d].*$/, '').trim().replace(/\s+/g, ' ') || 'MERCHANT';
 }
 
+/** Positive dollars text from integer minor units: 1234 -> "12.34".
+    Integer math only — no floats anywhere near money. */
+function dollarsText(minor) {
+  var m = Math.abs(minor || 0);
+  return Math.floor(m / 100) + '.' + ('0' + (m % 100)).slice(-2);
+}
+
+/** Smart category label: registered category name, else prettified key
+    (split/briefing keys can be merchant fallbacks). */
+function catLabelSmart(k) {
+  for (var i = 0; i < App.categories.length; i++)
+    if (String(App.categories[i].id) === String(k)) return App.categories[i].name;
+  return prettify(String(k == null ? '' : k));
+}
+
 /* ============================================================================
  * App shell: state, boot, tab router, event delegation
  * ========================================================================== */
@@ -329,14 +345,25 @@ var App = {
     statementId: null,     // currently viewed statement
     sfilter: 'review',     // statement tab filter
     txnId: null,           // open txn detail
-    more: 'menu',          // more submenu: menu | rules | privacy
+    more: 'menu',          // more submenu: menu | rules | privacy | accounts
+    onboardStep: null,     // onboarding overlay step: null | 0 | 1 | 2
     askQ: null,            // open ask answer id
     askText: '',
     receiptMsg: '',
     ruleOffer: null,       // pending "make this a rule" offer
     pending: null,         // pending import (file parsed, not yet committed)
     pipe: null,            // pipeline session
-    dupPairs: null         // duplicate candidate pairs for current statement
+    dupPairs: null,        // duplicate candidate pairs for current statement
+    txnShown: 60,          // statement list page size (Show more appends 60)
+    txnSearch: '',         // statement search query (trimmed, lowercase)
+    splitForm: null,       // open split form {txnId, rows:[{cat,amt}], error}
+    manualMsg: '',         // one-shot notice on the manual-entry form
+    dataRev: 0,            // bumped on every txn/rule mutation; invalidates dup cache
+    planView: 'budgets',   // plan tab sub-view: budgets | goals | subs
+    budgetMonth: null,     // chosen budget month 'YYYY-MM' (default: latest statement period)
+    budgetEditId: null,    // budget id being edited (form prefill)
+    goalEditId: null,      // goal id being edited (form prefill)
+    planMsg: ''            // one-shot notice shown at the top of the Plan tab
   },
   categories: [],          // seeded from Engine.defaultCategories()
   ready: false,
@@ -344,8 +371,18 @@ var App = {
   _renderSeq: 0            // increments per render; async views write only if current
 };
 
-var TABS = ['month', 'statement', 'ask', 'add', 'more'];
-var TAB_TITLES = { month: 'Your Month', statement: 'Clean Statement', ask: 'Ask', add: 'Add', more: 'More' };
+var TABS = ['month', 'statement', 'plan', 'ask', 'add', 'more'];
+var TAB_TITLES = { month: 'Your Month', statement: 'Clean Statement', plan: 'Plan', ask: 'Ask', add: 'Add', more: 'More' };
+
+/** Natural-key preference read: null when unset. (ES2019: no ??, use ternary.) */
+App.prefGet = async function (key) {
+  var r = await sGet('prefs', key);
+  return (r && r.value !== undefined && r.value !== null) ? r.value : null;
+};
+/** Natural-key preference write. Keys must be non-numeric strings (see Store.toKey). */
+App.prefSet = async function (key, value) {
+  await Store.put('prefs', { key: key, value: value });
+};
 
 App.boot = async function () {
   if (typeof Engine === 'undefined' || typeof Store === 'undefined') {
@@ -375,6 +412,7 @@ App.boot = async function () {
   App.ready = true;
   App.render();
   wireGlobalEvents();
+  App.maybeOnboard();
 };
 
 /** Seed categories from Engine.defaultCategories() once. */
@@ -434,8 +472,10 @@ App.render = function () {
   if (s.tab === 'add') App.vAdd(v, seq);
   else if (s.tab === 'statement') { s.txnId != null ? App.vTxnDetail(v, seq) : App.vStatement(v, seq); }
   else if (s.tab === 'month') App.vMonth(v, seq);
+  else if (s.tab === 'plan') App.vPlan(v, seq);
   else if (s.tab === 'ask') App.vAsk(v, seq);
   else if (s.tab === 'more') App.vMore(v, seq);
+  App.renderOnboarding(); // fixed overlay; no-op unless App.state.onboardStep set
 };
 
 /** Guarded view write: drops stale async renders so rapid navigation can't
@@ -492,6 +532,7 @@ App.vAdd = function (v, seq) {
   var s = App.state;
   if (s.addView === 'processing' && s.pipe) return App.vProcessing(v, seq);
   if (s.addView === 'receipts') return App.vReceipts(v, seq);
+  if (s.addView === 'manual') return App.vManualEntry(v, seq);
   if (s.addView === 'preview' && s.pending) return App.vImportPreview(v, seq);
   return App.vAddHome(v, seq);
 };
@@ -519,10 +560,19 @@ App.vAddHome = async function (v, seq) {
         '<ul class="list-plain">' +
           '<li><strong>Statement PDF</strong> — any bank or credit-card statement, read entirely on this device:<br>' +
           '<span class="small">Familiar layouts (President\u2019s Choice Financial Mastercard, CIBC Costco World Mastercard) ' +
-          'are read exactly. Unfamiliar layouts get a careful heuristic read, and uncertain rows are flagged for your review.</span></li>' +
+          'are read exactly. Unfamiliar layouts get a careful heuristic read, and uncertain rows are flagged for your review. ' +
+          'Large statements can take a minute on a phone \u2014 progress is shown while reading.</span></li>' +
           '<li><strong>CSV</strong> — supported now. Any column order; we detect date / description / amount columns.</li>' +
         '</ul>' +
       '</details>' +
+    '</div>';
+
+  html +=
+    '<div class="card">' +
+      '<div class="section-head"><h3 style="margin:0">Manual entry</h3><span class="pill dim">no file needed</span></div>' +
+      '<p class="small">Add a single transaction by hand — a cash purchase, a refund, anything missing from your statements. ' +
+      'It lands in a “Manual entries” statement and flows through Month, Statement, and Plan like any other row.</p>' +
+      '<div class="btn-row"><button class="btn ghost" data-action="goto" data-tab="add" data-addview="manual">Add a manual transaction</button></div>' +
     '</div>';
 
   html +=
@@ -544,6 +594,102 @@ App.vAddHome = async function (v, seq) {
     });
   }
   App.show(v, seq, html);
+};
+
+/* ---------- manual transaction entry ---------- */
+
+App.vManualEntry = function (v, seq) {
+  var n = new Date();
+  var today = n.getFullYear() + '-' + ('0' + (n.getMonth() + 1)).slice(-2) + '-' + ('0' + n.getDate()).slice(-2);
+  var html = '<button class="linklike" data-action="goto" data-tab="add" data-addview="home">← Back to Add</button>';
+  html += '<h1>Manual transaction</h1>';
+  if (App.state.manualMsg) { html += '<div class="banner warn">' + esc(App.state.manualMsg) + '</div>'; App.state.manualMsg = ''; }
+  html += '<div class="card">' +
+    '<label class="f" for="man-date">Date</label><input type="date" id="man-date" value="' + esc(today) + '">' +
+    '<label class="f" for="man-desc">Description</label>' +
+    '<input type="text" id="man-desc" autocomplete="off" placeholder="e.g. Farmers market">' +
+    '<label class="f" for="man-amount">Amount (e.g. 12.34)</label>' +
+    '<input type="text" id="man-amount" inputmode="decimal" autocomplete="off" placeholder="0.00">' +
+    '<label class="f" for="man-cat">Category</label><select id="man-cat">' +
+    App.categories.map(function (c) {
+      return '<option value="' + esc(c.id) + '">' + esc(c.name) + '</option>';
+    }).join('') + '</select>' +
+    '<label class="f" for="man-kind">Type</label><select id="man-kind">' +
+    '<option value="purchase">Purchase</option><option value="refund">Refund</option></select>' +
+    '<div class="btn-row" style="margin-top:8px"><button class="btn" data-action="manual-save">Save transaction</button></div>' +
+    '<p class="tiny" style="margin-bottom:0">Saved into a “Manual entries” statement for that month. ' +
+    'Whole dollars and cents only — no commas. The statement has no reported balances, so no balance check runs on it.</p></div>';
+  App.show(v, seq, html);
+};
+
+/** Find or create the "Manual entries" account + the per-month manual
+ * statement. One statement per calendar month keeps the statement picker
+ * tidy; the picker shows them as "Manual entries · YYYY-MM". */
+App.manualStatementFor = async function (monthPrefix) {
+  if (!/^\d{4}-\d{2}$/.test(monthPrefix || '')) throw new Error('manualStatementFor: need YYYY-MM');
+  var y = +monthPrefix.slice(0, 4), m = +monthPrefix.slice(5, 7);
+  var lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  var accounts = await sAll('accounts');
+  var acct = accounts.filter(function (a) { return a.name === 'Manual entries' && a.type === 'manual'; })[0];
+  if (!acct) {
+    var acctId = await Store.put('accounts', { name: 'Manual entries', type: 'manual', createdAt: Date.now() });
+    acct = await sGet('accounts', acctId);
+  }
+  var periodStart = monthPrefix + '-01';
+  var stmts = await sAll('statements');
+  var st = stmts.filter(function (s) {
+    return s.manual === true && String(s.accountId) === String(acct.id) && s.periodStart === periodStart;
+  })[0];
+  if (!st) {
+    var stId = await Store.put('statements', {
+      accountId: acct.id, sourceFileId: null,
+      periodStart: periodStart,
+      periodEnd: monthPrefix + '-' + ('0' + lastDay).slice(-2),
+      reportedStartMinor: null, reportedEndMinor: null,
+      manual: true, createdAt: Date.now(),
+      periodLabel: monthPrefix, scopeLabel: 'Manual entries · ' + monthPrefix,
+      rowCount: 0
+    });
+    st = await sGet('statements', stId);
+  }
+  return st;
+};
+
+App.Actions['manual-save'] = async function () {
+  var fail = function (msg) { App.state.manualMsg = msg; App.render(); };
+  var date = $('#man-date') ? $('#man-date').value : '';
+  var desc = $('#man-desc') ? $('#man-desc').value.trim() : '';
+  var raw = $('#man-amount') ? $('#man-amount').value.trim() : '';
+  var cat = $('#man-cat') ? $('#man-cat').value : '';
+  var kind = $('#man-kind') ? $('#man-kind').value : 'purchase';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date || '')) return fail('Pick a date.');
+  if (!desc) return fail('Enter a description.');
+  if (!cat) return fail('Choose a category.');
+  if (kind !== 'purchase' && kind !== 'refund') kind = 'purchase';
+  var minor = App.parseDollarsToMinor(raw);
+  if (minor === null || minor <= 0)
+    return fail('Enter a valid amount like 12.34 (digits and an optional decimal point — no commas, no negatives).');
+  var st;
+  try { st = await App.manualStatementFor(date.slice(0, 7)); }
+  catch (e) { return fail('Could not prepare the manual statement: ' + (e.message || e)); }
+  var existing = await sQuery('txns', 'statementId', st.id);
+  // Stored shape mirrors commitPipeline: CSV sign convention (purchases
+  // negative, refunds positive); spendAmountMinor is the spend magnitude.
+  var id = await Store.put('txns', {
+    statementId: st.id, manual: true, date: date,
+    merchantRaw: desc.toUpperCase().replace(/\s+/g, ' ').trim(),
+    rawDescription: desc, rawDateText: date, rawAmountText: raw,
+    amountMinor: kind === 'purchase' ? -minor : minor,
+    kind: kind, category: cat, spendAmountMinor: minor,
+    currency: 'CAD', excluded: 0, status: 'new', classificationSource: 'manual',
+    rowIndex: existing.length, createdAt: Date.now()
+  });
+  audit('txn.manual_added', 'txn', id,
+    { statementId: st.id, kind: kind, amountMinor: minor, category: cat, date: date });
+  App.state.manualMsg = '';
+  App.state.addView = 'home'; // next visit to Add starts at home, not this form
+  App.bumpDataRev();
+  App.go('statement', { statementId: st.id });
 };
 
 /* ---------- file chosen -> parse + preview ---------- */
@@ -1251,6 +1397,8 @@ App.commitPipeline = async function (pipe) {
   });
 
   App.state.statementId = statementId;
+  App.bumpDataRev(); // new statement -> duplicate cache invalid
+  App.state.txnShown = App.TXN_PAGE_SIZE; // new statement -> reset paging
 };
 
 /* ============================================================================
@@ -1564,6 +1712,37 @@ var SFILTERS = [
   ['uncertain', 'Uncertain'], ['excluded', 'Excluded']
 ];
 
+/** Map the Engine's reconcile balanceCheck for statements that carry no
+ * reported baseline (CSV imports, manual-entry scopes): the Engine reports
+ * 'no_baseline', which the UI presents as 'unavailable' — the check cannot
+ * run without reported balances. A real baseline result ('ok'/'gap') is
+ * never rewritten, and the 'no_baseline' mapping elsewhere is untouched. */
+App.applyBalanceCheckPolicy = function (recon, statement) {
+  var hasBaseline = !!(statement && typeof statement.reportedStartMinor === 'number' &&
+    typeof statement.reportedEndMinor === 'number');
+  if (recon && !hasBaseline && recon.balanceCheck === 'no_baseline') recon.balanceCheck = 'unavailable';
+  return recon;
+};
+
+/** Pure txn search (node-testable): matches q against merchantRaw,
+ * rawDescription, category id + name, amountMinor (minor-int text and
+ * dollars text, e.g. "1234" and "12.34"), and date. The caller stores q
+ * trimmed + lowercased (Changes['txn-search']); matching here is
+ * defensive about case anyway. */
+App.searchTxns = function (txns, q) {
+  q = String(q == null ? '' : q).toLowerCase();
+  if (!q) return (txns || []).slice();
+  var out = [];
+  (txns || []).forEach(function (t) {
+    if (!t) return;
+    var hay = [t.merchantRaw, t.rawDescription, t.category, catName(t.category), t.date];
+    var a = (t.amountMinor === null || t.amountMinor === undefined) ? null : t.amountMinor;
+    if (a !== null) hay.push(String(a), String(Math.abs(a)), dollarsText(a));
+    if (hay.join(' ').toLowerCase().indexOf(q) !== -1) out.push(t);
+  });
+  return out;
+};
+
 App.vStatement = async function (v, seq) {
   var stmts = await sAll('statements');
   if (!stmts.length) {
@@ -1584,6 +1763,7 @@ App.vStatement = async function (v, seq) {
     ? { startMinor: st.reportedStartMinor, endMinor: st.reportedEndMinor } : null;
   try { recon = Engine.reconcile(txns, stmtReported); } catch (e) { recon = null; }
   if (!recon) recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'unavailable', gapMinor: null };
+  recon = App.applyBalanceCheckPolicy(recon, st);
 
   var counts = { review: 0, purchases: 0, refunds: 0, payments: 0, duplicates: 0, uncertain: 0, excluded: 0 };
   txns.forEach(function (t) {
@@ -1621,28 +1801,87 @@ App.vStatement = async function (v, seq) {
   }
   html += '</div>';
 
-  html += '<div class="tabs" role="tablist">';
-  SFILTERS.forEach(function (f) {
-    html += '<button class="chip' + (App.state.sfilter === f[0] ? ' on' : '') + '" role="tab" ' +
-      'data-action="sfilter" data-f="' + f[0] + '">' + f[1] +
-      '<span class="count">' + (counts[f[0]] || 0) + '</span></button>';
-  });
-  html += '</div><div id="txn-list">' + App.txnListHtml(txns, App.state.sfilter, counts) + '</div>';
+  // Search box at the top of the statement list (change fires on Enter/blur).
+  var q = (App.state.txnSearch || '').trim();
+  html += '<div class="card" style="padding:8px 10px"><div style="display:flex;gap:8px;align-items:center">' +
+    '<input type="search" id="txn-search" data-change="txn-search" placeholder="Search description, merchant, category, amount…" ' +
+    'value="' + esc(App.state.txnSearch || '') + '" autocomplete="off" style="flex:1;min-width:0" aria-label="Search transactions">' +
+    (q ? '<button class="btn ghost smallbtn" data-action="txn-search-clear">Clear</button>' : '') +
+    '</div></div>';
+
+  if (q) {
+    // Search mode: chips are replaced by the result count + clear.
+    var results = App._searchTxns = App.searchTxns(txns, q);
+    html += '<div class="card"><div class="section-head"><h3 style="margin:0">' +
+      results.length + ' result' + (results.length === 1 ? '' : 's') + ' for \u2018' + esc(q) + '\u2019</h3>' +
+      '<button class="btn ghost smallbtn" data-action="txn-search-clear">Clear search</button></div></div>' +
+      '<div id="txn-list">' + App.txnListHtml(results, 'search', counts, App.state.txnShown || App.TXN_PAGE_SIZE) + '</div>';
+  } else {
+    App._searchTxns = [];
+    html += '<div class="tabs" role="tablist">';
+    SFILTERS.forEach(function (f) {
+      html += '<button class="chip' + (App.state.sfilter === f[0] ? ' on' : '') + '" role="tab" ' +
+        'data-action="sfilter" data-f="' + f[0] + '">' + f[1] +
+        '<span class="count">' + (counts[f[0]] || 0) + '</span></button>';
+    });
+    html += '</div><div id="txn-list">' + App.txnListHtml(txns, App.state.sfilter, counts, App.state.txnShown || App.TXN_PAGE_SIZE) + '</div>';
+  }
+  App._stmtCounts = counts; // for in-place "Show more" re-renders
   App.show(v, seq, html);
 };
 
+App.Changes['txn-search'] = function (el) {
+  App.state.txnSearch = String(el.value || '').trim().toLowerCase();
+  App.state.txnShown = App.TXN_PAGE_SIZE; // new query -> reset paging
+  App.render();
+};
+App.Actions['txn-search-clear'] = function () {
+  App.state.txnSearch = '';
+  App.state.txnShown = App.TXN_PAGE_SIZE;
+  App.render();
+};
+
 App.Changes['statement-select'] = function (el) {
+  App.state.txnShown = App.TXN_PAGE_SIZE; // new statement -> reset paging
   App.go('statement', { statementId: el.value, txnId: null });
 };
-App.Actions.sfilter = function (d) { App.state.sfilter = d.f; App.state.txnId = null; App.render(); };
+App.Actions.sfilter = function (d) { App.state.sfilter = d.f; App.state.txnId = null; App.state.txnShown = App.TXN_PAGE_SIZE; App.render(); };
 
-/** Duplicate candidate pairs for the current statement (indexes into App._stmtTxns). */
+/** Duplicate candidate pairs for the current statement (indexes into App._stmtTxns).
+ * Memoized: Engine.findDuplicateCandidates is O(n²), so we cache per
+ * (statement, txn count, data revision). Every txn/rule mutation calls
+ * App.bumpDataRev() to invalidate. */
+App._dupCacheKey = function (statementId, txnCount, dataRev) {
+  return String(statementId) + '|' + (txnCount || 0) + '|' + (dataRev || 0);
+};
+App.bumpDataRev = function () {
+  App.state.dataRev = (App.state.dataRev || 0) + 1;
+  App._dupCache = null;
+};
 App.dupPairs = function () {
   var txns = App._stmtTxns || [];
+  var key = App._dupCacheKey(App.state.statementId, txns.length, App.state.dataRev);
+  if (App._dupCache && App._dupCache.key === key) return App._dupCache.pairs;
+  var pairs;
   try {
-    var pairs = Engine.findDuplicateCandidates(txns) || [];
-    return pairs.filter(function (p) { return Array.isArray(p) && txns[p[0]] && txns[p[1]]; });
-  } catch (e) { return []; }
+    pairs = Engine.findDuplicateCandidates(txns) || [];
+    pairs = pairs.filter(function (p) { return Array.isArray(p) && txns[p[0]] && txns[p[1]]; });
+  } catch (e) { pairs = []; }
+  App._dupCache = { key: key, pairs: pairs };
+  return pairs;
+};
+
+/** Pure pagination helper (node-testable): first `limit` rows + remainder. */
+App._paginate = function (list, limit) {
+  list = list || [];
+  limit = Math.max(0, limit == null ? App.TXN_PAGE_SIZE : limit);
+  return { rows: list.slice(0, limit), remaining: Math.max(0, list.length - limit) };
+};
+/** Statement list page size: rendering is capped so large statements stay smooth. */
+App.TXN_PAGE_SIZE = 60;
+App._moreBtn = function (remaining) {
+  return '<button class="btn ghost" data-action="txn-more" style="width:100%;margin:8px 0">Show more (' +
+    remaining + ' remaining)</button>';
 };
 
 App.txnRowHtml = function (t) {
@@ -1653,13 +1892,15 @@ App.txnRowHtml = function (t) {
   if (t.status === 'duplicate') pills += ' <span class="pill bad">duplicate</span>';
   else if (t.kind === 'uncertain' || t.confidence === 'needs_review') pills += ' <span class="pill warn">review</span>';
   if (t.excluded && t.status !== 'duplicate') pills += ' <span class="pill dim">excluded</span>';
+  if (t.splits && t.splits.length) pills += ' <span class="pill dim">split</span>';
   return '<button class="txn" data-action="open-txn" data-id="' + esc(t.id) + '">' +
     '<span class="t-main"><span class="t-desc">' + esc(t.desc || '(no description)') + '</span><br>' +
     '<span class="t-sub">' + esc(fmtDate(t.date)) + ' · ' + esc(kindLabel(t.kind)) + pills + '</span></span>' +
     '<span class="' + cls + '">' + money(amt) + '</span></button>';
 };
 
-App.txnListHtml = function (txns, filter, counts) {
+App.txnListHtml = function (txns, filter, counts, limit) {
+  limit = limit == null ? App.TXN_PAGE_SIZE : limit;
   var html = '';
   if (filter === 'review') {
     var pairs = App.dupPairs();
@@ -1680,7 +1921,18 @@ App.txnListHtml = function (txns, filter, counts) {
           '<button class="btn ghost smallbtn" data-action="dup-markdup" data-id="' + esc(b.id) + '" data-other="' + esc(a.id) + '">Mark as duplicate</button></div>' +
         '</div><button class="btn ghost smallbtn" data-action="dup-keep" data-a="' + esc(a.id) + '" data-b="' + esc(b.id) + '">Keep both — not duplicates</button></div>';
     });
-    unc.forEach(function (t) { html += App.txnRowHtml(t); });
+    var upg = App._paginate(unc, limit);
+    upg.rows.forEach(function (t) { html += App.txnRowHtml(t); });
+    if (upg.remaining) html += App._moreBtn(upg.remaining);
+    return html;
+  }
+  if (filter === 'search') {
+    // Search results are pre-filtered by App.searchTxns; render as-is.
+    var q = (App.state.txnSearch || '').trim();
+    if (!txns.length) return '<div class="empty">No matches for \u2018' + esc(q) + '\u2019.</div>';
+    var spg = App._paginate(txns, limit);
+    spg.rows.forEach(function (t) { html += App.txnRowHtml(t); });
+    if (spg.remaining) html += App._moreBtn(spg.remaining);
     return html;
   }
   var list = txns.filter(function (t) { return txnTab(t) === filter; });
@@ -1691,8 +1943,22 @@ App.txnListHtml = function (txns, filter, counts) {
   if (filter === 'duplicates') {
     html += '<p class="small">Marked duplicates are excluded from spend. Candidate pairs live in the <strong>Review</strong> tab.</p>';
   }
-  list.forEach(function (t) { html += App.txnRowHtml(t); });
+  var pg = App._paginate(list, limit);
+  pg.rows.forEach(function (t) { html += App.txnRowHtml(t); });
+  if (pg.remaining) html += App._moreBtn(pg.remaining);
   return html;
+};
+/** "Show more" appends the next page of rows in place (no full re-render,
+ * so scroll position and the review queue stay put). */
+App.Actions['txn-more'] = function () {
+  App.state.txnShown = (App.state.txnShown || App.TXN_PAGE_SIZE) + App.TXN_PAGE_SIZE;
+  var el = document.getElementById('txn-list');
+  if (el) {
+    var searchMode = (App.state.txnSearch || '').trim() !== '';
+    var src = searchMode ? (App._searchTxns || []) : (App._stmtTxns || []);
+    var flt = searchMode ? 'search' : App.state.sfilter;
+    el.innerHTML = App.txnListHtml(src, flt, App._stmtCounts || {}, App.state.txnShown);
+  }
 };
 
 /* ---------- txn detail ---------- */
@@ -1717,6 +1983,11 @@ App.vTxnDetail = async function (v, seq) {
     '<tr><th>Kind confidence</th><td>' + esc(t.kindConfidence != null ? t.kindConfidence : '—') + '</td></tr>' +
     '<tr><th>Category</th><td>' + esc(catName(t.category)) + '</td></tr>' +
     '<tr><th>Status</th><td>' + esc(t.status) + '</td></tr></table></div>';
+
+  // Per-category splits (purchases only, never excluded/duplicates).
+  if (t.kind === 'purchase' && !t.excluded && t.status !== 'duplicate') {
+    html += App.splitSectionHtml(t);
+  }
 
   html += '<div class="card"><h3 style="margin-top:0">Normalized</h3><table class="kv">' +
     '<tr><th>Date</th><td>' + esc(t.date || '—') + '</td></tr>' +
@@ -1790,6 +2061,140 @@ App.vTxnDetail = async function (v, seq) {
   App.show(v, seq, html);
 };
 
+/* ---------- per-category splits ---------- */
+
+/** Split section on the txn detail: current split table, the edit form, or
+ * the entry button. Purchases only (the caller gates kind/excluded/status). */
+App.splitSectionHtml = function (t) {
+  var total = spendOf(t); // |spend| magnitude
+  var html = '<div class="card"><h3 style="margin-top:0">Split across categories</h3>';
+  if (t.splits && t.splits.length) {
+    html += '<table class="kv">';
+    t.splits.forEach(function (s) {
+      html += '<tr><th>' + esc(catLabelSmart(s.category)) + '</th><td>' + money(s.amountMinor) + '</td></tr>';
+    });
+    var splitTotal = t.splits.reduce(function (a, s) { return a + (s.amountMinor || 0); }, 0);
+    html += '</table><p class="small">Split total ' + money(splitTotal) + ' — matches the transaction\u2019s ' +
+      money(total) + '.</p>' +
+      '<div class="btn-row"><button class="btn ghost smallbtn" data-action="split-start" data-id="' + esc(t.id) + '">Edit split</button>' +
+      '<button class="btn ghost smallbtn" data-action="split-remove" data-id="' + esc(t.id) + '">Remove split</button></div>';
+  } else if (App.state.splitForm && String(App.state.splitForm.txnId) === String(t.id)) {
+    html += App.splitFormHtml(t);
+  } else {
+    html += '<p class="small">Divide this ' + money(total) + ' purchase across up to 5 categories. ' +
+      'The parts must add up exactly — budgets, movers, and briefings all honor the split.</p>' +
+      '<button class="btn ghost" data-action="split-start" data-id="' + esc(t.id) + '">Split across categories</button>';
+  }
+  html += '</div>';
+  return html;
+};
+
+App.splitFormHtml = function (t) {
+  var f = App.state.splitForm;
+  var total = spendOf(t);
+  var html = '<p class="small">Split ' + money(total) + ' across categories — the parts must add up exactly.</p>';
+  if (f.error) html += '<div class="banner bad">' + esc(f.error) + '</div>';
+  f.rows.forEach(function (r, i) {
+    html += '<div style="display:flex;gap:8px;margin-bottom:8px">' +
+      '<select id="split-cat-' + i + '" style="flex:1;min-width:0" aria-label="Category for part ' + (i + 1) + '">' +
+      '<option value="">— category —</option>' +
+      App.categories.map(function (c) {
+        return '<option value="' + esc(c.id) + '"' + (r.cat === c.id ? ' selected' : '') + '>' + esc(c.name) + '</option>';
+      }).join('') + '</select>' +
+      '<input type="text" id="split-amt-' + i + '" inputmode="decimal" autocomplete="off" placeholder="0.00" ' +
+      'value="' + esc(r.amt) + '" style="width:110px" aria-label="Amount for part ' + (i + 1) + '"></div>';
+  });
+  html += '<div class="btn-row">' +
+    (f.rows.length < 5 ? '<button class="btn ghost smallbtn" data-action="split-addrow" data-id="' + esc(t.id) + '">+ Add row</button>' : '') +
+    '<button class="btn ghost smallbtn" data-action="split-even" data-id="' + esc(t.id) + '">Split evenly</button>' +
+    '</div><div class="btn-row" style="margin-top:8px">' +
+    '<button class="btn" data-action="split-save" data-id="' + esc(t.id) + '">Save split</button>' +
+    '<button class="btn ghost" data-action="split-cancel">Cancel</button></div>';
+  return html;
+};
+
+/** Read the live form inputs back into App.state.splitForm.rows (so + Add
+ * row and Split evenly never lose what was already typed). */
+function readSplitFormRows() {
+  var f = App.state.splitForm;
+  if (!f || typeof document === 'undefined') return;
+  for (var i = 0; i < f.rows.length; i++) {
+    var catEl = document.getElementById('split-cat-' + i);
+    var amtEl = document.getElementById('split-amt-' + i);
+    if (catEl) f.rows[i].cat = catEl.value;
+    if (amtEl) f.rows[i].amt = amtEl.value;
+  }
+}
+
+App.Actions['split-start'] = function (d) {
+  App.state.splitForm = { txnId: d.id, rows: [{ cat: '', amt: '' }, { cat: '', amt: '' }], error: '' };
+  App.render();
+};
+App.Actions['split-cancel'] = function () { App.state.splitForm = null; App.render(); };
+App.Actions['split-addrow'] = function () {
+  var f = App.state.splitForm;
+  if (!f || f.rows.length >= 5) return;
+  readSplitFormRows();
+  f.rows.push({ cat: '', amt: '' });
+  f.error = '';
+  App.render();
+};
+App.Actions['split-even'] = function () {
+  var f = App.state.splitForm;
+  if (!f) return;
+  readSplitFormRows();
+  // Amounts come from the stored txn (integer math throughout).
+  sGet('txns', f.txnId).then(function (txn) {
+    if (!txn) return;
+    var total = Math.abs((txn.spendAmountMinor != null ? txn.spendAmountMinor : txn.amountMinor) || 0);
+    var shares = Engine.splitEvenly(total, f.rows.length);
+    for (var i = 0; i < f.rows.length; i++) f.rows[i].amt = dollarsText(shares[i]);
+    f.error = '';
+    App.render();
+  });
+};
+App.Actions['split-save'] = async function (d) {
+  var t = await sGet('txns', d.id);
+  var f = App.state.splitForm;
+  if (!t || !f) return;
+  var total = Math.abs((t.spendAmountMinor != null ? t.spendAmountMinor : t.amountMinor) || 0);
+  var splits = [], sum = 0;
+  for (var i = 0; i < f.rows.length; i++) {
+    var catEl = document.getElementById('split-cat-' + i);
+    var amtEl = document.getElementById('split-amt-' + i);
+    var cat = catEl ? catEl.value : '';
+    var rawAmt = amtEl ? amtEl.value : '';
+    var amt = App.parseDollarsToMinor(rawAmt);
+    if (!cat || amt === null || amt <= 0) {
+      f.error = 'Every row needs a category and an amount over $0.00.';
+      App.render(); return;
+    }
+    splits.push({ category: cat, amountMinor: amt });
+    sum += amt;
+    f.rows[i].cat = cat; f.rows[i].amt = rawAmt;
+  }
+  if (sum !== total) {
+    f.error = 'Split amounts must add up to ' + money(total) + ' (currently ' + money(sum) + ').';
+    App.render(); return;
+  }
+  t.splits = splits; // positive magnitudes, summing to exactly |spend|
+  if (t.status === 'new') t.status = 'reviewed';
+  await Store.put('txns', t);
+  audit('txn.split_saved', 'txn', t.id, { splits: splits });
+  App.state.splitForm = null;
+  App.bumpDataRev();
+  App.render();
+};
+App.Actions['split-remove'] = async function (d) {
+  var t = await sGet('txns', d.id);
+  if (!t || !t.splits) return;
+  delete t.splits; // restores the single-category row
+  await Store.put('txns', t);
+  audit('txn.split_removed', 'txn', t.id, {});
+  App.bumpDataRev();
+  App.render();
+};
+
 /* ---------- corrections & rules ---------- */
 
 App.applyCorrection = async function (txnId, field, newValue) {
@@ -1807,6 +2212,7 @@ App.applyCorrection = async function (txnId, field, newValue) {
   else if (field === 'excluded') t.excluded = newValue ? 1 : 0; // V7: reconcile checks ===1
   if (t.status === 'new') t.status = 'reviewed';
   await Store.put('txns', t); // put() with an existing id upserts
+  App.bumpDataRev(); // txn changed -> duplicate cache invalid
 
   var corr = { txnId: txnId, field: field, oldValue: String(oldValue), newValue: String(newValue), createdAt: Date.now() };
   var corrId = await Store.put('corrections', corr);
@@ -1860,6 +2266,7 @@ App.Actions['confirm-kind'] = function (d) {
     await Store.put('txns', t);
     await Store.put('corrections', { txnId: d.id, field: 'kind', oldValue: t.kind, newValue: t.kind, confirmed: true, createdAt: Date.now() });
     audit('correction.confirmed', 'txn', d.id, { kind: t.kind });
+    App.bumpDataRev();
     App.render();
   });
 };
@@ -1892,6 +2299,7 @@ App.Actions['confirm-rule'] = async function () {
   if (corr) { corr.madeRuleId = id; await Store.put('corrections', corr); }
   audit('rule.created', 'householdRule', id, { field: off.field, value: off.newValue, scope: off.scopeDescription });
   App.state.ruleOffer = null;
+  App.bumpDataRev(); // rules change classification -> duplicate cache invalid
   App.render();
 };
 App.Actions['cancel-rule'] = function () { App.state.ruleOffer = null; App.render(); };
@@ -1906,6 +2314,7 @@ App.Actions['dup-keep'] = async function (d) {
   }
   await Store.put('corrections', { txnId: d.a, field: 'duplicate', oldValue: 'candidate', newValue: 'keep-both', createdAt: Date.now() });
   audit('duplicate.kept', 'txn', d.a, { other: d.b });
+  App.bumpDataRev();
   App.render();
 };
 App.Actions['dup-markdup'] = async function (d) {
@@ -1915,6 +2324,7 @@ App.Actions['dup-markdup'] = async function (d) {
   await Store.put('txns', t);
   await Store.put('corrections', { txnId: d.id, field: 'duplicate', oldValue: 'candidate', newValue: 'duplicate', createdAt: Date.now() });
   audit('duplicate.marked', 'txn', d.id, { kept: d.other });
+  App.bumpDataRev();
   App.render();
 };
 
@@ -1930,6 +2340,165 @@ function spendOf(t) {
   var s = t.spendAmountMinor != null ? t.spendAmountMinor : t.amountMinor;
   return Math.abs(s || 0);
 }
+
+/* ---------------- Month: trends, movers, budgets summary (Phase 3) ---------------- */
+
+/** Last n calendar months ending at `anchor` ('YYYY-MM'), oldest -> newest. */
+function lastNMonths(anchor, n) {
+  var out = [];
+  var ym = anchor;
+  for (var i = 0; i < n; i++) { out.unshift(ym); ym = prevMonthOf(ym); }
+  return out;
+}
+
+/** Trends section: last 6 calendar months ending at the latest statement's
+ * periodEnd (else the current month), via pure Engine.monthlyNetSpend. */
+App.trendsHtml = async function () {
+  var stmts = await sAll('statements');
+  var anchor = App.defaultBudgetMonth(stmts);
+  var windowMonths = lastNMonths(anchor, 6);
+  var monthly = [];
+  try { monthly = Engine.monthlyNetSpend(await sAll('txns')) || []; } catch (e) { monthly = []; }
+  var byMonth = {};
+  monthly.forEach(function (r) { byMonth[r.month] = r.netMinor; });
+  var present = 0;
+  var data = windowMonths.map(function (m) {
+    if (byMonth[m] !== undefined) present++;
+    return { month: m, netMinor: byMonth[m] !== undefined ? byMonth[m] : 0 };
+  });
+  App._trendData = data; // picked up by the post-render draw call
+  var html = '<h2>Trends</h2>';
+  if (present < 2) {
+    return html + '<div class="card"><p class="small" style="margin:0">Not enough history yet — ' +
+      'trends appear once you have transactions in at least two months.</p></div>';
+  }
+  return html + '<div class="card"><canvas id="trend-canvas" width="680" height="240" ' +
+    'style="width:100%;display:block" role="img" aria-label="Net spend per month, last 6 months"></canvas>' +
+    '<p class="tiny" style="margin:8px 0 0">Net spend per month (after refunds), magnitudes.</p></div>';
+};
+
+/** Hand-rolled bar chart for monthly net spend. No dependencies: scales by
+ * devicePixelRatio, draws one bar per month sized by |netMinor| (min 1px
+ * for zero), month labels, and value labels via Engine.fmtMoney. */
+App.drawTrends = function (canvas, data) {
+  if (!canvas || !data || data.length < 2) return;
+  var dpr = (typeof window !== 'undefined' && window.devicePixelRatio) ? window.devicePixelRatio : 1;
+  var W = 680, H = 240;
+  canvas.width = Math.round(W * dpr);
+  canvas.height = Math.round(H * dpr);
+  var ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.scale(dpr, dpr);
+  var accent = '#0e6e64', ink = '#1d1a15', muted = '#5f584c';
+  try {
+    var cs = (typeof getComputedStyle !== 'undefined' && typeof document !== 'undefined')
+      ? getComputedStyle(document.documentElement) : null;
+    if (cs) {
+      accent = cs.getPropertyValue('--accent').trim() || accent;
+      ink = cs.getPropertyValue('--ink').trim() || ink;
+      muted = cs.getPropertyValue('--muted').trim() || muted;
+    }
+  } catch (e) { /* hardcoded palette fallback */ }
+  var padT = 34, padB = 30, padX = 10;
+  var baseY = H - padB, maxBarH = H - padT - padB;
+  var maxV = 0;
+  data.forEach(function (d) { maxV = Math.max(maxV, Math.abs(d.netMinor || 0)); });
+  if (maxV === 0) maxV = 1;
+  var n = data.length;
+  var slot = (W - padX * 2) / n;
+  var barW = Math.min(72, slot * 0.62);
+  var monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  ctx.textAlign = 'center';
+  data.forEach(function (d, i) {
+    var mag = Math.abs(d.netMinor || 0);
+    var h = Math.max(1, Math.round(mag / maxV * maxBarH));
+    var x = padX + slot * i + (slot - barW) / 2;
+    var y = baseY - h;
+    ctx.fillStyle = accent;
+    // Rounded-top bar (manual path: ES2019-safe, no roundRect dependency).
+    var r = Math.min(5, barW / 2);
+    ctx.beginPath();
+    ctx.moveTo(x, y + h);
+    ctx.lineTo(x, y + r);
+    ctx.quadraticCurveTo(x, y, x + r, y);
+    ctx.lineTo(x + barW - r, y);
+    ctx.quadraticCurveTo(x + barW, y, x + barW, y + r);
+    ctx.lineTo(x + barW, y + h);
+    ctx.closePath();
+    ctx.fill();
+    // Value label above the bar (magnitude, via Engine.fmtMoney).
+    ctx.fillStyle = ink;
+    ctx.font = '600 12px system-ui, sans-serif';
+    ctx.fillText(Engine.fmtMoney(mag), x + barW / 2, y - 6);
+    // Month label below the axis.
+    var mm = /^(\d{4})-(\d{2})$/.exec(String(d.month || ''));
+    ctx.fillStyle = muted;
+    ctx.font = '12px system-ui, sans-serif';
+    ctx.fillText(mm ? monthNames[+mm[2] - 1] : '', x + barW / 2, baseY + 18);
+  });
+};
+
+/** Top-3 month-over-month movers: latest full month vs the previous one,
+ * per-category spend deltas from split-aware totals. Categories at zero in
+ * both months are skipped. */
+App.moversHtml = async function () {
+  var stmts = await sAll('statements');
+  var anchor = App.defaultBudgetMonth(stmts); // latest statement's period month
+  var prev = prevMonthOf(anchor);
+  var txns = await sAll('txns');
+  var curT = {}, prevT = {};
+  try {
+    curT = Engine.splitAwareCategoryTotals(txns, anchor) || {};
+    prevT = Engine.splitAwareCategoryTotals(txns, prev) || {};
+  } catch (e) { curT = {}; prevT = {}; }
+  var keys = {};
+  Object.keys(curT).forEach(function (k) { keys[k] = 1; });
+  Object.keys(prevT).forEach(function (k) { keys[k] = 1; });
+  var movers = [];
+  Object.keys(keys).forEach(function (k) {
+    var c = curT[k] || 0, p = prevT[k] || 0;
+    if (c === 0 && p === 0) return;
+    movers.push({ category: k, delta: c - p });
+  });
+  movers.sort(function (a, b) { return Math.abs(b.delta) - Math.abs(a.delta); });
+  movers = movers.slice(0, 3);
+  var html = '<h2>Biggest movers</h2>';
+  if (!movers.length) {
+    return html + '<div class="card"><p class="small" style="margin:0">No category moved between ' +
+      esc(fmtPeriod(prev)) + ' and ' + esc(fmtPeriod(anchor)) + '.</p></div>';
+  }
+  html += '<div class="card">';
+  movers.forEach(function (m) {
+    var up = m.delta > 0;
+    html += '<div class="bar-row"><span class="b-label">' + esc(catLabelSmart(m.category)) + '</span>' +
+      '<span class="b-amt">' + (up ? 'up ' : 'down ') + spendAbs(m.delta) + '</span></div>';
+  });
+  html += '<p class="tiny" style="margin-bottom:0">' + esc(fmtPeriod(anchor)) + ' vs ' +
+    esc(fmtPeriod(prev)) + ' · split-aware.</p></div>';
+  return html;
+};
+
+/** Budgets summary card for App.state.budgetMonth (or the Plan default):
+ * "X of Y on track" (on track = spent <= limit, split-aware). Hidden when
+ * the month has no budgets. */
+App.budgetSummaryHtml = async function () {
+  var stmts = await sAll('statements');
+  var month = App.state.budgetMonth && /^\d{4}-\d{2}$/.test(App.state.budgetMonth)
+    ? App.state.budgetMonth : App.defaultBudgetMonth(stmts);
+  var budgets = (await sAll('budgets')).filter(function (b) { return b.month === month; });
+  if (!budgets.length) return '';
+  var txns = await sAll('txns');
+  var onTrack = 0;
+  budgets.forEach(function (b) {
+    var spent = 0;
+    try { spent = Engine.categorySpendMinor(txns, b.category, month); } catch (e) { spent = 0; }
+    if (spent <= (b.limitMinor || 0)) onTrack++;
+  });
+  return '<h2>Budgets</h2><div class="card"><div class="section-head"><h3 style="margin:0">' +
+    onTrack + ' of ' + budgets.length + ' on track</h3>' +
+    '<button class="btn ghost smallbtn" data-action="tab" data-tab="plan">Open Plan</button></div>' +
+    '<p class="small" style="margin-bottom:0">' + esc(fmtPeriod(month)) + ' budgets — spent vs limit, split-aware.</p></div>';
+};
 
 App.vMonth = async function (v, seq) {
   var stmts = await sAll('statements');
@@ -1952,6 +2521,7 @@ App.vMonth = async function (v, seq) {
     ? { startMinor: st.reportedStartMinor, endMinor: st.reportedEndMinor } : null;
   try { recon = Engine.reconcile(txns, monthReported); } catch (e) { recon = null; }
   if (!recon) recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'unavailable' };
+  recon = App.applyBalanceCheckPolicy(recon, st);
 
   var html = '<h1>Your Month</h1>';
   html += '<p class="small">' + esc(st.scopeLabel || fmtPeriod(st.periodLabel)) + ' · ' + txns.length + ' transactions</p>';
@@ -2033,6 +2603,11 @@ App.vMonth = async function (v, seq) {
     (facts ? '<tr><th>Balance check</th><td>' + esc(String(facts.balanceCheck)) + (facts.gapMinor ? ' · gap ' + money(facts.gapMinor) : '') + '</td></tr>' : '') +
     '</table></div>';
 
+  // Trends, biggest movers, budgets summary (Phase 3 depth on this tab).
+  html += await App.trendsHtml();
+  html += await App.moversHtml();
+  html += await App.budgetSummaryHtml();
+
   // Full deterministic briefing text.
   if (briefing && briefing.text) {
     html += '<details class="more"><summary>Full briefing text</summary><pre class="brief">' + esc(briefing.text) + '</pre>';
@@ -2043,6 +2618,11 @@ App.vMonth = async function (v, seq) {
     html += '</details><div id="llm-preview"></div>';
   }
   App.show(v, seq, html);
+  // Hand-rolled trend chart: draw after the canvas is in the DOM.
+  if (seq === App._renderSeq && typeof document !== 'undefined') {
+    var c = document.getElementById('trend-canvas');
+    if (c) App.drawTrends(c, App._trendData || []);
+  }
 };
 
 /** Find a txn id for a driver category (V8: categoryTotals keys are
@@ -2505,16 +3085,218 @@ App.vMore = async function (v, seq) {
   var m = App.state.more;
   if (m === 'rules') return App.vRules(v, seq);
   if (m === 'privacy') return App.vPrivacy(v, seq);
+  if (m === 'accounts') return App.vAccounts(v, seq);
   var rules = await sAll('householdRules');
   var active = rules.filter(function (r) { return r.enabled !== false; }).length;
+  var accounts = await sAll('accounts');
+  var txns = await sAll('txns');
+  var hasSample = txns.some(function (t) { return t && t.sampleBatch === 'v2-sample'; });
   App.show(v, seq, '<h1>More</h1>' +
+    '<div class="card"><div class="section-head"><h3 style="margin:0">Accounts</h3><span class="pill">' + accounts.length + ' account' + (accounts.length === 1 ? '' : 's') + '</span></div>' +
+    '<p class="small">Every card or account with imported statements. Rename an account, see its totals, and spot months missing statements.</p>' +
+    '<button class="btn ghost" data-action="goto" data-tab="more" data-more="accounts">Manage accounts</button></div>' +
+    '<div class="card"><div class="section-head"><h3 style="margin:0">Sample data</h3><span class="pill ' + (hasSample ? 'ok' : 'dim') + '">' + (hasSample ? 'loaded' : 'off') + '</span></div>' +
+    (hasSample
+      ? '<p class="small">Sample statements (“Sample data · YYYY-MM”) are loaded alongside your real statements. They are clearly labeled and can be removed any time.</p>' +
+        '<button class="btn ghost" data-action="sample-remove">Remove sample data</button>'
+      : '<p class="small">Explore the app with realistic demo data: 3 months of labeled sample statements (~85 transactions). Nothing is uploaded; remove it any time.</p>' +
+        '<button class="btn ghost" data-action="sample-add">Try with sample data</button>') +
+    '</div>' +
     '<div class="card"><div class="section-head"><h3 style="margin:0">Household rules</h3><span class="pill">' + active + ' active</span></div>' +
     '<p class="small">Corrections you turned into reusable rules. They apply to future imports automatically.</p>' +
     '<button class="btn ghost" data-action="goto" data-tab="more" data-more="rules">Manage rules</button></div>' +
     '<div class="card"><h3 style="margin:0 0 6px">Privacy &amp; data</h3>' +
     '<p class="small"><strong>Your data stays on this device.</strong> The only network use is optional AI phrasing, which you preview and approve per call. Export or delete any time.</p>' +
-    '<button class="btn ghost" data-action="goto" data-tab="more" data-more="privacy">Privacy, export &amp; delete</button></div>');
+    '<button class="btn ghost" data-action="goto" data-tab="more" data-more="privacy">Privacy, export &amp; delete</button></div>' +
+    '<div class="card"><h3 style="margin:0 0 6px">Take the tour again</h3>' +
+    '<p class="small">Replay the 3-step first-run walkthrough.</p>' +
+    '<button class="btn ghost" data-action="onboard-replay">Replay tour</button></div>');
 };
+
+App.vAccounts = async function (v, seq) {
+  var accounts = await sAll('accounts');
+  var statements = await sAll('statements');
+  var txns = await sAll('txns');
+  accounts.sort(function (a, b) {
+    var an = String(a && a.name || '').toLowerCase(), bn = String(b && b.name || '').toLowerCase();
+    return an < bn ? -1 : (an > bn ? 1 : 0);
+  });
+  var html = '<button class="linklike" data-action="back-more">← More</button><h1>Accounts</h1>';
+  if (!accounts.length) {
+    html += '<div class="empty">No accounts yet.<br><span class="small">Import a statement or try the sample data from the More menu.</span></div>';
+    App.show(v, seq, html);
+    return;
+  }
+  accounts.forEach(function (a) {
+    var id = a && a.id;
+    var acctStmts = statements.filter(function (s) { return s && String(s.accountId) === String(id); });
+    var stmtIds = {};
+    acctStmts.forEach(function (s) { stmtIds[s.id] = 1; });
+    var acctTxns = txns.filter(function (t) { return t && stmtIds[t.statementId]; });
+    var total = 0;
+    for (var i = 0; i < acctTxns.length; i++) total += spendOf(acctTxns[i]);
+    // Coverage strip: 12 months ending at the latest statement month (or now).
+    var latest = null;
+    acctStmts.forEach(function (s) {
+      var m = String((s.periodEnd || s.periodStart || '')).slice(0, 7);
+      if (/^\d{4}-\d{2}$/.test(m) && (!latest || m > latest)) latest = m;
+    });
+    var anchor = latest || planCurrentMonth();
+    var months = lastNMonths(anchor, 12);
+    var strip = '';
+    for (var k = 0; k < months.length; k++) {
+      var hit = Engine.monthCovered(acctStmts, months[k]);
+      strip += '<span class="cov ' + (hit ? 'hit' : 'miss') + '" title="' + months[k] + '" aria-label="' + months[k] + (hit ? ': statement present' : ': missing') + '"></span>';
+    }
+    html += '<div class="card"><div class="acct-head">' +
+      '<input type="text" class="acct-name" value="' + esc(a.name || '') + '" data-change="account-rename" data-id="' + esc(id) + '" aria-label="Account name">' +
+      '<span class="pill' + (a.sampleBatch === 'v2-sample' ? ' ok' : ' dim') + '">' + esc(a.type || 'account') + '</span></div>' +
+      '<p class="small" style="margin:4px 0 8px">spent ' + money(total) + ' across ' + acctTxns.length + ' transaction' + (acctTxns.length === 1 ? '' : 's') + '</p>' +
+      '<div class="cov-strip" role="img" aria-label="Statement coverage for the last 12 months">' + strip + '</div>' +
+      '<p class="tiny" style="margin:6px 0 0"><span class="cov hit legend"></span> has a statement &nbsp; <span class="cov miss legend"></span> missing &nbsp;·&nbsp; last 12 months ending ' + anchor + '</p>' +
+      '</div>';
+  });
+  html += '<p class="tiny">Rename an account by editing its name above — the change is saved and logged automatically. The coverage strip shows at a glance which months have statements; a hollow month means that month’s data is missing.</p>';
+  App.show(v, seq, html);
+};
+
+App.Changes['account-rename'] = async function (el) {
+  var a = await sGet('accounts', el.dataset.id);
+  if (!a) { App.render(); return; }
+  var next = String(el.value || '').trim();
+  if (!next || next === a.name) { App.render(); return; } // revert on blank/unchanged
+  var old = a.name;
+  a.name = next;
+  await Store.put('accounts', a); // upsert: id present
+  audit('account.renamed', 'account', a.id, { from: old, to: next });
+  App.render();
+};
+
+/* ---------------- Sample data (More menu) ---------------- */
+
+/** Insert Engine.sampleData(seed) into the stores, remapping local stmtKeys to real statement ids. */
+App.insertSampleData = async function (data) {
+  var acctId = await Store.put('accounts', data.account);
+  var keyToId = {};
+  // Stamp createdAt in insertion order (oldest month -> newest) so the
+  // newest sample month sorts as "latest" in the Month/Statement views.
+  // The Engine output stays pure (createdAt 0); stamping is an app-layer
+  // insert concern and does not affect sampleData determinism.
+  var now = Date.now();
+  for (var i = 0; i < data.statements.length; i++) {
+    var src = data.statements[i], st = {}, k;
+    for (k in src) if (src.hasOwnProperty(k) && k !== 'stmtKey') st[k] = src[k];
+    st.accountId = acctId;
+    st.createdAt = now - (data.statements.length - 1 - i);
+    keyToId[src.stmtKey] = await Store.put('statements', st);
+  }
+  for (var j = 0; j < data.txns.length; j++) {
+    var tsrc = data.txns[j], tx = {};
+    for (var k2 in tsrc) if (tsrc.hasOwnProperty(k2) && k2 !== 'stmtKey') tx[k2] = tsrc[k2];
+    tx.statementId = keyToId[tsrc.stmtKey] || null;
+    await Store.put('txns', tx);
+  }
+  return { accountId: acctId, statements: data.statements.length, txns: data.txns.length };
+};
+
+App.Actions['sample-add'] = async function () {
+  var txns0 = await sAll('txns');
+  if (txns0.some(function (t) { return t && t.sampleBatch === 'v2-sample'; })) { App.go('month'); return; }
+  var n = await App.insertSampleData(Engine.sampleData(42));
+  audit('sample.created', 'ledger', null, { seed: 42, batch: 'v2-sample', statements: n.statements, txns: n.txns });
+  App.bumpDataRev();
+  App.go('month');
+};
+
+App.Actions['sample-remove'] = async function (d, el) {
+  if (!el || !el.dataset.armed) {
+    if (el) {
+      el.dataset.armed = '1';
+      el.textContent = 'Tap again to remove sample data';
+      setTimeout(function () {
+        if (el.isConnected) { delete el.dataset.armed; el.textContent = 'Remove sample data'; }
+      }, 3000);
+    }
+    return;
+  }
+  var removed = { txns: 0, statements: 0, accounts: 0 };
+  var txns = await sAll('txns'), stmts = await sAll('statements'), accts = await sAll('accounts');
+  for (var i = 0; i < txns.length; i++)
+    if (txns[i] && txns[i].sampleBatch === 'v2-sample') { await Store.delete('txns', txns[i].id); removed.txns++; }
+  for (var j = 0; j < stmts.length; j++)
+    if (stmts[j] && stmts[j].sampleBatch === 'v2-sample') { await Store.delete('statements', stmts[j].id); removed.statements++; }
+  for (var k = 0; k < accts.length; k++)
+    if (accts[k] && accts[k].sampleBatch === 'v2-sample') { await Store.delete('accounts', accts[k].id); removed.accounts++; }
+  audit('sample.removed', 'ledger', null, removed);
+  App.bumpDataRev();
+  App.go('more', { more: 'menu' });
+};
+
+/* ---------------- Onboarding (first-run 3-step tour) ---------------- */
+
+var ONBOARD_STEPS = [
+  { title: 'Add a statement',
+    body: 'Import a CSV or PDF bank statement. Everything is read on this device — nothing is ever uploaded.' },
+  { title: 'See your month',
+    body: 'Your spending explained with evidence. Every claim links back to the transactions behind it.' },
+  { title: 'Ask anything',
+    body: 'Ask “Where did my money go?” and get answers with cited transactions — all computed on-device.' }
+];
+
+/** First-run hook: show the tour when there are no statements and it was never finished/skipped. */
+App.maybeOnboard = async function () {
+  if (!App.ready) return;
+  var statements = await sAll('statements');
+  if (statements.length) return;
+  if (await App.prefGet('onboarded') === '1') return;
+  App.state.onboardStep = 0;
+  App.render();
+};
+
+/** Fixed-position first-run overlay (#onboard); no-op unless onboardStep is set. DOM-guarded for node tests. */
+App.renderOnboarding = function () {
+  if (typeof document === 'undefined') return;
+  var step = App.state.onboardStep;
+  var old = document.getElementById('onboard');
+  if (step === null || step === undefined) { if (old) old.remove(); return; }
+  step = Math.min(2, Math.max(0, step));
+  var cur = ONBOARD_STEPS[step];
+  var btns = '';
+  if (step > 0) btns += '<button class="btn ghost" data-action="onboard-back">Back</button>';
+  if (step < 2) btns += '<button class="btn" data-action="onboard-next">Next</button>';
+  else btns += '<button class="btn" data-action="onboard-done">Done</button>';
+  btns += '<button class="btn ghost" data-action="onboard-skip">Skip</button>';
+  var html = '<div class="onboard-card"><div class="onboard-step">Step ' + (step + 1) + ' of 3</div>' +
+    '<h2>' + esc(cur.title) + '</h2><p>' + esc(cur.body) + '</p>' +
+    '<div class="btn-row">' + btns + '</div></div>';
+  if (old) old.innerHTML = html;
+  else {
+    var d = document.createElement('div');
+    d.id = 'onboard';
+    d.innerHTML = html;
+    document.body.appendChild(d);
+  }
+};
+
+App.finishOnboarding = async function () {
+  await App.prefSet('onboarded', '1');
+  App.state.onboardStep = null;
+  App.render();
+};
+
+App.Actions['onboard-next'] = function () {
+  var next = (App.state.onboardStep || 0) + 1;
+  if (next > 2) { App.finishOnboarding(); return; }
+  App.state.onboardStep = next;
+  App.render();
+};
+App.Actions['onboard-back'] = function () {
+  App.state.onboardStep = Math.max(0, (App.state.onboardStep || 0) - 1);
+  App.render();
+};
+App.Actions['onboard-skip'] = function () { App.finishOnboarding(); };
+App.Actions['onboard-done'] = function () { App.finishOnboarding(); };
+App.Actions['onboard-replay'] = function () { App.state.onboardStep = 0; App.render(); };
 
 App.vRules = async function (v, seq) {
   var rules = await sAll('householdRules');
@@ -2548,6 +3330,7 @@ App.Changes['rule-toggle'] = async function (el) {
   r.enabled = el.checked;
   await Store.put('householdRules', r);
   audit(el.checked ? 'rule.enabled' : 'rule.disabled', 'householdRule', r.id, {});
+  App.bumpDataRev();
   App.render();
 };
 
@@ -2561,6 +3344,7 @@ App.Actions['rule-delete'] = async function (d, el) {
   var r = await sGet('householdRules', d.id);
   await Store.delete('householdRules', d.id);
   audit('rule.deleted', 'householdRule', d.id, { ruleType: r && r.ruleType, scope: r && r.scopeDescription });
+  App.bumpDataRev();
   App.render();
 };
 
@@ -2635,19 +3419,442 @@ App.Actions['wipe-go'] = async function () {
   try { await Store.wipeAll(); } catch (e) { /* fall through to reset */ }
   // Reset in-memory state; categories re-seed on next boot.
   App.state = { tab: 'add', addView: 'home', statementId: null, sfilter: 'review', txnId: null,
-                more: 'menu', askQ: null, askText: '', receiptMsg: '', ruleOffer: null,
-                pending: null, pipe: null, dupPairs: null };
+                more: 'menu', onboardStep: null, askQ: null, askText: '', receiptMsg: '', ruleOffer: null,
+                pending: null, pipe: null, dupPairs: null, txnShown: 60, txnSearch: '',
+                splitForm: null, manualMsg: '', dataRev: 0,
+                planView: 'budgets', budgetMonth: null, budgetEditId: null,
+                goalEditId: null, planMsg: '' };
   App.categories = [];
   await App.seedCategories();
   App.go('add');
+};
+
+/* ============================================================================
+ * Plan tab (Phase 2): budgets, goals, subscriptions
+ * ----------------------------------------------------------------------------
+ * All money inputs go through App.parseDollarsToMinor — strict, integer-only:
+ * an optional "$", 1-9 digits, optional .NN cents. Commas are NOT accepted
+ * (they are ambiguous across locales), negatives are not allowed; anything
+ * else returns null and the UI refuses to save instead of guessing.
+ * Tracking language only: budgets/goals report what happened, never advice
+ * like "you can afford X".
+ * ========================================================================== */
+
+/**
+ * App.parseDollarsToMinor(text) -> int minor units, or null.
+ * Strict: /^\$?\s*(\d{1,9})(?:\.(\d{1,2}))?\s*$/. Integer math only —
+ * no parseFloat anywhere near money. Commas rejected (-> null) by design.
+ */
+App.parseDollarsToMinor = function (text) {
+  var m = /^\$?\s*(\d{1,9})(?:\.(\d{1,2}))?\s*$/.exec(String(text == null ? '' : text));
+  if (!m) return null;
+  var dollars = m[1], cents = m[2] || '';
+  while (cents.length < 2) cents += '0';
+  var minor = 0;
+  for (var i = 0; i < dollars.length; i++) minor = minor * 10 + (dollars.charCodeAt(i) - 48);
+  minor = minor * 100 + (cents.charCodeAt(0) - 48) * 10 + (cents.charCodeAt(1) - 48);
+  return minor;
+};
+
+/** Dismiss-slug for a subscription: normalized merchant with [^a-z0-9]+ -> '_'. */
+App.subDismissSlug = function (merchant) {
+  return Engine._normSubMerchant(merchant).replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+};
+
+/* ---------------- Plan shell ---------------- */
+
+App.Actions['plan-view'] = function (d) {
+  App.state.planView = d.pv || 'budgets';
+  App.state.budgetEditId = null;
+  App.state.goalEditId = null;
+  App.render();
+};
+
+App.vPlan = async function (v, seq) {
+  var s = App.state;
+  if (s.planView !== 'goals' && s.planView !== 'subs') s.planView = 'budgets';
+  var html = '<h1>Plan</h1>';
+  if (s.planMsg) { html += '<div class="banner info">' + esc(s.planMsg) + '</div>'; s.planMsg = ''; }
+  html += '<div class="tabs" role="tablist">';
+  var views = [['budgets', 'Budgets'], ['goals', 'Goals'], ['subs', 'Subscriptions']];
+  for (var i = 0; i < views.length; i++) {
+    html += '<button class="chip' + (s.planView === views[i][0] ? ' on' : '') + '" role="tab" ' +
+      'data-action="plan-view" data-pv="' + views[i][0] + '">' + views[i][1] + '</button>';
+  }
+  html += '</div>';
+  if (s.planView === 'goals') html += await App.vPlanGoals();
+  else if (s.planView === 'subs') html += await App.vPlanSubs();
+  else html += await App.vPlanBudgets();
+  App.show(v, seq, html);
+};
+
+/* ---------------- Plan: budgets ---------------- */
+
+function planCurrentMonth() {
+  var n = new Date();
+  return n.getFullYear() + '-' + ('0' + (n.getMonth() + 1)).slice(-2);
+}
+
+function prevMonthOf(ym) {
+  var y = +String(ym).slice(0, 4), m = +String(ym).slice(5, 7);
+  m -= 1;
+  if (m < 1) { m = 12; y -= 1; }
+  return y + '-' + ('0' + m).slice(-2);
+}
+
+/** Default month for budget views: the latest statement's periodEnd month,
+ * else the current calendar month. Shared by the Plan tab and the Month
+ * view's budget summary card. */
+App.defaultBudgetMonth = function (stmts) {
+  var curMonth = planCurrentMonth();
+  var sorted = (stmts || []).slice().sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
+  if (sorted.length) {
+    var pe = /^(\d{4})-(\d{2})/.exec(String(sorted[0].periodEnd || ''));
+    if (pe) return pe[1] + '-' + pe[2];
+  }
+  return curMonth;
+};
+
+App.vPlanBudgets = async function () {
+  var stmts = await sAll('statements');
+  var curMonth = planCurrentMonth();
+  var defMonth = App.defaultBudgetMonth(stmts);
+  if (!App.state.budgetMonth || !/^\d{4}-\d{2}$/.test(App.state.budgetMonth)) {
+    App.state.budgetMonth = defMonth;
+  }
+  var month = App.state.budgetMonth;
+  var readOnly = month < curMonth; // past months: actuals only, no editing
+
+  var html = '<div class="card"><label class="f" for="budget-month">Month</label>' +
+    '<input type="month" id="budget-month" data-change="budget-month" value="' + esc(month) + '">' +
+    '<p class="tiny" style="margin-bottom:0">Showing ' + esc(fmtPeriod(month)) +
+    (readOnly ? ' — past months are read-only.' : '') + '</p></div>';
+
+  var budgets = (await sAll('budgets')).filter(function (b) { return b.month === month; });
+  budgets.sort(function (a, b) { return String(a.category).localeCompare(String(b.category)); });
+  var txns = await sAll('txns');
+
+  html += '<div class="card"><h3 style="margin-top:0">Budgets for ' + esc(fmtPeriod(month)) + '</h3>';
+  if (!budgets.length) {
+    html += '<p class="small" style="margin-bottom:0">' +
+      (readOnly ? 'No budgets were set for this month.' : 'No budgets set yet — add one below or copy last month\u2019s.') + '</p>';
+  } else {
+    budgets.forEach(function (b) {
+      var spent = 0;
+      try { spent = Engine.categorySpendMinor(txns, b.category, month); } catch (e) { spent = 0; }
+      var limit = b.limitMinor || 0;
+      var over = spent > limit;
+      var pct = limit > 0 ? Math.min(100, Math.round(spent * 100 / limit)) : (spent > 0 ? 100 : 0);
+      html += '<div class="bar-row"' + (over ? ' style="border-left:3px solid var(--danger);padding-left:6px"' : '') + '>' +
+        '<span class="b-label">' + esc(catName(b.category)) + '</span>' +
+        '<span class="b-track"><span class="b-fill" style="width:' + pct + '%;' +
+        (over ? 'background:var(--danger);' : '') + '"></span></span>' +
+        '<span class="b-amt">' + money(spent) + ' / ' + money(limit) + '</span></div>';
+      if (over) {
+        html += '<div><span class="pill bad">Over budget by ' + money(spent - limit) + '</span></div>';
+      }
+      if (!readOnly) {
+        html += '<div class="btn-row" style="margin:4px 0 10px">' +
+          '<button class="btn ghost smallbtn" data-action="budget-edit" data-id="' + esc(b.id) + '">Edit</button>' +
+          '<button class="btn ghost smallbtn" data-action="budget-delete" data-id="' + esc(b.id) + '">Delete</button></div>';
+      }
+    });
+  }
+  html += '</div>';
+
+  if (!readOnly) {
+    var editing = App.state.budgetEditId ? (await sGet('budgets', App.state.budgetEditId)) : null;
+    html += '<div class="card"><h3 style="margin-top:0">' + (editing ? 'Edit budget' : 'Add a budget') + '</h3>' +
+      '<label class="f" for="budget-cat">Category</label><select id="budget-cat">';
+    for (var i = 0; i < App.categories.length; i++) {
+      var c = App.categories[i];
+      var sel = (editing && String(editing.category) === String(c.id)) ? ' selected' : '';
+      html += '<option value="' + esc(c.id) + '"' + sel + '>' + esc(c.name) + '</option>';
+    }
+    html += '</select>' +
+      '<label class="f" for="budget-limit">Monthly limit (e.g. 400 or 400.00)</label>' +
+      '<input type="text" id="budget-limit" inputmode="decimal" autocomplete="off" placeholder="400.00"' +
+      (editing ? ' value="' + (Math.floor(editing.limitMinor / 100)) + '.' +
+        ('0' + (editing.limitMinor % 100)).slice(-2) + '"' : '') + '>' +
+      '<div class="btn-row"><button class="btn" data-action="budget-save">' +
+      (editing ? 'Save changes' : 'Add budget') + '</button>';
+    if (editing) html += '<button class="btn ghost" data-action="budget-cancel">Cancel</button>';
+    html += '</div><p class="tiny" style="margin-bottom:0">Whole dollars and cents only — no commas.</p></div>';
+
+    var prev = prevMonthOf(month);
+    html += '<div class="card"><button class="btn ghost" data-action="budget-copy">' +
+      'Copy ' + esc(fmtPeriod(prev)) + '\u2019s budgets</button>' +
+      '<p class="tiny" style="margin-bottom:0">Copies each of last month\u2019s budgets into ' +
+      esc(fmtPeriod(month)) + ' unless that category already has one.</p></div>';
+  }
+  return html;
+};
+
+App.Changes['budget-month'] = function (el) {
+  if (/^\d{4}-\d{2}$/.test(el.value || '')) {
+    App.state.budgetMonth = el.value;
+    App.state.budgetEditId = null;
+    App.render();
+  }
+};
+
+App.Actions['budget-edit'] = function (d) {
+  App.state.budgetEditId = d.id;
+  App.render();
+};
+
+App.Actions['budget-cancel'] = function () {
+  App.state.budgetEditId = null;
+  App.render();
+};
+
+App.Actions['budget-save'] = async function () {
+  var catEl = $('#budget-cat'), limEl = $('#budget-limit');
+  var cat = catEl ? catEl.value : '';
+  var amt = App.parseDollarsToMinor(limEl ? limEl.value : '');
+  if (!cat) { App.state.planMsg = 'Choose a category.'; App.render(); return; }
+  if (amt === null || amt <= 0) {
+    App.state.planMsg = 'Enter a valid limit like 400 or 400.00 (digits and an optional decimal point — no commas, no negatives).';
+    App.render(); return;
+  }
+  var month = App.state.budgetMonth;
+  if (App.state.budgetEditId) {
+    var b = await sGet('budgets', App.state.budgetEditId);
+    if (!b) { App.state.budgetEditId = null; App.render(); return; }
+    b.category = cat; b.limitMinor = amt;
+    await Store.put('budgets', b);
+    audit('budget.updated', 'budget', b.id, { month: b.month, category: cat, limitMinor: amt });
+    App.state.budgetEditId = null;
+  } else {
+    var dup = (await sAll('budgets')).filter(function (x) {
+      return x.month === month && String(x.category) === String(cat);
+    });
+    if (dup.length) {
+      App.state.planMsg = 'That category already has a budget for this month — edit it instead.';
+      App.render(); return;
+    }
+    var id = await Store.put('budgets', { category: cat, month: month, limitMinor: amt });
+    audit('budget.created', 'budget', id, { month: month, category: cat, limitMinor: amt });
+  }
+  App.bumpDataRev();
+  App.render();
+};
+
+App.Actions['budget-delete'] = async function (d, el) {
+  if (!el.dataset.armed) {
+    el.dataset.armed = '1';
+    el.textContent = 'Tap again to delete';
+    setTimeout(function () { if (el.isConnected) { delete el.dataset.armed; el.textContent = 'Delete'; } }, 3000);
+    return;
+  }
+  var b = await sGet('budgets', d.id);
+  await Store.delete('budgets', d.id);
+  audit('budget.deleted', 'budget', d.id, { month: b && b.month, category: b && b.category, limitMinor: b && b.limitMinor });
+  App.bumpDataRev();
+  App.render();
+};
+
+App.Actions['budget-copy'] = async function () {
+  var month = App.state.budgetMonth;
+  var prev = prevMonthOf(month);
+  var all = await sAll('budgets');
+  var prevB = all.filter(function (b) { return b.month === prev; });
+  var have = {};
+  all.filter(function (b) { return b.month === month; }).forEach(function (b) { have[String(b.category)] = 1; });
+  var n = 0;
+  for (var i = 0; i < prevB.length; i++) {
+    if (have[String(prevB[i].category)]) continue;
+    await Store.put('budgets', { category: prevB[i].category, month: month, limitMinor: prevB[i].limitMinor });
+    n++;
+  }
+  audit('budget.copied', 'budget', null, { from: prev, to: month, count: n });
+  App.state.planMsg = n > 0
+    ? ('Copied ' + n + ' budget' + (n === 1 ? '' : 's') + ' from ' + fmtPeriod(prev) + '.')
+    : ('No budgets to copy from ' + fmtPeriod(prev) + '.');
+  App.bumpDataRev();
+  App.render();
+};
+
+/* ---------------- Plan: goals ---------------- */
+
+App.vPlanGoals = async function () {
+  var goals = await sAll('goals');
+  goals.sort(function (a, b) { return (a.createdAt || 0) - (b.createdAt || 0); });
+  var html = '';
+  if (!goals.length) {
+    html += '<div class="empty">No goals yet — name one below and track what you\u2019ve set aside toward it.</div>';
+  }
+  goals.forEach(function (g) {
+    var saved = g.savedMinor || 0, target = g.targetMinor || 0;
+    var done = target > 0 && saved >= target;
+    var pct = target > 0 ? Math.min(100, Math.round(saved * 100 / target)) : (saved > 0 ? 100 : 0);
+    html += '<div class="card"><h3 style="margin-top:0">' + esc(g.name || 'Goal') +
+      (done ? ' <span class="pill ok">Complete \uD83C\uDF89</span>' : '') + '</h3>';
+    html += '<div class="bar-row"><span class="b-label">Saved</span>' +
+      '<span class="b-track"><span class="b-fill" style="width:' + pct + '%"></span></span>' +
+      '<span class="b-amt">' + money(saved) + ' / ' + money(target) + '</span></div>';
+    if (g.targetDate) html += '<p class="small">Target date: ' + esc(fmtDate(g.targetDate)) + '</p>';
+    if (g.note) html += '<p class="small">' + esc(g.note) + '</p>';
+    html += '<div class="btn-row" style="align-items:center">' +
+      '<input type="text" id="contrib-' + esc(g.id) + '" inputmode="decimal" autocomplete="off" ' +
+      'placeholder="Log amount, e.g. 25.00" style="flex:1;min-width:0">' +
+      '<button class="btn smallbtn" data-action="goal-contrib" data-id="' + esc(g.id) + '">Log</button>' +
+      '<button class="btn ghost smallbtn" data-action="goal-edit" data-id="' + esc(g.id) + '">Edit</button>' +
+      '<button class="btn ghost smallbtn" data-action="goal-delete" data-id="' + esc(g.id) + '">Delete</button></div></div>';
+  });
+
+  var editing = App.state.goalEditId ? (await sGet('goals', App.state.goalEditId)) : null;
+  html += '<div class="card"><h3 style="margin-top:0">' + (editing ? 'Edit goal' : 'Add a goal') + '</h3>' +
+    '<label class="f" for="goal-name">Name</label>' +
+    '<input type="text" id="goal-name" autocomplete="off" placeholder="e.g. Emergency fund"' +
+    (editing ? ' value="' + esc(editing.name) + '"' : '') + '>' +
+    '<label class="f" for="goal-target">Target amount (e.g. 1000 or 1000.00)</label>' +
+    '<input type="text" id="goal-target" inputmode="decimal" autocomplete="off" placeholder="1000.00"' +
+    (editing ? ' value="' + (Math.floor(editing.targetMinor / 100)) + '.' +
+      ('0' + (editing.targetMinor % 100)).slice(-2) + '"' : '') + '>' +
+    '<label class="f" for="goal-date">Target date (optional)</label>' +
+    '<input type="date" id="goal-date"' + (editing && editing.targetDate ? ' value="' + esc(editing.targetDate) + '"' : '') + '>' +
+    '<label class="f" for="goal-note">Note (optional)</label>' +
+    '<input type="text" id="goal-note" autocomplete="off"' +
+    (editing && editing.note ? ' value="' + esc(editing.note) + '"' : '') + '>' +
+    '<div class="btn-row"><button class="btn" data-action="goal-save">' +
+    (editing ? 'Save changes' : 'Add goal') + '</button>';
+  if (editing) html += '<button class="btn ghost" data-action="goal-cancel">Cancel</button>';
+  html += '</div></div>';
+  return html;
+};
+
+App.Actions['goal-edit'] = function (d) {
+  App.state.goalEditId = d.id;
+  App.render();
+};
+
+App.Actions['goal-cancel'] = function () {
+  App.state.goalEditId = null;
+  App.render();
+};
+
+App.Actions['goal-save'] = async function () {
+  var nameEl = $('#goal-name'), tgtEl = $('#goal-target'), dateEl = $('#goal-date'), noteEl = $('#goal-note');
+  var name = nameEl ? String(nameEl.value || '').replace(/^\s+|\s+$/g, '') : '';
+  var target = App.parseDollarsToMinor(tgtEl ? tgtEl.value : '');
+  var tdate = dateEl && /^\d{4}-\d{2}-\d{2}$/.test(dateEl.value || '') ? dateEl.value : null;
+  var note = noteEl ? String(noteEl.value || '').replace(/^\s+|\s+$/g, '') : '';
+  if (!name) { App.state.planMsg = 'Give the goal a name.'; App.render(); return; }
+  if (target === null || target <= 0) {
+    App.state.planMsg = 'Enter a valid target like 1000 or 1000.00 (digits and an optional decimal point — no commas, no negatives).';
+    App.render(); return;
+  }
+  if (App.state.goalEditId) {
+    var g = await sGet('goals', App.state.goalEditId);
+    if (!g) { App.state.goalEditId = null; App.render(); return; }
+    g.name = name; g.targetMinor = target; g.targetDate = tdate; g.note = note || null;
+    await Store.put('goals', g);
+    audit('goal.updated', 'goal', g.id, { name: name, targetMinor: target });
+    App.state.goalEditId = null;
+  } else {
+    var id = await Store.put('goals', {
+      name: name, targetMinor: target, savedMinor: 0, targetDate: tdate,
+      note: note || null, createdAt: Date.now()
+    });
+    audit('goal.created', 'goal', id, { name: name, targetMinor: target });
+  }
+  App.bumpDataRev();
+  App.render();
+};
+
+App.Actions['goal-contrib'] = async function (d) {
+  var input = document.getElementById('contrib-' + d.id);
+  var amt = App.parseDollarsToMinor(input ? input.value : '');
+  if (amt === null || amt <= 0) {
+    App.state.planMsg = 'Enter a valid amount like 25.00 to log a contribution.';
+    App.render(); return;
+  }
+  var g = await sGet('goals', d.id);
+  if (!g) return;
+  g.savedMinor = (g.savedMinor || 0) + amt; // integer math only
+  await Store.put('goals', g);
+  audit('goal.contributed', 'goal', g.id, { amountMinor: amt, savedMinor: g.savedMinor });
+  App.bumpDataRev();
+  App.render();
+};
+
+App.Actions['goal-delete'] = async function (d, el) {
+  if (!el.dataset.armed) {
+    el.dataset.armed = '1';
+    el.textContent = 'Tap again to delete';
+    setTimeout(function () { if (el.isConnected) { delete el.dataset.armed; el.textContent = 'Delete'; } }, 3000);
+    return;
+  }
+  var g = await sGet('goals', d.id);
+  await Store.delete('goals', d.id);
+  audit('goal.deleted', 'goal', d.id, { name: g && g.name });
+  if (String(App.state.goalEditId) === String(d.id)) App.state.goalEditId = null;
+  App.bumpDataRev();
+  App.render();
+};
+
+/* ---------------- Plan: subscriptions ---------------- */
+
+var SUB_CADENCE_LABELS = { monthly: 'Monthly', weekly: 'Weekly', yearly: 'Yearly' };
+
+App.vPlanSubs = async function () {
+  var txns = await sAll('txns');
+  var subs = [];
+  try { subs = Engine.detectSubscriptions(txns) || []; } catch (e) { subs = []; }
+  var visible = [];
+  var total = 0;
+  for (var i = 0; i < subs.length; i++) {
+    var slug = App.subDismissSlug(subs[i].merchant);
+    var dismissed = await App.prefGet('sub_dismissed_' + slug);
+    if (dismissed) continue;
+    visible.push({ sub: subs[i], slug: slug });
+    total += subs[i].monthlyCostMinor || 0;
+  }
+
+  var html = '<div class="card"><div class="headline-label">Recurring charges detected</div>' +
+    '<div class="headline-num">\u2248 ' + money(total) + '/mo</div>' +
+    '<p class="small" style="margin-bottom:0">Across ' + visible.length + ' subscription' +
+    (visible.length === 1 ? '' : 's') + '. Detected on-device from your statements — ' +
+    'dismiss anything that isn\u2019t really recurring. Nothing here is a recommendation.</p></div>';
+
+  if (!visible.length) {
+    html += '<div class="empty">No recurring charges detected yet.<br>' +
+      '<span class="small">Subscriptions appear after at least 3 matching charges with a steady monthly, weekly, or yearly cadence.</span></div>';
+    return html;
+  }
+  visible.forEach(function (vs) {
+    var s = vs.sub;
+    var cad = SUB_CADENCE_LABELS[s.cadence] || s.cadence;
+    html += '<div class="card"><div class="bar-row"><span class="b-label">' + esc(s.displayName) + '</span>' +
+      '<span class="b-amt">' + money(s.amountMinor) + ' · ' + esc(cad) + '</span></div>' +
+      '<p class="small" style="margin:4px 0">' + s.occurrences + ' charge' + (s.occurrences === 1 ? '' : 's') +
+      ' · last ' + esc(fmtDate(s.lastDate)) + ' · next expected ' + esc(fmtDate(s.nextExpected)) +
+      ' · \u2248 ' + money(s.monthlyCostMinor) + '/mo</p>' +
+      '<div class="btn-row" style="align-items:center">' +
+      (s.priceChanged ? '<span class="pill warn">Price changed</span>' : '') +
+      '<button class="btn ghost smallbtn" data-action="sub-dismiss" data-slug="' + esc(vs.slug) + '">Dismiss</button></div></div>';
+  });
+  return html;
+};
+
+App.Actions['sub-dismiss'] = async function (d) {
+  if (!d.slug) return;
+  await App.prefSet('sub_dismissed_' + d.slug, '1');
+  audit('sub.dismissed', 'subscription', d.slug, {});
+  App.render();
 };
 
 /* Test hooks: pure helpers exposed for node smoke tests (no DOM needed). */
 App._test = {
   sha256Hex: sha256Hex, esc: esc, money: money, spendAbs: spendAbs, fmtDate: fmtDate, fmtPeriod: fmtPeriod,
   prettify: prettify, kindLabel: kindLabel, merchantCore: merchantCore, receiptForScore: receiptForScore,
-  parseManualAmount: parseManualAmount, spendOf: spendOf, txnTab: txnTab,
-  matchQuestion: App.matchQuestion, shortHash: shortHash
+  parseManualAmount: parseManualAmount, spendOf: spendOf, txnTab: txnTab, dollarsText: dollarsText,
+  searchTxns: App.searchTxns, applyBalanceCheckPolicy: App.applyBalanceCheckPolicy,
+  defaultBudgetMonth: App.defaultBudgetMonth, catLabelSmart: catLabelSmart,
+  parseDollarsToMinor: App.parseDollarsToMinor, subDismissSlug: App.subDismissSlug,
+  matchQuestion: App.matchQuestion, shortHash: shortHash,
+  _paginate: App._paginate, _dupCacheKey: App._dupCacheKey, TXN_PAGE_SIZE: App.TXN_PAGE_SIZE
 };
 
 /* ============================================================================
