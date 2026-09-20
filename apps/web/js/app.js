@@ -2862,6 +2862,14 @@ App.Actions['confirm-rule'] = async function () {
   if (corr) { corr.madeRuleId = id; await Store.put('corrections', corr); }
   audit('rule.created', 'householdRule', id, { field: off.field, value: off.newValue, scope: off.scopeDescription });
   App.state.ruleOffer = null;
+  // A confirmed category rule teaches the existing ledger immediately:
+  // similar transactions that were never categorized get the category now
+  // (user-set categories are never touched). Kind rules stay future-only —
+  // reclassifying kind retroactively would rewrite spend/excluded history.
+  if (rec.category) {
+    await App.runAutocatBackfill();
+    return;
+  }
   App.bumpDataRev(); // rules change classification -> duplicate cache invalid
   App.render();
 };
@@ -3910,9 +3918,11 @@ App.Changes['account-rename'] = async function (el) {
  * App.Actions['autocat-backfill']: run Engine.autoCategorize over ALL stored
  * transactions. Rows with a user-set category (categorySource==='user' or
  * classificationSource==='user') are never touched. Reports how many
- * transactions newly received a category.
+ * transactions newly received a category. Also runs automatically right
+ * after the user confirms a new category rule, so one correction teaches
+ * the whole existing ledger.
  */
-App.Actions['autocat-backfill'] = async function () {
+App.runAutocatBackfill = async function () {
   var txns = await sAll('txns');
   var rules = rulePayloads(await enabledRules());
   var before = {};
@@ -3936,7 +3946,9 @@ App.Actions['autocat-backfill'] = async function () {
     ' Your own categories were never touched.';
   App.bumpDataRev();
   App.render();
+  return { added: added, refreshed: refreshed, total: txns.length };
 };
+App.Actions['autocat-backfill'] = function () { return App.runAutocatBackfill(); };
 
 /** Insert Engine.sampleData(seed) into the stores, remapping local stmtKeys to real statement ids. */
 App.insertSampleData = async function (data) {
