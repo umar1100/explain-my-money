@@ -1345,7 +1345,8 @@
    * before their generic single-word cousins ('COSTCO GAS' -> transport must
    * beat 'COSTCO' -> groceries; 'UBER EATS' -> dining must beat 'UBER' ->
    * transport; 'CANADIAN TIRE GAS' -> transport must beat 'CANADIAN TIRE' ->
-   * household). Substring match against the uppercase merchantRaw.
+   * household). Alphanumeric-folded substring match against the uppercase
+   * merchantRaw (punctuation/spacing-insensitive, see foldAlphaNum).
    *
    * Confidence: the rule's confidence applies when the matched keyword is
    * multi-word (specific); generic single-word matches are capped at 0.75.
@@ -1358,19 +1359,30 @@
   Engine.categoryKeywordRules = [
     // --- specific keys that must beat a generic rule below ---
     { category: 'transport', confidence: 0.95, keywords: ['COSTCO GAS', 'COSTCO FUEL', 'CANADIAN TIRE GAS', 'GO TRANSIT', 'PRESTO CARD', 'GREEN P PARKING', 'VIA RAIL'] },
-    { category: 'groceries', confidence: 0.92, keywords: ['LOBLAWS', 'REAL CANADIAN SUPERSTORE', 'SUPERSTORE', 'NO FRILLS', 'NOFRILLS', 'SOBEYS', 'FRESHCO', 'FOOD BASICS', 'LONGOS', 'FORTINOS', 'FARM BOY', 'SAVE-ON-FOODS', 'SAVE ON FOODS', 'SAFEWAY', 'MARCHE ADONIS', 'T&T SUPERMARKET', 'H MART', 'COSTCO WHOLESALE'] },
-    { category: 'dining', confidence: 0.92, keywords: ['TIM HORTONS', 'MCDONALD', 'SKIPTHEDISHES', 'SKIP THE DISHES', 'DOORDASH', 'UBER EATS', 'PIZZA PIZZA', 'THE KEG', 'STEAKHOUSE', 'HARVEYS', 'WENDY', 'SUBWAY', 'STARBUCKS', 'SECOND CUP', 'SUSHI', 'RESTAURANT', 'FOOD COURT', 'PIZZERIA', 'COFFEE', 'CAFE'] },
+    { category: 'groceries', confidence: 0.92, keywords: ['LOBLAWS', 'REAL CANADIAN SUPERSTORE', 'REAL CANADIAN', 'SUPERSTORE', 'NO FRILLS', 'NOFRILLS', 'SOBEYS', 'FRESHCO', 'FOOD BASICS', 'LONGOS', 'FORTINOS', 'FARM BOY', 'SAVE-ON-FOODS', 'SAVE ON FOODS', 'SAFEWAY', 'MARCHE ADONIS', 'T&T SUPERMARKET', 'H MART', 'COSTCO WHOLESALE'] },
+    { category: 'dining', confidence: 0.92, keywords: ['TIM HORTONS', 'MCDONALD', 'KFC', 'POPEYES', 'SKIPTHEDISHES', 'SKIP THE DISHES', 'DOORDASH', 'UBER EATS', 'PIZZA PIZZA', 'THE KEG', 'STEAKHOUSE', 'HARVEYS', 'WENDY', 'SUBWAY', 'STARBUCKS', 'SECOND CUP', 'SUSHI', 'ICE CREAM', 'RESTAURANT', 'FOOD COURT', 'PIZZERIA', 'COFFEE', 'CAFE'] },
     { category: 'health_pharmacy', confidence: 0.92, keywords: ['SHOPPERS DRUG', 'DRUG MART', 'SHOPPERS', 'REXALL', 'PHARMAPRIX', 'JEAN COUTU', 'PHARMACY', 'LIFE LABS', 'LIFELABS', 'DENTAL', 'OPTICAL', 'PHYSIO', 'WALK-IN CLINIC', 'MEDICAL CENTRE'] },
     { category: 'subscriptions', confidence: 0.92, keywords: ['NETFLIX', 'SPOTIFY', 'DISNEY+', 'AMAZON PRIME', 'PRIME VIDEO', 'YOUTUBE PREMIUM', 'APPLE.COM/BILL', 'GOOGLE ONE', 'DROPBOX', 'ICLOUD', 'MICROSOFT 365', 'ROGERS WIRELESS', 'ROGERS', 'BELL MOBILITY', 'TELUS', 'KOODO', 'FREEDOM MOBILE', 'FIDO', 'VIRGIN MOBILE', 'GOODLIFE FITNESS', 'GOODLIFE', 'FITNESS'] },
-    { category: 'household', confidence: 0.88, keywords: ['HYDRO ONE', 'HYDRO', 'ENBRIDGE', 'TORONTO WATER', 'CANADIAN TIRE', 'HOME DEPOT', 'RONA', 'LOWES', "LOWE'S", 'IKEA', 'DOLLARAMA', 'BED BATH', 'UTILITY', 'PROPERTY TAX'] },
+    { category: 'household', confidence: 0.88, keywords: ['HYDRO ONE', 'HYDRO', 'ENBRIDGE', 'ENERCARE', 'TORONTO WATER', 'CANADIAN TIRE', 'HOME DEPOT', 'RONA', 'LOWES', "LOWE'S", 'IKEA', 'DOLLARAMA', 'BED BATH', 'UTILITY', 'PROPERTY TAX'] },
     { category: 'shopping', confidence: 0.88, keywords: ['BEST BUY', 'SPORT CHEK', 'SPORTCHEK', 'WINNERS', 'HOMESENSE', 'MARKS WORK', 'AMAZON', 'COSTCO.CA'] },
     // --- generic single-word keys (lower confidence, still >= 0.6) ---
     { category: 'transport', confidence: 0.90, keywords: ['SHELL', 'ESSO', 'PETRO', 'PIONEER', 'ULTRAMAR', 'HUSKY', 'PRESTO', 'TTC', 'PARKING', 'UBER', 'LYFT', 'AIR CANADA', 'PORTER AIRLINES', 'WESTJET', 'AVIS', 'BUDGET RENT', 'TAXI'] },
-    { category: 'groceries', confidence: 0.80, keywords: ['COSTCO', 'METRO', 'GROCERY', 'PRODUCE', 'BAKERY', 'BUTCHER', 'MEAT MARKET'] },
+    { category: 'groceries', confidence: 0.80, keywords: ['COSTCO', 'METRO', 'GROCERY', 'FOODS', 'PRODUCE', 'BAKERY', 'BUTCHER', 'MEAT MARKET'] },
     { category: 'shopping', confidence: 0.80, keywords: ['WALMART', 'SEPHORA', 'OLD NAVY', 'ZARA', 'H&M'] },
     { category: 'fees', confidence: 0.90, keywords: ['ANNUAL FEE', 'LATE FEE', 'INTEREST CHARGE', 'INTEREST CHARGED', 'SERVICE CHARGE', 'BANK FEE', 'OVERDRAFT', 'CASH ADVANCE FEE', 'NSF FEE'] },
     { category: 'other', confidence: 0.70, keywords: ['LCBO', 'BEER STORE', 'CANADA POST', 'POST OFFICE', 'DONATION', 'CHARITY', 'GOVERNMENT', 'CITY OF'] }
   ];
+
+  /**
+   * Fold a string to uppercase alphanumerics for keyword matching, so
+   * punctuation and spacing variants ('WAL-MART' vs 'WALMART', 'SAVE-ON-FOODS'
+   * vs 'SAVE ON FOODS', 'H&M') match the same keyword. Folded matching is a
+   * strict superset of plain substring matching: if hay contained kw, the
+   * folded hay still contains the folded kw.
+   */
+  function foldAlphaNum(s) {
+    return String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  }
 
   /**
    * Engine.suggestCategory(row) -> {categoryId, confidence, reason} | null.
@@ -1379,7 +1391,8 @@
    *  - kind in (payment, transfer) -> null (money movement, not spend).
    *  - kind in (purchase, refund) -> first keyword-rule match (ordered, so
    *    specific beats generic); multi-word keyword -> rule confidence,
-   *    generic single-word -> capped at 0.75.
+   *    generic single-word -> capped at 0.75. Matching is
+   *    alphanumeric-folded (see foldAlphaNum).
    *  - anything else (uncertain, cash_advance, ...) -> null.
    *  - NO keyword match -> null. Blank stays blank; never invent a category.
    */
@@ -1393,6 +1406,7 @@
     if (kind !== 'purchase' && kind !== 'refund') return null;
     var hay = String(row.merchantRaw || '');
     if (hay === '') return null;
+    var hayFolded = foldAlphaNum(hay);
     var rules = Engine.categoryKeywordRules || [];
     for (var i = 0; i < rules.length; i++) {
       var rule = rules[i];
@@ -1400,7 +1414,7 @@
       var kws = rule.keywords || [];
       for (var k = 0; k < kws.length; k++) {
         var kw = String(kws[k] || '').toUpperCase();
-        if (kw !== '' && hay.indexOf(kw) !== -1) {
+        if (kw !== '' && hayFolded.indexOf(foldAlphaNum(kw)) !== -1) {
           var multi = kw.indexOf(' ') !== -1;
           var conf = multi ? rule.confidence : Math.min(rule.confidence, 0.75);
           return { categoryId: rule.category, confidence: conf,

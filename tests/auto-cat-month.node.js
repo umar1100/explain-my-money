@@ -116,6 +116,28 @@ async function main() {
   ok(sugOf('STARBUCKS STORE 551').categoryId === 'dining', 'STARBUCKS -> dining');
   ok(sugOf('PRESTO CARD LOAD').categoryId === 'transport', 'PRESTO -> transport');
 
+  // --- real statement merchants seen in the wild (statement truncates /
+  // punctuates names: 'SUPERSTO' for SUPERSTORE, 'WAL-MART', 'SQ *' prefix) ---
+  const wild = [
+    ['REAL CANADIAN SUPERSTO WHITBY ON', 'groceries'],   // truncated print
+    ['REAL CANADIAN SUPERSTORE #1234', 'groceries'],
+    ['ENERCARE HOME SERVICES MARKHAM ON', 'household'],
+    ['KFC #1377 AJAX ON', 'dining'],
+    ['WAL-MART #3001 AJAX ON', 'shopping'],              // hyphen variant
+    ['WALMART SUPERCENTER', 'shopping'],
+    ['AJAX IQBAL FOODS AJAX ON', 'groceries'],
+    ['SQ *ICE CREAMONOLOGY TORONTO ON', 'dining'],       // Square prefix
+    ['SAVE-ON-FOODS #9921', 'groceries'],                // hyphen variant
+    ['POPEYES LOUISIANA KITCHEN', 'dining'],
+  ];
+  wild.forEach(([desc, expected]) => {
+    const s = sugOf(desc);
+    ok(s && s.categoryId === expected && s.confidence >= 0.6,
+      'wild merchant "' + desc + '" -> ' + expected, s);
+  });
+  ok(sugOf('SQ *NIKITA FENG TORONTO ON') === null,
+    'unknown small business stays blank (never guessed)');
+
   // --- fee kind, payment/transfer, unknown merchant, non-spend kinds ---
   ok(sugOf('ANNUAL FEE').categoryId === 'fees', 'fee kind -> fees');
   ok(E.suggestCategory(txn('t', 's1', '2026-08-10', 5000, 'COSTCO', 'payment')) === null, 'payment -> null');
