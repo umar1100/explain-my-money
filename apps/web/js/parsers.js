@@ -294,7 +294,9 @@
     extractLines: extractLines,
     groupIntoLines: groupIntoLines,
     looksLikeISODate: looksLikeISODate,
-    normApos: normApos
+    normApos: normApos,
+    pcParseLongDate: pcParseLongDate,
+    cibcParseLongDate: cibcParseLongDate
   };
 
   /* ================================================================== */
@@ -311,7 +313,10 @@
     columnSplitX: 392.0
   };
 
-  var PC_MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, sept: 9, oct: 10, nov: 11, dec: 12 };
+  // Accept both abbreviations ("Jul") and full names ("July") for statement
+  // dates; some statements spell the month out (e.g. "July 16, 2026").
+  var PC_MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, sept: 9, oct: 10, nov: 11, dec: 12,
+    january: 1, february: 2, march: 3, april: 4, june: 6, july: 7, august: 8, september: 9, october: 10, november: 11, december: 12 };
 
   function pcParseLongDate(text) {
     var m = /^\s*([A-Za-z]+)\.?\s+(\d{1,2}),\s*(\d{4})\s*$/.exec(text);

@@ -104,6 +104,28 @@ async function testFile(label, pdfPath, expected) {
   check('detectFormat detects CIBC markers',
     Parsers.detectFormat('CIBC Costco World Mastercard\nStatement Date') === 'cibc_costco');
 
+  // Statement dates spelled out with full month names (seen in the wild:
+  // "Statement date: July 16, 2026") must parse, not throw "unknown month".
+  const I = Parsers._internals || {};
+  if (typeof I.pcParseLongDate === 'function') {
+    const pcDate = (s) => { try { return I.pcParseLongDate(s); } catch (e) { return 'THROW:' + e.message; } };
+    check('pc: full month name parses', pcDate('July 16, 2026') === '2026-07-16', pcDate('July 16, 2026'));
+    check('pc: abbreviation still parses', pcDate('Jul 16, 2026') === '2026-07-16', pcDate('Jul 16, 2026'));
+    check('pc: dotted abbreviation still parses', pcDate('Jul. 16, 2026') === '2026-07-16', pcDate('Jul. 16, 2026'));
+    const allMonths = ['January 3, 2025', 'February 14, 2025', 'March 1, 2025', 'April 30, 2025',
+      'May 5, 2025', 'June 6, 2025', 'July 16, 2026', 'August 8, 2025', 'September 9, 2025',
+      'October 10, 2025', 'November 11, 2025', 'December 25, 2025'];
+    check('pc: all 12 full month names parse',
+      allMonths.every((s) => !/^THROW/.test(pcDate(s))),
+      JSON.stringify(allMonths.filter((s) => /^THROW/.test(pcDate(s)))));
+  } else {
+    check('pcParseLongDate exposed in _internals', false, 'not exposed');
+  }
+  if (typeof I.cibcParseLongDate === 'function') {
+    const cibcDate = (s) => { try { return I.cibcParseLongDate(s); } catch (e) { return 'THROW:' + e.message; } };
+    check('cibc: full month name parses', cibcDate('July 16, 2026') === '2026-07-16', cibcDate('July 16, 2026'));
+  }
+
   /* ---------- generic template: synthetic PDFs (hand-built, zero deps) ---------- */
   console.log('== generic template (synthetic PDFs)');
 
