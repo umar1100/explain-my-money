@@ -1327,6 +1327,7 @@
       { id: 'health_pharmacy', name: 'Health/Pharmacy', parentId: null },
       { id: 'subscriptions',  name: 'Subscriptions',   parentId: null },
       { id: 'shopping',       name: 'Shopping',        parentId: null },
+      { id: 'leisure',        name: 'Leisure',         parentId: null },
       { id: 'fees',           name: 'Fees',            parentId: null },
       { id: 'other',          name: 'Other',           parentId: null }
     ];
@@ -1365,9 +1366,11 @@
     { category: 'subscriptions', confidence: 0.92, keywords: ['NETFLIX', 'SPOTIFY', 'DISNEY+', 'AMAZON PRIME', 'PRIME VIDEO', 'YOUTUBE PREMIUM', 'APPLE.COM/BILL', 'GOOGLE ONE', 'DROPBOX', 'ICLOUD', 'MICROSOFT 365', 'ROGERS WIRELESS', 'ROGERS', 'BELL MOBILITY', 'TELUS', 'KOODO', 'FREEDOM MOBILE', 'FIDO', 'VIRGIN MOBILE', 'GOODLIFE FITNESS', 'GOODLIFE', 'FITNESS'] },
     { category: 'household', confidence: 0.88, keywords: ['HYDRO ONE', 'HYDRO', 'ENBRIDGE', 'ENERCARE', 'TORONTO WATER', 'CANADIAN TIRE', 'HOME DEPOT', 'RONA', 'LOWES', "LOWE'S", 'IKEA', 'DOLLARAMA', 'BED BATH', 'UTILITY', 'PROPERTY TAX'] },
     { category: 'shopping', confidence: 0.88, keywords: ['BEST BUY', 'SPORT CHEK', 'SPORTCHEK', 'WINNERS', 'HOMESENSE', 'MARKS WORK', 'AMAZON', 'COSTCO.CA'] },
+    { category: 'leisure', confidence: 0.92, keywords: ['ROYAL CARIBBEAN', 'CARNIVAL CRUISE', 'NORWEGIAN CRUISE', 'DISNEY CRUISE', 'CRUISE LINE', 'AIRBNB', 'BOOKING.COM', 'EXPEDIA', 'HOTELS.COM', 'MARRIOTT', 'HILTON', 'WESTIN', 'HOLIDAY INN', 'FAIRMONT', 'RESORT', 'VACATION', 'CINEPLEX', 'LANDMARK CINEMA', 'TICKETMASTER', 'LIVE NATION', 'CONCERT'] },
     // --- generic single-word keys (lower confidence, still >= 0.6) ---
     { category: 'transport', confidence: 0.90, keywords: ['SHELL', 'ESSO', 'PETRO', 'PIONEER', 'ULTRAMAR', 'HUSKY', 'PRESTO', 'TTC', 'PARKING', 'UBER', 'LYFT', 'AIR CANADA', 'PORTER AIRLINES', 'WESTJET', 'AVIS', 'BUDGET RENT', 'TAXI'] },
     { category: 'groceries', confidence: 0.80, keywords: ['COSTCO', 'METRO', 'GROCERY', 'FOODS', 'PRODUCE', 'BAKERY', 'BUTCHER', 'MEAT MARKET'] },
+    { category: 'leisure', confidence: 0.80, keywords: ['CRUISE', 'HOTEL', 'MOTEL', 'AIRBNB', 'CINEMA', 'THEATRE', 'THEATER', 'MOVIE', 'GOLF', 'SKI RESORT'] },
     { category: 'shopping', confidence: 0.80, keywords: ['WALMART', 'SEPHORA', 'OLD NAVY', 'ZARA', 'H&M'] },
     { category: 'fees', confidence: 0.90, keywords: ['ANNUAL FEE', 'LATE FEE', 'INTEREST CHARGE', 'INTEREST CHARGED', 'SERVICE CHARGE', 'BANK FEE', 'OVERDRAFT', 'CASH ADVANCE FEE', 'NSF FEE'] },
     { category: 'other', confidence: 0.70, keywords: ['LCBO', 'BEER STORE', 'CANADA POST', 'POST OFFICE', 'DONATION', 'CHARITY', 'GOVERNMENT', 'CITY OF'] }
@@ -1567,6 +1570,7 @@
     health_pharmacy: ['SHOPPERS DRUG', 'REXALL', 'DENTAL CARE', 'LIFE LABS'],
     subscriptions:   ['SPOTIFY', 'NETFLIX', 'DROPBOX', 'GITHUB'],
     shopping:        ['AMAZON', 'WALMART', 'BEST BUY', 'ZARA'],
+    leisure:         ['ROYAL CARIBBEAN', 'AIRBNB', 'CINEPLEX', 'MARRIOTT'],
     fees:            ['BANK FEE', 'SERVICE FEE', 'ANNUAL FEE', 'OVERDRAFT FEE'],
     other:           ['POST OFFICE', 'CITY TAXES', 'DONATION', 'LIBRARY']
   };

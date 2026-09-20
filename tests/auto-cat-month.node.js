@@ -138,6 +138,27 @@ async function main() {
   ok(sugOf('SQ *NIKITA FENG TORONTO ON') === null,
     'unknown small business stays blank (never guessed)');
 
+  // --- leisure category: cruises, stays, entertainment ---
+  const leisure = [
+    ['ROYAL CARIBBEAN CRUISE', 'leisure'],
+    ['CARNIVAL CRUISE LINE', 'leisure'],
+    ['AIRBNB TORONTO ON', 'leisure'],
+    ['BOOKING.COM AMSTERDAM', 'leisure'],
+    ['MARRIOTT HOTEL TORONTO', 'leisure'],
+    ['CINEPLEX ODEON', 'leisure'],
+    ['TICKETMASTER EVENTS', 'leisure'],
+    ['LIVE NATION CONCERTS', 'leisure'],
+    ['GOLF TOWN MARKHAM', 'leisure'],
+  ];
+  leisure.forEach(([desc, expected]) => {
+    const s = sugOf(desc);
+    ok(s && s.categoryId === expected && s.confidence >= 0.6,
+      'leisure "' + desc + '" -> ' + expected, s);
+  });
+  ok(sugOf('SPAGHETTI FACTORY') === null, 'SPAGHETTI FACTORY is not leisure (no SPA false-positive)');
+  ok(E.defaultCategories().some((c) => c.id === 'leisure' && c.name === 'Leisure'),
+    'leisure is a default category');
+
   // --- fee kind, payment/transfer, unknown merchant, non-spend kinds ---
   ok(sugOf('ANNUAL FEE').categoryId === 'fees', 'fee kind -> fees');
   ok(E.suggestCategory(txn('t', 's1', '2026-08-10', 5000, 'COSTCO', 'payment')) === null, 'payment -> null');
