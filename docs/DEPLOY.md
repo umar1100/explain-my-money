@@ -31,3 +31,27 @@ inside that folder, referenced with relative paths.
 The host serves **application code only**. Statements, receipts,
 transactions, rules, and briefings live in the device's own storage
 (IndexedDB) and are never transmitted anywhere. See `docs/PRIVACY.md`.
+
+## Option C — cPanel shared hosting (one-click updates)
+
+Used for `https://finance.raavtek.com` (Namecheap Stellar shared hosting,
+`server309.web-hosting.com`). The site is password-gated with cPanel
+**Directory Privacy** on the domain's document root
+(`/home/newekopu/finance.raavtek.com`).
+
+One-time setup in cPanel:
+
+1. Open **Git Version Control** → **Create**:
+   - Clone URL: `https://github.com/umar1100/explain-my-money.git`
+   - Repository Path: `/home/newekopu/emm-repo` (a working folder — **not**
+     the domain's document root)
+   - Repository Name: `explain-my-money`
+2. The repo's `.cpanel.yml` defines the deployment: it copies `apps/web/`
+   into the `finance.raavtek.com` document root.
+
+Updating later: **Git Version Control** → **Manage** the repo →
+**Pull or Deploy** → **Update from Remote**, then **Deploy**.
+
+Deploys only copy files over the top, so the Directory Privacy
+`.htaccess`/`.htpasswd` in the document root — and the password gate —
+survive every update untouched.
