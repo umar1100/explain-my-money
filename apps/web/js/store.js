@@ -3,8 +3,11 @@
  * ----------------------------------------------------------------------------
  * Global `Store`, async API. Primary backend: IndexedDB ('emmdb', v1).
  * Fallback: localStorage (prefix 'emm_') with an IDENTICAL async API when
- * IndexedDB is unavailable (e.g. private-browsing edge cases, non-browser
- * test harnesses).
+ * IndexedDB is genuinely unavailable (e.g. private-browsing edge cases,
+ * non-browser test harnesses). A BLOCKED open (another tab holds the DB)
+ * does NOT fall back — it rejects with an EMM_BLOCKED error, because
+ * forking to localStorage there would split the user's data across two
+ * backends and look like data loss.
  *
  * PRIVACY INVARIANTS:
  *  - Data NEVER leaves the device. There is no sync, no fetch, no beacon,
@@ -197,7 +200,15 @@
       };
       req.onsuccess = function () { resolve(req.result); };
       req.onerror = function () { reject(req.error || new Error('IndexedDB open failed')); };
-      req.onblocked = function () { reject(new Error('IndexedDB open blocked')); };
+      /* BLOCKED (another tab holds the DB open) is NOT a generic failure:
+       * falling back to localStorage here would fork the user's data across
+       * two backends and look like data loss. Reject with a marked error so
+       * Store.open() can surface a clear "close other tabs" message instead. */
+      req.onblocked = function () {
+        var err = new Error('IndexedDB open blocked: the database is already open in another tab. Close other Explain My Money tabs, then reload.');
+        err.code = 'EMM_BLOCKED';
+        reject(err);
+      };
     });
   }
 
@@ -233,7 +244,11 @@
   /**
    * Store.open() -> Promise<'idb'|'local'>.
    * Opens the on-device database, choosing IndexedDB first and falling back
-   * to localStorage. Safe to call multiple times (single-flight).
+   * to localStorage ONLY for genuine IndexedDB unavailability (no IDB API,
+   * open throws, or open errors). A BLOCKED open (another tab holds the DB)
+   * is rejected with an EMM_BLOCKED error: we must not silently fork to
+   * localStorage there, or the user's data would split across two backends
+   * and look deleted. Safe to call multiple times (single-flight).
    */
   Store.open = function () {
     if (openPromise) return openPromise;
@@ -243,8 +258,14 @@
           db = d;
           backend = 'idb';
           resolve(backend);
-        }, function () {
-          // IndexedDB failed (blocked, denied): try localStorage fallback.
+        }, function (err) {
+          // Blocked: another tab holds the database. Surface it — never fork.
+          if (err && err.code === 'EMM_BLOCKED') {
+            openPromise = null; // allow a retry after the user closes tabs
+            reject(err);
+            return;
+          }
+          // Genuine IndexedDB failure (denied, quota, etc.): localStorage fallback.
           if (lsAvailable()) { backend = 'local'; resolve(backend); }
           else { openPromise = null; reject(new Error('No on-device storage available (IndexedDB failed, localStorage unavailable)')); }
         });

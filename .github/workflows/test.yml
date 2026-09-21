@@ -25,6 +25,7 @@ jobs:
           node tests/e2e.node.js
           node tests/pdf-parse.node.js
           node tests/new-modules.node.js
+          node tests/statement-delete.node.js
       - name: Syntax-check app JS (no execution)
         run: |
           for f in apps/web/js/*.js; do node --check "$f"; done

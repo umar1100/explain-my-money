@@ -69,9 +69,10 @@ units everywhere (`parseFloat` never touches money), ES2019 only.
 | Accounts manager: inline rename (audited), per-account totals ("spent $X across N transactions"), 12-month statement coverage strip with missing-month legend | `app.js` `App.vAccounts`, `App.Changes['account-rename']`; `engine.js` `Engine.monthCovered` | v2.node.js (monthCovered, 13 checks); browser smoke (screen renders, totals, legend) |
 | Sample data: deterministic generator (seed 42, 3 months, ~25–35 txns/mo, clearly labeled, honest `unavailable` balance check) | `engine.js` `Engine.sampleData`, `Engine._mulberry32`; `app.js` `App.Actions['sample-add']`, `App.insertSampleData` | v2.node.js (sampleData 16 checks + mulberry32 3 checks); browser smoke (add button present) |
 | Remove sample data: two-tap confirm, deletes exactly the `v2-sample` batch | `app.js` `App.Actions['sample-remove']` | v2.node.js (tagging); UI flow **not yet** automated |
-| Privacy & data: what's stored where, audit-trail viewer | `app.js` `App.vPrivacy` | browser smoke ("privacy: screen renders") |
+| Privacy & data: what's stored where (reflects actual backend), "Where your data lives" card (storage backend, record counts, plain-language note that a different browser/private tab/app = expected empty app), audit-trail viewer | `app.js` `App.vPrivacy`; `store.js` `Store.backend()` | browser smoke ("privacy: screen renders") |
 | Export: ledger JSON + transactions CSV (offline Blob download) | `app.js` `App.Actions['export-json'/'export-csv']` | e2e.node.js (export data shape); download mechanics **not yet** automated |
 | Delete everything (typed `DELETE` confirm, full IndexedDB wipe) | `app.js` `App.Actions['wipe-go']` | e2e.node.js (store empty after wipe) |
+| Delete one statement (Activity → statement → "Statement options", two-tap confirm; removes statement + its txns + their matches/refund links/allocations, keeps receipts + other statements, audit-logged) | `app.js` `App.deleteStatement`, `App.Actions['statement-delete']` | statement-delete.node.js (14 checks) |
 | Replay tour | `app.js` `App.Actions['onboard-replay']` | browser smoke (button present) |
 
 ## Onboarding

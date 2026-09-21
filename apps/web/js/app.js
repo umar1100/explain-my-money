@@ -402,8 +402,14 @@ App.boot = async function () {
   }
   try { await Store.open(); }
   catch (e) {
-    $('#view').innerHTML = '<div class="banner bad"><strong>Storage failed to open:</strong> ' +
-      esc(e && e.message || e) + '<br>Try serving over http (see web/README.md).</div>';
+    var blocked = e && e.code === 'EMM_BLOCKED';
+    $('#view').innerHTML = '<div class="banner bad">' +
+      (blocked
+        ? '<strong>Your money data is open in another tab.</strong><br>' +
+          'Please close other Explain My Money tabs, then reload this page.'
+        : '<strong>Storage failed to open:</strong> ' +
+          esc(e && e.message || e) + '<br>Try serving over http (see web/README.md).') +
+      '</div>';
     return;
   }
   await App.seedCategories();
@@ -2336,6 +2342,12 @@ App.vStatement = async function (v, seq) {
     html += '</div><div id="txn-list">' + App.txnListHtml(txns, App.state.sfilter, counts, App.state.txnShown || App.TXN_PAGE_SIZE) + '</div>';
   }
   App._stmtCounts = counts; // for in-place "Show more" re-renders
+  // Statement options: destructive actions live one tap down so the busy
+  // transaction list stays clean. Tap-twice-to-confirm, like rule/budget/goal delete.
+  html += '<details class="more"><summary>Statement options</summary>' +
+    '<p class="small">Remove this statement and all ' + txns.length + ' of its transactions from this device. ' +
+    'Receipts and other statements are kept. This cannot be undone.</p>' +
+    '<button class="btn danger" data-action="statement-delete" data-id="' + esc(st.id) + '">Delete statement</button></details>';
   App.show(v, seq, html);
 };
 
@@ -2355,6 +2367,61 @@ App.Changes['statement-select'] = function (el) {
   App.go('statement', { statementId: el.value, txnId: null });
 };
 App.Actions.sfilter = function (d) { App.state.sfilter = d.f; App.state.txnId = null; App.state.txnShown = App.TXN_PAGE_SIZE; App.render(); };
+
+/**
+ * App.deleteStatement(statementId) -> Promise<{statementId, txnCount, matchCount}|null>.
+ * Node-testable core of per-statement deletion: removes the statement record,
+ * every txn carrying its statementId, and every row that references those
+ * txns (matches, refund links, allocations). Writes a 'statement.deleted'
+ * audit entry. Other statements are untouched. Returns null when the
+ * statement does not exist.
+ */
+App.deleteStatement = async function (statementId) {
+  var st = await sGet('statements', statementId);
+  if (!st) return null;
+  var txns = await sQuery('txns', 'statementId', st.id);
+  var gone = {};
+  for (var i = 0; i < txns.length; i++) gone[String(txns[i].id)] = 1;
+
+  var nMatches = 0, nLinks = 0, nAllocs = 0;
+  var matches = await sAll('matches');
+  for (var m = 0; m < matches.length; m++) {
+    if (gone[String(matches[m].txnId)]) { await Store.delete('matches', matches[m].id); nMatches++; }
+  }
+  var links = await sAll('refundLinks');
+  for (var l = 0; l < links.length; l++) {
+    if (gone[String(links[l].purchaseTxnId)] || gone[String(links[l].refundTxnId)]) {
+      await Store.delete('refundLinks', links[l].id); nLinks++;
+    }
+  }
+  var allocs = await sAll('allocations');
+  for (var a = 0; a < allocs.length; a++) {
+    if (gone[String(allocs[a].txnId)]) { await Store.delete('allocations', allocs[a].id); nAllocs++; }
+  }
+  for (var t = 0; t < txns.length; t++) { await Store.delete('txns', txns[t].id); }
+
+  await Store.delete('statements', st.id);
+  audit('statement.deleted', 'statement', st.id, {
+    txnCount: txns.length, matchCount: nMatches, refundLinkCount: nLinks,
+    allocationCount: nAllocs, periodLabel: st.periodLabel || st.scopeLabel || null
+  });
+  App.bumpDataRev();
+  return { statementId: st.id, txnCount: txns.length, matchCount: nMatches };
+};
+
+/** Delete-statement button: same tap-twice-to-confirm pattern as rule/budget/goal delete. */
+App.Actions['statement-delete'] = async function (d, el) {
+  if (!el.dataset.armed) {
+    el.dataset.armed = '1';
+    el.textContent = 'Tap again to delete';
+    setTimeout(function () { if (el.isConnected) { delete el.dataset.armed; el.textContent = 'Delete statement'; } }, 3000);
+    return;
+  }
+  await App.deleteStatement(d.id);
+  App.state.statementId = null;
+  App.state.txnId = null;
+  App.go('activity');
+};
 
 /** Duplicate candidate pairs for the current statement (indexes into App._stmtTxns).
  * Memoized: Engine.findDuplicateCandidates is O(n²), so we cache per
@@ -4232,12 +4299,27 @@ App.vPrivacy = async function (v, seq) {
     'Your financial data makes zero network calls — the only exception is optional AI phrasing ' +
     '(off by default), which contacts only the provider you configure, only after you preview and approve each payload.</div>';
 
+  var backend = Store.backend();
+  var backendLabel = backend === 'idb' ? 'IndexedDB' : backend === 'local' ? 'localStorage' : 'unavailable';
   html += '<div class="card"><h3 style="margin-top:0">What’s stored, where</h3>' +
     '<table class="kv">' +
-    '<tr><th>Ledger &amp; rules</th><td>IndexedDB on this device — statements, transactions, merchants, categories, household rules, corrections, matches, allocations, refund links, briefings, audit events</td></tr>' +
-    '<tr><th>Receipt photos</th><td>IndexedDB, as image blobs — never uploaded</td></tr>' +
-    '<tr><th>Cookies / localStorage</th><td>Not used for your data</td></tr>' +
+    '<tr><th>Ledger &amp; rules</th><td>' + esc(backendLabel) + ' on this device — statements, transactions, merchants, categories, household rules, corrections, matches, allocations, refund links, briefings, audit events</td></tr>' +
+    '<tr><th>Receipt photos</th><td>' + esc(backendLabel) + ', as image blobs — never uploaded</td></tr>' +
+    '<tr><th>Cookies / localStorage</th><td>' + (backend === 'local' ? 'In use as the fallback store on this browser (IndexedDB unavailable here)' : 'Not used for your data') + '</td></tr>' +
     '<tr><th>Network</th><td>Zero requests for your financial data (verify in devtools). Optional AI phrasing is the only network use, and only with your per-call approval.</td></tr></table></div>';
+
+  var nStmt = (await sAll('statements')).length;
+  var nTxn = (await sAll('txns')).length;
+  var nRcpt = (await sAll('receipts')).length;
+  html += '<div class="card"><h3 style="margin-top:0">Where your data lives</h3>' +
+    '<table class="kv">' +
+    '<tr><th>Storage in use</th><td>' + esc(backendLabel) + ' — on this device only</td></tr>' +
+    '<tr><th>Statements</th><td>' + nStmt + '</td></tr>' +
+    '<tr><th>Transactions</th><td>' + nTxn + '</td></tr>' +
+    '<tr><th>Receipts</th><td>' + nRcpt + '</td></tr></table>' +
+    '<p class="small">Your data lives only in this browser, on this device. ' +
+    'Opening the link in a different browser, a private tab, or another app will show an empty app — ' +
+    'that is expected, your data is still here.</p></div>';
 
   html += '<div class="card"><h3 style="margin-top:0">Export</h3>' +
     '<p class="small">Take your data with you — still without any network involved.</p>' +
@@ -4724,6 +4806,7 @@ App.Actions['sub-dismiss'] = async function (d) {
 
 /* Test hooks: pure helpers exposed for node smoke tests (no DOM needed). */
 App._test = {
+  deleteStatement: App.deleteStatement,
   sha256Hex: sha256Hex, esc: esc, money: money, spendAbs: spendAbs, fmtDate: fmtDate, fmtPeriod: fmtPeriod,
   prettify: prettify, kindLabel: kindLabel, merchantCore: merchantCore, receiptForScore: receiptForScore,
   parseManualAmount: parseManualAmount, spendOf: spendOf, txnTab: txnTab, dollarsText: dollarsText,
