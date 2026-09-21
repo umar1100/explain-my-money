@@ -277,11 +277,15 @@ async function main() {
   ok(noPrev && noPrev.deltas.length === 0, 'no previous month -> no deltas, no crash');
 
   // --- reviewTxns: deduplicated review rows (Problem B "Needs your review") ---
+  // The review sign fires on genuinely uncertain rows only: the
+  // 'needs_review' confidence band alone is NOT a trigger (the engine stamps
+  // it on every default-classified purchase), so a categorized purchase is
+  // resolved even when its kind band reads 'needs_review'.
   const rq1 = txn('q1', 's1', '2026-08-10', 5000, 'MISC', 'purchase'); rq1.confidence = 'needs_review'; // uncategorized + needs_review: ONE row, not two
-  const rq2 = txn('q2', 's1', '2026-08-11', 5000, 'LOBLAWS', 'purchase'); rq2.confidence = 'needs_review'; rq2.category = 'groceries'; // categorized + needs_review
+  const rq2 = txn('q2', 's1', '2026-08-11', 5000, 'LOBLAWS', 'purchase'); rq2.confidence = 'needs_review'; rq2.category = 'groceries'; // categorized + needs_review: resolved, not a review row
   const rq3 = txn('q3', 's1', '2026-08-12', 5000, 'X', 'uncertain'); // uncertain kind
   const rq4 = txn('q4', 's1', '2026-08-13', 5000, 'X', 'payment'); rq4.confidence = 'likely'; // confident payment: not a review row
-  ok(T.reviewTxns([rq1, rq2, rq3, rq4]).length === 3, 'reviewTxns dedupes the uncategorized+needs_review row', T.reviewTxns([rq1, rq2, rq3, rq4]).map((t) => t.id));
+  ok(T.reviewTxns([rq1, rq2, rq3, rq4]).length === 2, 'reviewTxns keeps only genuine review rows (q1, q3)', T.reviewTxns([rq1, rq2, rq3, rq4]).map((t) => t.id));
   ok(T.reviewTxns([rq4]).length === 0, 'confident payment is not a review row');
   ok(T.reviewTxns([]).length === 0, 'reviewTxns handles empty list');
 
@@ -294,7 +298,7 @@ async function main() {
   const miscHits = (reviewHtml.match(/MISC/g) || []).length;
   ok(miscHits === 1, 'uncategorized row listed exactly once (not duplicated across sections)', miscHits);
   const loblawsHits = (reviewHtml.match(/LOBLAWS/g) || []).length;
-  ok(loblawsHits === 1, 'categorized uncertain row still listed once', loblawsHits);
+  ok(loblawsHits === 0, 'categorized purchase with needs_review band is NOT in review', loblawsHits);
   const emptyHtml = App.txnListHtml([rq4], 'review', {}, 100);
   ok(emptyHtml.indexOf('Nothing needs review') !== -1, 'empty review queue renders the all-clear');
 

@@ -668,6 +668,31 @@
    * (end - start) - signedSum; any non-zero gap beyond tolerance is
    * REPORTED, never hidden.
    */
+  /* Review-sign predicate. The engine stamps confidence 'needs_review' on
+   * every default-classified purchase (kindConfidence 0.6), so the band
+   * alone cannot be the trigger — it would flag every transaction. A row
+   * needs a human look when the kind is unknown, the read failed, the PDF
+   * read itself was uncertain (kindConfidence below 0.6), or a spend row
+   * still has no category (never-guess: unknown spend is flagged, never
+   * silently trusted). A default-classified purchase that already has a
+   * category is resolved. Single source of truth: App.needsReview in app.js
+   * is the same predicate for the UI. */
+  function rowNeedsReview(r) {
+    r = r || {};
+    if (r.kind === 'uncertain') return true;
+    if (r._error) return true;
+    if (typeof r.kindConfidence === 'number' && r.kindConfidence < 0.6) return true;
+    var k = r.kind || 'uncertain';
+    if (k !== 'purchase' && k !== 'refund') return false;
+    var cat = (r.category !== null && r.category !== undefined && r.category !== '')
+      ? r.category : (r.categoryId || null);
+    if (cat) return false;
+    if (r.excluded) return false;
+    if (r.status === 'duplicate') return false;
+    return true;
+  }
+  Engine.rowNeedsReview = rowNeedsReview;
+
   Engine.reconcile = function (rows, reported) {
     var gross = 0, refundSigned = 0, excludedTotal = 0;
     var unresolved = 0;
@@ -679,7 +704,7 @@
       if (r.kind === 'purchase') gross += amt;
       else if (r.kind === 'refund') { refundSigned += amt; refundCount++; }
       if (r.excluded === 1) excludedTotal += amt;
-      if (r.kind === 'uncertain' || r._error || r.confidence === 'needs_review') unresolved++;
+      if (rowNeedsReview(r)) unresolved++;
       var samt = r.signedAmountMinor;
       if (samt === null || samt === undefined) signedKnown = false;
       else signedSum += samt;

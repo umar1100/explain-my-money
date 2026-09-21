@@ -298,6 +298,7 @@ function nt(t) {
     splits: t.splits || null, // per-category split shares [{category, amountMinor}] or null
     receiptId: t.receiptId || null,
     error: t._error ? (t._errorReasons || []).join('; ') : null,
+    _error: !!t._error, // preserved: App.needsReview routes error rows to review
     _raw: t
   };
 }
@@ -1713,7 +1714,7 @@ App.stageReconcile = async function (pipe) {
       if (t.kind === 'purchase') g += amt;
       else if (t.kind === 'refund') { rfSigned += amt; rfCount++; }
       if (t.excluded === 1) ex += amt;
-      if ((t.kind || 'uncertain') === 'uncertain' || t.confidence === 'needs_review') un++;
+      if (App.needsReview(t)) un++;
       if (t.signedAmountMinor === null || t.signedAmountMinor === undefined) sKnown = false;
       else sSum += t.signedAmountMinor;
     });
@@ -2218,7 +2219,7 @@ function txnTab(t) {
   t = nt(t);
   if (t.excluded) return 'excluded';
   if (t.status === 'duplicate' || t.kind === 'duplicate-candidate') return 'duplicates';
-  if (t.kind === 'uncertain' || t.confidence === 'needs_review') return 'uncertain';
+  if (App.needsReview(t)) return 'uncertain';
   if (t.kind === 'refund') return 'refunds';
   if (t.kind === 'payment' || t.kind === 'transfer' || t.kind === 'fee') return 'payments';
   return 'purchases';
@@ -2245,13 +2246,28 @@ function needsCategory(t) {
   return true;
 }
 
-/** Review-queue rows for a txn list: uncertain kinds, needs_review row
- * confidence, row errors, and uncategorized spend — deduplicated, so an
- * uncategorized purchase with needs_review confidence counts once. */
+/** One shared rule for the review sign. The engine stamps confidence
+ * 'needs_review' on every default-classified purchase (kindConfidence 0.6),
+ * so the confidence band alone cannot be the trigger — it would flag every
+ * transaction. A row needs a human look when the kind is unknown, the read
+ * failed, the PDF read itself was uncertain (kindConfidence below 0.6), or
+ * a spend row still has no category (the never-guess rule: unknown spend is
+ * flagged, never silently trusted). A default-classified purchase that has
+ * a category is resolved and shows no review sign. */
+App.needsReview = function (t) {
+  t = t || {};
+  if (t.kind === 'uncertain') return true;
+  if (t._error) return true;
+  if (typeof t.kindConfidence === 'number' && t.kindConfidence < 0.6) return true;
+  return needsCategory(t);
+};
+
+/** Review-queue rows for a txn list: App.needsReview rows — deduplicated,
+ * so an uncategorized uncertain purchase counts once. */
 App.reviewTxns = function (txns) {
   var seen = {}, out = [];
   (txns || []).forEach(function (t) {
-    if (t.kind === 'uncertain' || t.confidence === 'needs_review' || t._error || needsCategory(t)) {
+    if (App.needsReview(t)) {
       var k = String(t.id);
       if (!seen[k]) { seen[k] = 1; out.push(t); }
     }
@@ -2499,7 +2515,7 @@ App.txnRowHtml = function (t) {
   var cls = amt > 0 ? 't-amt pos' : 't-amt';
   var pills = '';
   if (t.status === 'duplicate') pills += ' <span class="pill bad">duplicate</span>';
-  else if (t.kind === 'uncertain' || t.confidence === 'needs_review') pills += ' <span class="pill warn">review</span>';
+  else if (App.needsReview(t)) pills += ' <span class="pill warn">review</span>';
   if (needsCategory(t)) pills += ' <span class="pill warn">no category</span>';
   if (t.excluded && t.status !== 'duplicate') pills += ' <span class="pill dim">excluded</span>';
   if (t.splits && t.splits.length) pills += ' <span class="pill dim">split</span>';
@@ -2597,7 +2613,17 @@ App.vTxnDetail = async function (v, seq) {
   html += '<h1 style="font-size:20px">' + esc(t.desc || '(no description)') + '</h1>';
   html += '<div class="headline-num">' + money(t.amountMinor) + '</div>';
   html += '<div><span class="pill">' + esc(kindLabel(t.kind)) + '</span> ' +
-    (t.confidence ? '<span class="pill ' + (t.confidence === 'needs_review' ? 'warn' : 'dim') + '">' + esc(String(t.confidence).replace(/_/g, ' ')) + '</span> ' : '') +
+    (function () {
+      // The engine's 'needs_review' band fires on every default-classified
+      // purchase (kindConfidence 0.6), so label from kindConfidence instead:
+      // only genuinely uncertain rows get the warn treatment.
+      var kc = (typeof t.kindConfidence === 'number') ? t.kindConfidence : null;
+      var uncertainRow = (t.kind === 'uncertain') || !!t._error || (kc !== null && kc < 0.6);
+      var label = kc === null
+        ? (t.confidence ? String(t.confidence).replace(/_/g, ' ') : '')
+        : kc >= 0.95 ? 'confirmed' : kc >= 0.80 ? 'likely' : kc >= 0.6 ? 'assumed' : 'needs review';
+      return label ? '<span class="pill ' + (uncertainRow ? 'warn' : 'dim') + '">' + esc(label) + '</span> ' : '';
+    })() +
     (t.excluded ? '<span class="pill dim">excluded</span> ' : '') +
     (t.status === 'duplicate' ? '<span class="pill bad">duplicate</span>' : '') + '</div>';
 
@@ -2658,7 +2684,11 @@ App.vTxnDetail = async function (v, seq) {
 
   // Corrections.
   html += '<div class="card"><h3 style="margin-top:0">Correct this transaction</h3>';
-  if (t.kind === 'uncertain' || t.confidence === 'needs_review') {
+  // Confirm-kind is offered when the kind itself is uncertain (unknown kind,
+  // read error, or low kind confidence) — not for every default-classified
+  // purchase. Category fixes are handled by the category selector below.
+  var kc2 = (typeof t.kindConfidence === 'number') ? t.kindConfidence : null;
+  if (t.kind === 'uncertain' || t._error || (kc2 !== null && kc2 < 0.6)) {
     html += '<button class="btn" data-action="confirm-kind" data-id="' + esc(t.id) + '">Confirm: it really is ' + esc(kindLabel(t.kind)) + '</button>';
   }
   var kinds = (Engine.KINDS && Engine.KINDS.slice()) || ['purchase', 'refund', 'payment', 'transfer', 'fee', 'cash_advance', 'uncertain'];
@@ -4875,7 +4905,7 @@ App._test = {
   matchQuestion: App.matchQuestion, shortHash: shortHash,
   _paginate: App._paginate, _dupCacheKey: App._dupCacheKey, TXN_PAGE_SIZE: App.TXN_PAGE_SIZE,
   /* Auto-categorization (Problem A) + Month aggregation (Problem B). */
-  needsCategory: needsCategory, reviewTxns: App.reviewTxns, monthsWithData: App.monthsWithData,
+  needsCategory: needsCategory, needsReview: App.needsReview, reviewTxns: App.reviewTxns, monthsWithData: App.monthsWithData,
   latestTxnMonth: App.latestTxnMonth, txnsInMonth: App.txnsInMonth,
   statementCoverage: App.statementCoverage,
   /* PDF job controller (node-testable via the fakes in tests/pdf-resume.node.js). */
