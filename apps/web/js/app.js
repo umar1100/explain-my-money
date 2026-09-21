@@ -1840,6 +1840,8 @@ App.commitPipeline = async function (pipe) {
   }
 
   // Refund links (suggested): same merchant, matching amount, purchase before refund.
+  // One suggested original per refund; the most recent eligible purchase wins
+  // (consistent with the cross-statement rule below).
   var refunds = [], purchases = [];
   pipe.txns.forEach(function (t, i) {
     if (t.kind === 'refund') refunds.push(i);
@@ -1848,16 +1850,22 @@ App.commitPipeline = async function (pipe) {
   function merchKey(s) { return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, ''); }
   for (var r = 0; r < refunds.length; r++) {
     var rt = pipe.txns[refunds[r]];
+    var rk = merchKey(rt.merchantRaw || rt.rawDescription);
+    var ra = Math.abs(rt.amountMinor || 0);
+    var bestQ = -1;
     for (var q = 0; q < purchases.length; q++) {
       var pt = pipe.txns[purchases[q]];
-      if (merchKey(rt.merchantRaw || rt.rawDescription) !== merchKey(pt.merchantRaw || pt.rawDescription)) continue;
-      if (Math.abs(Math.abs(rt.amountMinor || 0) - Math.abs(pt.amountMinor || 0)) > 1) continue;
+      if (merchKey(pt.merchantRaw || pt.rawDescription) !== rk) continue;
+      if (Math.abs(Math.abs(pt.amountMinor || 0) - ra) > 1) continue;
       if (rt.date && pt.date && rt.date < pt.date) continue;
+      if (bestQ === -1 ||
+          String(pt.date || '') > String(pipe.txns[purchases[bestQ]].date || '')) bestQ = q;
+    }
+    if (bestQ !== -1) {
       await Store.put('refundLinks', {
-        statementId: statementId, refundTxnId: rowToId[refunds[r]], purchaseTxnId: rowToId[purchases[q]],
+        statementId: statementId, refundTxnId: rowToId[refunds[r]], purchaseTxnId: rowToId[purchases[bestQ]],
         basis: 'same merchant + matching amount', status: 'suggested', createdAt: now
       });
-      break; // one suggested original per refund
     }
   }
   // Cross-statement: a refund with no in-statement match may return a purchase
@@ -1892,6 +1900,37 @@ App.commitPipeline = async function (pipe) {
       });
     }
     if (r2 % 20 === 0) await tick();
+  }
+  // Reverse cross-statement: this import can also be the missing PURCHASE
+  // side for refunds imported earlier (refund statement imported before the
+  // purchase statement). Link still-unlinked prior refunds to the most
+  // recent eligible purchase in THIS statement. Without this, import order
+  // alone decided whether return attribution worked.
+  var priorRefunds = (await sAll('txns')).filter(function (t) {
+    return t && t.kind === 'refund' && !t.excluded &&
+      String(t.statementId) !== String(statementId) &&
+      !alreadyLinked[String(t.id)];
+  });
+  for (var r3 = 0; r3 < priorRefunds.length; r3++) {
+    var pr = priorRefunds[r3];
+    var prk = merchKey(pr.merchantRaw || pr.rawDescription);
+    var pra = Math.abs(pr.amountMinor || 0);
+    var best3 = null, best3Row = -1;
+    for (var q3 = 0; q3 < purchases.length; q3++) {
+      var pt3 = pipe.txns[purchases[q3]];
+      if (merchKey(pt3.merchantRaw || pt3.rawDescription) !== prk) continue;
+      if (Math.abs(Math.abs(pt3.amountMinor || 0) - pra) > 1) continue;
+      if (pr.date && pt3.date && pr.date < pt3.date) continue;
+      if (!best3 || String(pt3.date || '') > String(best3.date || '')) { best3 = pt3; best3Row = purchases[q3]; }
+    }
+    if (best3) {
+      await Store.put('refundLinks', {
+        statementId: pr.statementId, refundTxnId: pr.id, purchaseTxnId: rowToId[best3Row],
+        basis: 'same merchant + matching amount (purchase imported later)', status: 'suggested', createdAt: now
+      });
+      alreadyLinked[String(pr.id)] = 1;
+    }
+    if (r3 % 20 === 0) await tick();
   }
 
   // Briefing (V9: factsJson per schema; facts/text kept for direct use).
@@ -3336,6 +3375,10 @@ App.monthContext = async function () {
       recon.returnOutMinor = retAdj.deltaMinor - retAdj.movedMinor; // >= 0: refunds moved OUT
     }
   } catch (e) { /* keep the unadjusted headline */ }
+  // Cross-month refund moves, computed once: the per-account breakdown below
+  // applies the same attribution as the headline (single source of truth).
+  var retMoves = [];
+  try { retMoves = Engine.refundMoves(txns, await sAll('refundLinks')) || []; } catch (e) { retMoves = []; }
 
   // Contributors: statements with transactions dated in this month.
   var byStmt = {};
@@ -3369,7 +3412,21 @@ App.monthContext = async function () {
     var lf = latestFactsByStmt[c.id];
     c.checkState = (hasBaseline && lf && lf.facts && lf.facts.balanceCheck) ? String(lf.facts.balanceCheck) : 'unavailable';
     c.coverage = App.statementCoverage(st, month);
-    try { c.netMinor = Engine.reconcile(c.txns, null).netSpendMinor; } catch (e) { c.netMinor = 0; }
+    var base = 0;
+    try { base = Engine.reconcile(c.txns, null).netSpendMinor; } catch (e) { base = 0; }
+    // Same return attribution as the headline, scoped to this account's
+    // rows: a refund received this month for an earlier purchase moves out
+    // (net rises); a later refund for this month's purchase moves in (net
+    // falls). The breakdown then agrees with the hero number above.
+    var ids = {};
+    c.txns.forEach(function (t) { if (t && t.id !== null && t.id !== undefined) ids[String(t.id)] = 1; });
+    var delta = 0;
+    for (var mi = 0; mi < retMoves.length; mi++) {
+      var mv = retMoves[mi];
+      if (mv.fromMonth === month && mv.refund && ids[String(mv.refund.id)]) delta -= (mv.amountMinor || 0);
+      else if (mv.toMonth === month && mv.purchase && ids[String(mv.purchase.id)]) delta += (mv.amountMinor || 0);
+    }
+    c.netMinor = base + delta;
   });
 
   var idx = months.indexOf(month);
@@ -3424,21 +3481,30 @@ App.monthNavHtml = function (ctx) {
     '</div><p class="small" style="margin-bottom:0">' + ctx.covNote + ' \u00b7 ' + ctx.mTxns.length + ' transactions</p></div>';
 };
 
-/** Headline card: net spend after refunds + the Engine's first line. */
+/** Hero card: net spend after refunds for the month, with the gross/refund
+ *  build-up and any return-attribution notes, plus the Engine's first line.
+ *  The numbers here already include cross-month return attribution; the
+ *  per-account breakdown below applies the same rule, so the two agree. */
 App.headlineHtml = function (ctx) {
+  var r = ctx.recon || {};
   var retNote = '';
-  if (ctx.recon.returnAdjMinor) {
-    retNote += '<p class="tiny" style="margin-bottom:0">Includes ' + spendAbs(ctx.recon.returnAdjMinor) +
+  if (r.returnAdjMinor) {
+    retNote += '<p class="tiny" style="margin-bottom:0">Includes ' + spendAbs(r.returnAdjMinor) +
       ' in returns attributed to the month of the original purchase.</p>';
   }
-  if (ctx.recon.returnOutMinor) {
-    retNote += '<p class="tiny" style="margin-bottom:0">Excludes ' + spendAbs(ctx.recon.returnOutMinor) +
+  if (r.returnOutMinor) {
+    retNote += '<p class="tiny" style="margin-bottom:0">Excludes ' + spendAbs(r.returnOutMinor) +
       ' in refunds matched to earlier purchases (counted in those months).</p>';
   }
-  return '<div class="card"><div class="headline-label">Net spend after refunds</div>' +
-    '<div class="headline-num">' + spendAbs(ctx.recon.netSpendMinor) + '</div>' +
-    '<p class="small" style="margin-bottom:0">' + esc(ctx.headline || ('Across ' + ctx.mTxns.length + ' transactions in ' + fmtPeriod(ctx.month) + ', all accounts.')) + '</p>' +
-    retNote + '</div>';
+  var buildup = '<span>' + spendAbs(r.grossPurchasesMinor) + ' purchases</span>';
+  if ((r.refundCount || 0) > 0) {
+    buildup += ' <span aria-hidden="true">&minus;</span> <span>' + spendAbs(r.refundsTotalMinor) + ' refunds</span>';
+  }
+  return '<div class="card hero"><div class="headline-label">Net spend &middot; ' + esc(fmtPeriod(ctx.month)) + '</div>' +
+    '<div class="headline-num">' + spendAbs(r.netSpendMinor) + '</div>' +
+    '<div class="hero-sub">' + buildup + '</div>' +
+    retNote +
+    '<p class="small" style="margin-bottom:0">' + esc(ctx.headline || ('Across ' + ctx.mTxns.length + ' transactions in ' + fmtPeriod(ctx.month) + ', all accounts.')) + '</p></div>';
 };
 
 /** Review nudge: one card when something needs a human look, else a quiet
@@ -3450,6 +3516,36 @@ App.homeReviewHtml = function (ctx) {
     (ctx.noCatMonth ? ', including <strong>' + ctx.noCatMonth + '</strong> under \u201cNeeds a category\u201d' : '') + '.</p>' +
     '<button class="btn" data-action="goto" data-tab="activity" data-filter="review"' +
     (ctx.contributors.length ? ' data-sid="' + esc(ctx.contributors[0].id) + '"' : '') + '>Review now</button></div>';
+};
+
+/** "Where it went": top spend categories for the month as tappable bars.
+ *  Same Engine top-drivers the old Month tab showed, promoted to Home so the
+ *  breakdown is visible without digging. Tap a category to open one of its
+ *  transactions. Refunds are already netted into the category totals. */
+App.homeCategoriesHtml = function (ctx) {
+  var head = '<div class="section-head"><h2>Where it went</h2>' +
+    '<button class="linklike" data-action="wrong" data-filter="purchases">This explanation is wrong</button></div>';
+  var drivers = (ctx.drivers || []).slice(0, 5);
+  if (!drivers.length) {
+    return head + '<div class="card"><p class="small" style="margin:0">No categorized spend in ' +
+      esc(fmtPeriod(ctx.month)) + ' yet.</p></div>';
+  }
+  var max = 0, i;
+  for (i = 0; i < drivers.length; i++) max = Math.max(max, Math.abs(drivers[i].totalMinor || 0));
+  var html = head + '<div class="card">';
+  for (i = 0; i < drivers.length; i++) {
+    var d = drivers[i];
+    var link = App.driverTxnId(ctx.mTxns, d.category);
+    var pct = max ? Math.round(100 * Math.abs(d.totalMinor || 0) / max) : 0;
+    html += '<button class="driver" data-action="open-txn" data-id="' + esc(link || '') + '"' + (link ? '' : ' disabled') + '>' +
+      '<span class="d-main"><span class="d-name">' + esc(catLabelSmart(d.category || '')) + '</span><br>' +
+      '<span class="d-sub">' + (d.txnCount || 0) + ' transaction' + ((d.txnCount || 0) === 1 ? '' : 's') + '</span>' +
+      '<span class="b-track" style="display:block;margin-top:6px"><span class="b-fill" style="width:' + pct + '%"></span></span></span>' +
+      '<span class="d-amt">' + spendAbs(d.totalMinor) + '</span></button>';
+  }
+  html += '<p class="tiny" style="margin-bottom:0">Top categories for ' + esc(fmtPeriod(ctx.month)) +
+    ', after refunds. Tap one to see a transaction.</p></div>';
+  return html;
 };
 
 /** One-line Ask box with the answer below; the six priority questions live
@@ -3502,18 +3598,8 @@ App.monthDetailsHtml = async function (ctx) {
       : 'No ' + esc(fmtPeriod(prev)) + ' data to compare against yet.') + '</p></div>';
   }
 
-  // Where it went: Engine top drivers, each linking to its first transaction.
-  html += '<div class="section-head"><h2>Where it went</h2>' +
-    '<button class="linklike" data-action="wrong" data-filter="purchases">This explanation is wrong</button></div>';
-  if (ctx.drivers.length) {
-    ctx.drivers.slice(0, 5).forEach(function (d) {
-      var link = App.driverTxnId(ctx.mTxns, d.category);
-      html += '<button class="driver" data-action="open-txn" data-id="' + esc(link || '') + '"' + (link ? '' : ' disabled') + '>' +
-        '<span class="d-main"><span class="d-name">' + esc(catLabelSmart(d.category || '')) + '</span><br>' +
-        '<span class="d-sub">' + (d.txnCount || 0) + ' transaction' + ((d.txnCount || 0) === 1 ? '' : 's') + '</span></span>' +
-        '<span class="d-amt">' + spendAbs(d.totalMinor) + '</span></button>';
-    });
-  } else html += '<p class="small">No spend drivers this month.</p>';
+  // "Where it went" now lives on Home itself (App.homeCategoriesHtml); the
+  // details keep the remaining deep-dives.
 
   // Refunds & money movement, month-scoped.
   html += '<div class="section-head"><h2>Refunds &amp; money movement</h2>' +
@@ -3543,7 +3629,7 @@ App.monthDetailsHtml = async function (ctx) {
       '<span class="d-amt">' + spendAbs(c.netMinor) + '</span></button>';
   });
   html += '<p class="tiny" style="margin-bottom:0">Net spend per account for ' + esc(fmtPeriod(month)) +
-    ', magnitudes. Tap an account to drill into its statement.</p></div>';
+    ', magnitudes, after return attribution. Tap an account to drill into its statement.</p></div>';
 
   // Evidence quality. The aggregate balance check is meaningless (balances
   // never sum across accounts) — per-statement states are above.
@@ -3555,8 +3641,7 @@ App.monthDetailsHtml = async function (ctx) {
     '<tr><th>Balance check</th><td>n/a (per-account above)</td></tr>' +
     '</table></div>';
 
-  // Trends, biggest movers — month-scoped.
-  html += await App.trendsHtml(month);
+  // Trends now live on Home itself (above); biggest movers stay here.
   html += await App.moversHtml(month);
 
   // Full deterministic briefing text (month-scoped facts).
@@ -3584,6 +3669,8 @@ App.vHome = async function (v, seq) {
   }
   var html = '<h1>Home</h1>' + App.monthNavHtml(ctx) + App.headlineHtml(ctx);
   html += App.homeReviewHtml(ctx);
+  html += App.homeCategoriesHtml(ctx);
+  html += await App.trendsHtml(ctx.month);
   html += await App.homeAskHtml();
   html += await App.homePlanHtml(ctx);
   html += '<details class="more"><summary>Month details</summary>' +

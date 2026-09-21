@@ -37,6 +37,33 @@ E.autoCategorize(rows1, []);
 ok(rows1[0].category === 'groceries' && rows1[0].categorySource === 'auto',
    'autoCategorize stamps NOFR row as groceries', { category: rows1[0].category, src: rows1[0].categorySource });
 
+/* ---------- 1b. RCSS / Domino's / Bonduc keyword gaps (user-reported) ---------- */
+const rcss = E.suggestCategory(row('t2', '2026-08-21', 2600, 'RCSS #1012 AJAX ON', 'purchase'));
+ok(rcss && rcss.categoryId === 'groceries', 'RCSS (Real Canadian Superstore) suggests groceries', rcss);
+ok(rcss && rcss.confidence >= 0.6, 'RCSS suggestion meets auto-categorize threshold', rcss);
+
+const dom = E.suggestCategory(row('t3', '2026-08-28', 2032, 'DOMINOS PIZZA #10566 AJAX ON', 'purchase'));
+ok(dom && dom.categoryId === 'dining', 'DOMINOS PIZZA suggests dining', dom);
+const domApos = E.suggestCategory(row('t4', '2026-08-28', 1129, "DOMINO'S PIZZA 10360 AJAX ON", 'purchase'));
+ok(domApos && domApos.categoryId === 'dining', "DOMINO'S (apostrophe variant) suggests dining", domApos);
+
+const bon = E.suggestCategory(row('t5', '2026-08-16', 1031, 'BONDUC MISSISSAUGA ON', 'purchase'));
+ok(bon && bon.categoryId === 'dining', 'BONDUC (verified coffee shop) suggests dining', bon);
+
+const rows1b = [
+  row('t2', '2026-08-21', 2600, 'RCSS #1012 AJAX ON', 'purchase'),
+  row('t3', '2026-08-28', 2032, 'DOMINOS PIZZA #10566 AJAX ON', 'purchase'),
+  row('t5', '2026-08-16', 1031, 'BONDUC MISSISSAUGA ON', 'purchase'),
+];
+E.autoCategorize(rows1b, []);
+ok(rows1b[0].category === 'groceries' && rows1b[1].category === 'dining' && rows1b[2].category === 'dining',
+   'autoCategorize stamps RCSS/Dominos/Bonduc rows', rows1b.map(function (r) { return r.category; }));
+// Unverifiable merchants stay blank (never guess): domain registrar, unknown kids site.
+const nc = E.suggestCategory(row('t6', '2026-08-14', 1643, 'NAME-CHEAP.COM* 4HEEEJQ PHOENIX AZ USD', 'purchase'));
+ok(nc === null, 'NAME-CHEAP.COM (domain registrar) suggests nothing', nc);
+const rk = E.suggestCategory(row('t7', '2026-08-25', 3400, 'READKIDZ.COM WESTCLIFFE CO', 'purchase'));
+ok(rk === null, 'READKIDZ.COM (no matching category) suggests nothing', rk);
+
 /* ---------- 2. Same-statement refund netting ---------- */
 const recon = E.reconcile([
   row('p1', '2026-08-10', 10000, 'LOBLAWS', 'purchase'),
@@ -105,6 +132,9 @@ ok(weird.find(function (r) { return r.month === '2026-08'; }).netMinor === 5000,
 const moves = E.refundMoves(txns, [link]);
 ok(moves.length === 1 && moves[0].fromMonth === '2026-09' && moves[0].toMonth === '2026-08' &&
    moves[0].amountMinor === -5000, 'refundMoves shape', moves);
+ok(moves[0].purchase && String(moves[0].purchase.id) === 'p1' &&
+   moves[0].refund && String(moves[0].refund.id) === 'r1',
+   'refundMoves carries refund+purchase refs (per-account attribution)', moves[0] && { r: moves[0].refund && moves[0].refund.id, p: moves[0].purchase && moves[0].purchase.id });
 ok(E.refundMoves(txns, []).length === 0, 'refundMoves: empty with no links');
 
 console.log(pass + ' passed, ' + fail + ' failed');

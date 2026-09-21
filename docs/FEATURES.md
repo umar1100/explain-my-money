@@ -43,16 +43,17 @@ units everywhere (`parseFloat` never touches money), ES2019 only.
 | "Make this a rule" from a correction (kind + category rules, auto-applied to future imports) | `app.js` `App.Actions['make-rule'/'confirm-rule'/'cancel-rule']`; `engine.js` `Engine.makeRuleFromCorrection`, `Engine.applyRules` | e2e.node.js (rule created, applied to fresh row) |
 | Split a transaction across categories (integer shares, exact-sum enforced) | `app.js` `App.Actions['split-*']`; `engine.js` `Engine.splitEvenly`, `Engine.expandSplits` | v2.node.js (splitEvenly/expandSplits/split-aware totals/briefing) |
 | Duplicate-transaction detection + keep / mark-duplicate resolution | `app.js` dup pairs, `App.Actions['dup-keep'/'dup-markdup']` | v2.node.js (dup-cache key); resolution UI **not yet** automated (import-level dedupe covered by e2e) |
-| Refund links ("money back" evidence on txn detail) | `app.js` `App.vTxnDetail` (reads `refundLinks` store) | **not yet** automated |
+| Refund links ("money back" evidence on txn detail; auto-created at import: same-statement, cross-statement in both import orders, most-recent eligible purchase wins, one suggested link per refund) | `app.js` `App.commitPipeline`, `App.vTxnDetail` (reads `refundLinks` store) | refund-links.node.js (import-order both directions, most-recent, no duplicates) |
+| Return-adjusted monthly spend: cross-month refunds attributed to the purchase's month in the hero, the 6-month trend, and the per-account breakdown (all three agree) | `engine.js` `Engine.monthlyNetSpend`, `Engine.returnAdjustment`, `Engine.refundMoves`; `app.js` `App.monthContext` | returns-month.node.js; refund-links.node.js (hero/breakdown agreement) |
 | Balance check: reported vs computed (ok / gap / unavailable — never hidden) | `engine.js` `Engine.reconcile`; `app.js` `App.applyBalanceCheckPolicy` | v2.node.js (policy mapping); e2e (netSpendMinor) |
 
 ## Home tab (month summary + ask + plan highlights)
 
 | Feature | Where (file + function) | Verified |
 |---|---|---|
-| Calm summary: month navigator, net-spend headline, review nudge, one-line Ask box, plan highlights | `app.js` `App.vHome`, `App.monthContext`, `App.homeReviewHtml`, `App.homeAskHtml`, `App.homePlanHtml` | node smoke (vHome renders all sections) |
+| Calm summary: month navigator, net-spend hero (gross/refund build-up + return-attribution notes), review nudge, "Where it went" category bars, 6-month trend, one-line Ask box, plan highlights | `app.js` `App.vHome`, `App.monthContext`, `App.headlineHtml`, `App.homeReviewHtml`, `App.homeCategoriesHtml`, `App.homeAskHtml`, `App.homePlanHtml` | refund-links.node.js (hero + categories builders) |
 | One-line Ask: keyword-matched Q&A with cited transactions (offline templates, deterministic); six priority questions one tap down in "What can I ask?" | `app.js` `App.homeAskHtml`, `App.matchQuestion`, `App.answerHtml`, `App.Actions['ask-submit'/'ask-chip']` | e2e.node.js (answer ctx, spend answer, question matching); browser smoke |
-| "Month details" disclosure: drivers, deltas, refunds, per-account breakdown, evidence quality, trends, movers, full briefing text | `app.js` `App.monthDetailsHtml` | node smoke (details render) |
+| "Month details" disclosure: deltas, refunds, per-account breakdown (return-attributed), evidence quality, movers, full briefing text | `app.js` `App.monthDetailsHtml` | node smoke (details render) |
 | Monthly briefing in plain language with evidence | `app.js` `App.monthContext` + `App.monthDetailsHtml`; `engine.js` `Engine.buildBriefing`, `Engine.renderBriefingText` | e2e.node.js (briefing facts + "can't give you a final number" honesty); browser smoke |
 | 6-month net-spend trend chart (hand-rolled canvas, no chart lib) | `app.js` `App.trendsHtml`, `App.drawTrends`; `engine.js` `Engine.monthlyNetSpend` | v2.node.js (monthlyNetSpend); **not yet** browser-verified |
 | Biggest movers (top-3 month-over-month category deltas) | `app.js` `App.moversHtml` | **not yet** automated |

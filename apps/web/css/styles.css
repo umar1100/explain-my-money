@@ -367,6 +367,9 @@ details.more summary::-webkit-details-marker { color: var(--accent); }
 
 .headline-num { font-size: 36px; font-weight: 800; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; margin: 4px 0; }
 .headline-label { font-size: 13px; color: var(--muted); font-weight: 600; }
+/* Home hero: the month's net spend, visually anchored as the page's key figure */
+.hero { border-top: 3px solid var(--accent); }
+.hero-sub { font-size: 14px; color: var(--muted); margin: 0 0 8px; font-variant-numeric: tabular-nums; }
 
 /* Home ask box: one-line input + Ask button side by side */
 .ask-row { display: flex; gap: 8px; align-items: center; }

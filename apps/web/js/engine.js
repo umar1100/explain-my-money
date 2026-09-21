@@ -780,7 +780,7 @@
   };
 
   /**
-   * Engine.refundMoves(txns, links) -> [{refund, fromMonth, toMonth,
+   * Engine.refundMoves(txns, links) -> [{refund, purchase, fromMonth, toMonth,
    *   amountMinor}]. Pure helper behind return-adjusted monthly spend: for
    * each refund link whose refund and purchase fall in different calendar
    * months, the refund's signed amount (refunds are negative) moves from the
@@ -799,7 +799,7 @@
       if (!rf || !pu || rf.kind !== 'refund') return;
       var rm = Engine._monthOf(rf.date), pm = Engine._monthOf(pu.date);
       if (!rm || !pm || rm === pm) return;
-      moves.push({ refund: rf, fromMonth: rm, toMonth: pm,
+      moves.push({ refund: rf, purchase: pu, fromMonth: rm, toMonth: pm,
                    amountMinor: rf.amountMinor || 0 });
     });
     return moves;
@@ -1459,8 +1459,8 @@
   Engine.categoryKeywordRules = [
     // --- specific keys that must beat a generic rule below ---
     { category: 'transport', confidence: 0.95, keywords: ['COSTCO GAS', 'COSTCO FUEL', 'CANADIAN TIRE GAS', 'GO TRANSIT', 'PRESTO CARD', 'GREEN P PARKING', 'VIA RAIL'] },
-    { category: 'groceries', confidence: 0.92, keywords: ['LOBLAWS', 'REAL CANADIAN SUPERSTORE', 'REAL CANADIAN', 'SUPERSTORE', 'NO FRILLS', 'NOFRILLS', 'NOFR', 'SOBEYS', 'FRESHCO', 'FOOD BASICS', 'LONGOS', 'FORTINOS', 'FARM BOY', 'SAVE-ON-FOODS', 'SAVE ON FOODS', 'SAFEWAY', 'MARCHE ADONIS', 'T&T SUPERMARKET', 'H MART', 'COSTCO WHOLESALE'] },
-    { category: 'dining', confidence: 0.92, keywords: ['TIM HORTONS', 'MCDONALD', 'KFC', 'POPEYES', 'SKIPTHEDISHES', 'SKIP THE DISHES', 'DOORDASH', 'UBER EATS', 'PIZZA PIZZA', 'THE KEG', 'STEAKHOUSE', 'HARVEYS', 'WENDY', 'SUBWAY', 'STARBUCKS', 'SECOND CUP', 'SUSHI', 'ICE CREAM', 'RESTAURANT', 'FOOD COURT', 'PIZZERIA', 'COFFEE', 'CAFE'] },
+    { category: 'groceries', confidence: 0.92, keywords: ['LOBLAWS', 'REAL CANADIAN SUPERSTORE', 'REAL CANADIAN', 'SUPERSTORE', 'RCSS', 'NO FRILLS', 'NOFRILLS', 'NOFR', 'SOBEYS', 'FRESHCO', 'FOOD BASICS', 'LONGOS', 'FORTINOS', 'FARM BOY', 'SAVE-ON-FOODS', 'SAVE ON FOODS', 'SAFEWAY', 'MARCHE ADONIS', 'T&T SUPERMARKET', 'H MART', 'COSTCO WHOLESALE'] },
+    { category: 'dining', confidence: 0.92, keywords: ['TIM HORTONS', 'MCDONALD', 'KFC', 'POPEYES', 'DOMINOS', 'BONDUC', 'SKIPTHEDISHES', 'SKIP THE DISHES', 'DOORDASH', 'UBER EATS', 'PIZZA PIZZA', 'THE KEG', 'STEAKHOUSE', 'HARVEYS', 'WENDY', 'SUBWAY', 'STARBUCKS', 'SECOND CUP', 'SUSHI', 'ICE CREAM', 'RESTAURANT', 'FOOD COURT', 'PIZZERIA', 'COFFEE', 'CAFE'] },
     { category: 'health_pharmacy', confidence: 0.92, keywords: ['SHOPPERS DRUG', 'DRUG MART', 'SHOPPERS', 'REXALL', 'PHARMAPRIX', 'JEAN COUTU', 'PHARMACY', 'LIFE LABS', 'LIFELABS', 'DENTAL', 'OPTICAL', 'PHYSIO', 'WALK-IN CLINIC', 'MEDICAL CENTRE'] },
     { category: 'subscriptions', confidence: 0.92, keywords: ['NETFLIX', 'SPOTIFY', 'DISNEY+', 'AMAZON PRIME', 'PRIME VIDEO', 'YOUTUBE PREMIUM', 'APPLE.COM/BILL', 'GOOGLE ONE', 'DROPBOX', 'ICLOUD', 'MICROSOFT 365', 'ROGERS WIRELESS', 'ROGERS', 'BELL MOBILITY', 'TELUS', 'KOODO', 'FREEDOM MOBILE', 'FIDO', 'VIRGIN MOBILE', 'GOODLIFE FITNESS', 'GOODLIFE', 'FITNESS'] },
     { category: 'household', confidence: 0.88, keywords: ['HYDRO ONE', 'HYDRO', 'ENBRIDGE', 'ENERCARE', 'TORONTO WATER', 'CANADIAN TIRE', 'HOME DEPOT', 'RONA', 'LOWES', "LOWE'S", 'IKEA', 'DOLLARAMA', 'BED BATH', 'UTILITY', 'PROPERTY TAX'] },
