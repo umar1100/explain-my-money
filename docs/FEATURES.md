@@ -12,9 +12,9 @@ units everywhere (`parseFloat` never touches money), ES2019 only.
 
 | Feature | Where (file + function) | Verified |
 |---|---|---|
-| 6 tabs: Month, Statement, Plan, Ask, Add, More | `apps/web/js/app.js` `App.render`, `TABS`; tab bar in `apps/web/index.html` | browser smoke ("boot: 6 tabs render") |
+| 4 tabs: Home, Activity, Add, More (`statement`/`month`/`plan`/`ask` kept as internal deep-link routes, highlighted under their parent tab) | `apps/web/js/app.js` `App.render`, `TABS`, `TAB_HIGHLIGHT`; tab bar in `apps/web/index.html` | node smoke (vHome/vMore/vAi render) |
 | Tab routing + global event delegation (`data-action`/`data-change`) | `app.js` `App.Actions['tab']`, `App.Actions['goto']`, `wireGlobalEvents` | browser smoke |
-| First-run starts on the Add tab; otherwise Month | `app.js` `App.boot` | e2e.node.js (boot state) |
+| First-run starts on the Add tab; otherwise Home | `app.js` `App.boot` | e2e.node.js (boot state) |
 
 ## Add tab — import
 
@@ -30,7 +30,7 @@ units everywhere (`parseFloat` never touches money), ES2019 only.
 | Receipt photo capture + on-device OCR (Tesseract) | `app.js` `App.vReceipts`, `App.Changes['receipt-file']`; `apps/web/js/ocr.js` | new-modules.node.js ("OCR receipt parsing (synthetic)") |
 | Receipt ↔ transaction matching (≥0.85 confidence, precision-first) | `app.js` `App.Actions['find-matches'/'confirm-match']`; `engine.js` receipt matching | e2e.node.js (score ≥ 0.85, deterministic, link + coverage) |
 
-## Statement tab
+## Activity tab (statements + review queue)
 
 | Feature | Where (file + function) | Verified |
 |---|---|---|
@@ -46,35 +46,25 @@ units everywhere (`parseFloat` never touches money), ES2019 only.
 | Refund links ("money back" evidence on txn detail) | `app.js` `App.vTxnDetail` (reads `refundLinks` store) | **not yet** automated |
 | Balance check: reported vs computed (ok / gap / unavailable — never hidden) | `engine.js` `Engine.reconcile`; `app.js` `App.applyBalanceCheckPolicy` | v2.node.js (policy mapping); e2e (netSpendMinor) |
 
-## Month tab
+## Home tab (month summary + ask + plan highlights)
 
 | Feature | Where (file + function) | Verified |
 |---|---|---|
-| Monthly briefing in plain language with evidence | `app.js` `App.vMonth`; `engine.js` `Engine.buildBriefing`, `Engine.renderBriefingText` | e2e.node.js (briefing facts + "can't give you a final number" honesty); browser smoke |
+| Calm summary: month navigator, net-spend headline, review nudge, one-line Ask box, plan highlights | `app.js` `App.vHome`, `App.monthContext`, `App.homeReviewHtml`, `App.homeAskHtml`, `App.homePlanHtml` | node smoke (vHome renders all sections) |
+| One-line Ask: keyword-matched Q&A with cited transactions (offline templates, deterministic); six priority questions one tap down in "What can I ask?" | `app.js` `App.homeAskHtml`, `App.matchQuestion`, `App.answerHtml`, `App.Actions['ask-submit'/'ask-chip']` | e2e.node.js (answer ctx, spend answer, question matching); browser smoke |
+| "Month details" disclosure: drivers, deltas, refunds, per-account breakdown, evidence quality, trends, movers, full briefing text | `app.js` `App.monthDetailsHtml` | node smoke (details render) |
+| Monthly briefing in plain language with evidence | `app.js` `App.monthContext` + `App.monthDetailsHtml`; `engine.js` `Engine.buildBriefing`, `Engine.renderBriefingText` | e2e.node.js (briefing facts + "can't give you a final number" honesty); browser smoke |
 | 6-month net-spend trend chart (hand-rolled canvas, no chart lib) | `app.js` `App.trendsHtml`, `App.drawTrends`; `engine.js` `Engine.monthlyNetSpend` | v2.node.js (monthlyNetSpend); **not yet** browser-verified |
 | Biggest movers (top-3 month-over-month category deltas) | `app.js` `App.moversHtml` | **not yet** automated |
-| Budget progress summary on Month | `app.js` `App.vMonth` (budgets section) | **not yet** automated |
+| Budget progress summary on Home | `app.js` `App.homePlanHtml`, `App.budgetSummaryHtml` | **not yet** automated |
 | "This explanation is wrong" → routes to the underlying transactions | `app.js` `App.Actions.wrong` | **not yet** automated |
+| Full Plan (budgets/goals/subscriptions) opened from the Home highlights card | `app.js` `App.vPlan`, `App.vPlanBudgets`, `App.vPlanGoals`, `App.vPlanSubs` | v2.node.js (categorySpendMinor, defaultBudgetMonth, detectSubscriptions); CRUD UI **not yet** automated |
 
-## Plan tab
-
-| Feature | Where (file + function) | Verified |
-|---|---|---|
-| Budgets: per-category monthly limits, create/edit/delete/copy-from-previous-month | `app.js` `App.vPlanBudgets`, `App.Actions['budget-*']`, `App.Changes['budget-month']`; `engine.js` `Engine.categorySpendMinor` | v2.node.js (categorySpendMinor, defaultBudgetMonth, parseDollarsToMinor); CRUD UI **not yet** automated |
-| Goals: save toward a target, log contributions | `app.js` `App.vPlanGoals`, `App.Actions['goal-*']` | **not yet** automated |
-| Subscriptions: recurring-charge detection (monthly/weekly/yearly, price-change flag), dismiss | `app.js` `App.vPlanSubs`, `App.Actions['sub-dismiss']`; `engine.js` `Engine.detectSubscriptions` | v2.node.js (20+ detectSubscriptions checks); UI wiring **not yet** automated |
-
-## Ask tab
+## More tab (rules, accounts, AI phrasing, privacy)
 
 | Feature | Where (file + function) | Verified |
 |---|---|---|
-| Natural-language Q&A with cited transactions (offline templates, deterministic) | `app.js` `App.vAsk`, `App.matchQuestion`, `App.Actions['ask-submit'/'ask-chip']` | e2e.node.js (answer ctx, spend answer, question matching); browser smoke |
-| Optional BYO-key AI phrasing (off by default; per-call approval bound to provider URL, model, privacy mode, exact payload) | `apps/web/js/llm.js`; `app.js` `App.Actions['llm-rephrase-answer'/'llm-send-answer'/'llm-rephrase-briefing'/'llm-send-briefing']`, `App.Changes['llm-*']` | new-modules.node.js ("LLM settings", "LLM privacy packets"); browser smoke ("AI phrasing", off-by-default) |
-
-## More tab
-
-| Feature | Where (file + function) | Verified |
-|---|---|---|
+| Optional BYO-key AI phrasing settings (off by default; per-call approval bound to provider URL, model, privacy mode, exact payload) | `apps/web/js/llm.js`; `app.js` `App.vAi`, `App.llmSettingsHtml`, `App.Actions['llm-rephrase-answer'/'llm-send-answer'/'llm-rephrase-briefing'/'llm-send-briefing']`, `App.Changes['llm-*']` | new-modules.node.js ("LLM settings", "LLM privacy packets"); browser smoke ("AI phrasing", off-by-default) |
 | Household rules manager (enable/disable, two-tap delete, audit-logged) | `app.js` `App.vRules`, `App.Changes['rule-toggle']`, `App.Actions['rule-delete']` | **not yet** automated (engine rule application covered by e2e) |
 | Accounts manager: inline rename (audited), per-account totals ("spent $X across N transactions"), 12-month statement coverage strip with missing-month legend | `app.js` `App.vAccounts`, `App.Changes['account-rename']`; `engine.js` `Engine.monthCovered` | v2.node.js (monthCovered, 13 checks); browser smoke (screen renders, totals, legend) |
 | Sample data: deterministic generator (seed 42, 3 months, ~25–35 txns/mo, clearly labeled, honest `unavailable` balance check) | `engine.js` `Engine.sampleData`, `Engine._mulberry32`; `app.js` `App.Actions['sample-add']`, `App.insertSampleData` | v2.node.js (sampleData 16 checks + mulberry32 3 checks); browser smoke (add button present) |

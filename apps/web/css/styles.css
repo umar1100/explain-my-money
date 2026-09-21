@@ -94,9 +94,9 @@ body {
   gap: 3px;
   min-height: var(--tabbar-h);
   border: 0; background: none; color: var(--muted);
-  font-size: 11px; font-weight: 600;
+  font-size: 12px; font-weight: 600;
   cursor: pointer;
-  padding: 6px 2px;
+  padding: 8px 2px;
 }
 .tab svg { display: block; }
 .tab.active { color: var(--accent-dark); }
@@ -115,8 +115,8 @@ p { margin: 8px 0; }
   background: var(--card);
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  padding: 14px;
-  margin: 10px 0;
+  padding: 16px;
+  margin: 14px 0;
   box-shadow: 0 1px 2px rgba(30,25,15,.04);
 }
 .card.flush { padding: 0; overflow: hidden; }
@@ -365,8 +365,13 @@ details.more summary::-webkit-details-marker { color: var(--accent); }
 .duo .txn { flex-direction: column; align-items: flex-start; cursor: default; }
 .duo .txn .t-amt { margin-top: 4px; }
 
-.headline-num { font-size: 34px; font-weight: 800; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; margin: 2px 0; }
+.headline-num { font-size: 36px; font-weight: 800; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; margin: 4px 0; }
 .headline-label { font-size: 13px; color: var(--muted); font-weight: 600; }
+
+/* Home ask box: one-line input + Ask button side by side */
+.ask-row { display: flex; gap: 8px; align-items: center; }
+.ask-row input[type="text"] { flex: 1; min-width: 0; margin: 2px 0; }
+.ask-row .btn { width: auto; flex: 0 0 auto; margin: 2px 0; padding-left: 22px; padding-right: 22px; }
 
 .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
 .linklike { background: none; border: 0; color: var(--accent-dark); font-weight: 700; font-size: 14px;

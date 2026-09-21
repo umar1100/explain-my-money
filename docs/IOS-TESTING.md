@@ -16,14 +16,14 @@ from Safari as a home-screen app.
 - [ ] **Import the sample CSV** — Add → Choose statement files → pick
       `tests/fixtures/sample_statement_aug2026.csv` → Process files.
       Expect: 8 visible pipeline stages, then a clean statement.
-- [ ] **Clean statement** — Statement tab: purchases separated from
+- [ ] **Activity** — Activity tab: clean statement; purchases separated from
       payments/transfers/refunds; reconciliation strip shows gross,
       refunds, net spending.
 - [ ] **Review queue** — open an uncertain item, correct it, confirm the
       proposed household rule.
-- [ ] **Your Month** — Month tab: headline total, what changed,
+- [ ] **Home** — Home tab: headline total, review nudge, ask box; details one tap down (what changed,
       where it went, evidence quality. Tap any claim → evidence drawer.
-- [ ] **Ask** — Ask tab: try a suggested question; check the evidence
+- [ ] **Ask** — Home ask box: try a suggested question; check the evidence
       footer (period, scope, confidence, sources).
 - [ ] **Receipt** — Add → Add receipts → Take photo / choose image.
       Expect on-device OCR (may take ~30s first run while the engine

@@ -42,7 +42,7 @@ def main():
         page.goto(BASE, wait_until="networkidle")
         page.wait_for_selector(".tabbar .tab", timeout=15000)
         tabs = page.locator(".tabbar .tab").count()
-        check("boot: 6 tabs render", tabs == 6, f"found {tabs}")
+        check("boot: 4 tabs render", tabs == 4, f"found {tabs}")
         check("boot: Add screen first-run", page.locator("#stmt-file").count() == 1)
         page.screenshot(path=f"{SHOTS}/01-add.png")
 
@@ -60,52 +60,73 @@ def main():
         check("import: preview shows", True)
         page.screenshot(path=f"{SHOTS}/02-preview.png")
         page.click('button[data-action="confirm-import"]')
-        page.wait_for_selector("text=Your Month", timeout=30000)  # pipeline lands on Month
-        check("import: pipeline completes to Month", True)
+        page.wait_for_selector("text=Net spend after refunds", timeout=30000)  # pipeline lands on Home
+        check("import: pipeline completes to Home", True)
         page.screenshot(path=f"{SHOTS}/03-month.png")
 
-        # 3. Month briefing
-        check("month: headline number", page.locator(".headline-num").count() >= 1)
+        # 3. Home summary
+        check("home: headline number", page.locator(".headline-num").count() >= 1)
+        check("home: ask box", page.locator("#ask-free").count() == 1)
         body = page.inner_text("#view")
-        for needle in ["Where it went", "Needs your review", "Evidence quality"]:
-            check(f"month: section '{needle}'", needle in body)
+        for needle in ["Needs your review", "All clear", "Ask about your money"]:
+            if needle in body:
+                check(f"home: section '{needle}'", True)
+                break
+        else:
+            check("home: summary section", False, body[:120])
+        check("home: month details behind disclosure",
+              page.locator('details.more summary:has-text("Month details")').count() >= 1)
+        # expand Month details and check the detailed sections still render
+        page.click('details.more summary:has-text("Month details")')
+        page.wait_for_timeout(600)
+        body = page.inner_text("#view")
+        for needle in ["Where it went", "Evidence quality"]:
+            check(f"home details: section '{needle}'", needle in body)
 
-        # 4. Statement
-        page.click('.tab[data-tab="statement"]')
+        # 4. Activity (statements + review queue)
+        page.click('.tab[data-tab="activity"]')
         page.wait_for_selector('#view', timeout=10000)
         page.wait_for_timeout(800)
         body = page.inner_text("#view")
-        check("statement: list renders", "Review" in body or "Purchases" in body)
+        check("activity: list renders", "Review" in body or "Purchases" in body)
         page.screenshot(path=f"{SHOTS}/04-statement.png")
         txn_btn = page.locator('button[data-action="open-txn"]').first
         if txn_btn.count():
             txn_btn.click()
             page.wait_for_timeout(800)
             body = page.inner_text("#view")
-            check("statement: txn detail opens", "Normalized" in body or "Raw" in body or "Evidence" in body)
+            check("activity: txn detail opens", "Normalized" in body or "Raw" in body or "Evidence" in body)
             page.screenshot(path=f"{SHOTS}/05-txn.png")
             back = page.locator('button[data-action="txn-back"]')
             if back.count(): back.click(); page.wait_for_timeout(500)
         else:
-            check("statement: txn detail opens", False, "no txn buttons")
+            check("activity: txn detail opens", False, "no txn buttons")
 
-        # 5. Ask
-        page.click('.tab[data-tab="ask"]')
+        # 5. Ask (one-line box on Home) — question chips live in "What can I ask?"
+        page.click('.tab[data-tab="home"]')
         page.wait_for_timeout(800)
+        page.click('details.more summary:has-text("What can I ask?")')
+        page.wait_for_timeout(400)
         page.click('.chip[data-q="q-spend"]')
         page.wait_for_timeout(1200)
         body = page.inner_text("#view")
         check("ask: deterministic answer card", "actual spend after refunds" in body.lower())
         check("ask: evidence footer", "Evidence basis" in body)
-        check("ask: AI phrasing present", "AI phrasing" in body)
-        ai_on = page.locator('#llm-base').count()
-        check("ask: AI settings inputs exist but disabled by default",
-              page.locator('input[data-change="llm-enabled"]').is_checked() == False)
         page.screenshot(path=f"{SHOTS}/06-ask.png")
 
-        # 6. More → privacy
+        # 5b. More → AI phrasing settings (off by default)
         page.click('.tab[data-tab="more"]')
         page.wait_for_timeout(600)
+        check("more: AI phrasing card present", page.locator('button[data-action="goto"][data-more="ai"]').count() == 1)
+        page.click('button[data-action="goto"][data-more="ai"]')
+        page.wait_for_timeout(800)
+        check("ai: settings inputs exist but disabled by default",
+              page.locator('input[data-change="llm-enabled"]').is_checked() == False)
+        page.screenshot(path=f"{SHOTS}/06b-ai.png")
+        page.click('button[data-action="back-more"]')
+        page.wait_for_timeout(600)
+
+        # 6. More → privacy
         page.click('button[data-action="goto"][data-more="privacy"]')
         page.wait_for_timeout(800)
         body = page.inner_text("#view")

@@ -44,7 +44,7 @@ def main():
         # 1. Boot over file://
         page.goto(BASE, wait_until="load")
         page.wait_for_selector(".tabbar .tab", timeout=20000)
-        check("boot: 6 tabs render", page.locator(".tabbar .tab").count() == 6)
+        check("boot: 4 tabs render", page.locator(".tabbar .tab").count() == 4)
         check("boot: Add screen first-run", page.locator("#stmt-file").count() == 1)
         page.screenshot(path=f"{SHOTS}/local-01-add.png")
 
@@ -64,10 +64,10 @@ def main():
         page.wait_for_selector(".banner.ok", timeout=30000)  # pipeline done
         banner = page.inner_text(".banner.ok")
         check("import: pipeline completes", "25 transactions cleaned" in banner, banner)
-        page.click('button[data-action="tab"][data-tab="month"]')  # "See your month"
+        page.click('button[data-action="tab"][data-tab="home"]')  # "See your month" -> Home
         page.wait_for_selector(".month-nav", timeout=15000)
-        check("import: Month tab opens", True)
-        page.screenshot(path=f"{SHOTS}/local-03-month.png")
+        check("import: Home opens", True)
+        page.screenshot(path=f"{SHOTS}/local-03-home.png")
 
         # 3. Auto-categories stamped by the import pipeline (on-device Store)
         cats = page.evaluate("""(async () => {
@@ -89,24 +89,29 @@ def main():
         check("auto-cat: PRESTO -> transport (auto)", cats.get("presto") == ["transport", "auto"], cats.get("presto"))
         check("auto-cat: ANNUAL FEE -> fees (auto)", cats.get("fee") == ["fees", "auto"], cats.get("fee"))
 
-        # 4. Month tab: navigator, coverage note, per-account breakdown
+        # 4. Home tab: navigator, coverage note; detail sections one tap down
         body = page.inner_text("#view")
-        check("month: navigator renders", page.locator(".month-nav").count() == 1)
-        check("month: prev/next buttons", page.locator('button[data-action="month-prev"]').count() == 1
+        check("home: navigator renders", page.locator(".month-nav").count() == 1)
+        check("home: prev/next buttons", page.locator('button[data-action="month-prev"]').count() == 1
               and page.locator('button[data-action="month-next"]').count() == 1)
-        check("month: month dropdown", page.locator("#month-select").count() == 1)
+        check("home: month dropdown", page.locator("#month-select").count() == 1)
         opts = page.evaluate("Array.from(document.querySelectorAll('#month-select option')).map(o => o.value)")
-        check("month: dropdown lists the imported month", "2026-08" in opts, opts)
-        check("month: coverage note", "1 statement contributes to August 2026" in body, "")
-        check("month: per-account breakdown", "Per-account breakdown" in body)
-        check("month: per-account row shows balance check state", "check:" in body)
-        check("month: aggregate balance check honest", "n/a (per-account above)" in body)
-        check("month: sections present",
-              all(s in body for s in ["What changed", "Where it went", "Refunds & money movement", "Needs your review", "Evidence quality"]))
-        page.screenshot(path=f"{SHOTS}/local-04-month-full.png")
+        check("home: dropdown lists the imported month", "2026-08" in opts, opts)
+        check("home: coverage note", "1 statement contributes to August 2026" in body, "")
+        check("home: ask box present", page.locator("#ask-free").count() == 1)
+        # Detail sections live inside the "Month details" disclosure: open it.
+        page.click('details.more summary:has-text("Month details")')
+        page.wait_for_timeout(600)
+        body = page.inner_text("#view")
+        check("home details: per-account breakdown", "Per-account breakdown" in body)
+        check("home details: per-account row shows balance check state", "check:" in body)
+        check("home details: aggregate balance check honest", "n/a (per-account above)" in body)
+        check("home details: sections present",
+              all(s in body for s in ["What changed", "Where it went", "Refunds & money movement", "Evidence quality"]))
+        page.screenshot(path=f"{SHOTS}/local-04-home-full.png")
 
-        # 5. Statement review queue: uncategorized rows listed with "Needs a category"
-        page.click('.tab[data-tab="statement"]')
+        # 5. Activity review queue: uncategorized rows listed with "Needs a category"
+        page.click('.tab[data-tab="activity"]')
         page.wait_for_timeout(900)
         body = page.inner_text("#view")
         review_count = page.evaluate("""(() => {

@@ -372,8 +372,14 @@ var App = {
   _renderSeq: 0            // increments per render; async views write only if current
 };
 
-var TABS = ['month', 'statement', 'plan', 'ask', 'add', 'more'];
-var TAB_TITLES = { month: 'Your Month', statement: 'Clean Statement', plan: 'Plan', ask: 'Ask', add: 'Add', more: 'More' };
+var TABS = ['home', 'activity', 'add', 'more'];
+var TAB_TITLES = { home: 'Home', activity: 'Activity', add: 'Add', more: 'More' };
+/* Internal (non-tab) routes still exist for deep links: 'statement' renders
+ * inside Activity, 'month' renders the Home summary, 'plan' is opened from
+ * the Home plan-highlights card, 'ask' is folded into Home. The mapping
+ * below keeps the right bottom tab highlighted for each internal route. */
+var TAB_HIGHLIGHT = { statement: 'activity', month: 'home', plan: 'home', ask: 'home' };
+function tabHighlight(t) { return TAB_HIGHLIGHT[t] || t; }
 
 /** Natural-key preference read: null when unset. (ES2019: no ??, use ternary.) */
 App.prefGet = async function (key) {
@@ -406,7 +412,7 @@ App.boot = async function () {
   if (statements.length) {
     statements.sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
     App.state.statementId = statements[0].id;
-    App.state.tab = 'month';
+    App.state.tab = 'home';
   } else {
     App.state.tab = 'add'; // first-run flow starts at Add
   }
@@ -464,19 +470,23 @@ App.go = function (tab, params) {
 App.render = function () {
   if (!App.ready || App.engineMissing) return;
   $all('.tab').forEach(function (b) {
-    b.classList.toggle('active', b.dataset.tab === App.state.tab);
-    if (b.dataset.tab === App.state.tab) b.setAttribute('aria-current', 'page');
+    b.classList.toggle('active', b.dataset.tab === tabHighlight(App.state.tab));
+    if (b.dataset.tab === tabHighlight(App.state.tab)) b.setAttribute('aria-current', 'page');
     else b.removeAttribute('aria-current');
   });
   var seq = ++App._renderSeq; // async views must check this before writing
   var v = $('#view');
   var s = App.state;
   if (s.tab === 'add') App.vAdd(v, seq);
-  else if (s.tab === 'statement') { s.txnId != null ? App.vTxnDetail(v, seq) : App.vStatement(v, seq); }
-  else if (s.tab === 'month') App.vMonth(v, seq);
-  else if (s.tab === 'plan') App.vPlan(v, seq);
-  else if (s.tab === 'ask') App.vAsk(v, seq);
+  else if (s.tab === 'activity') { s.txnId != null ? App.vTxnDetail(v, seq) : App.vStatement(v, seq); }
+  else if (s.tab === 'home') App.vHome(v, seq);
   else if (s.tab === 'more') App.vMore(v, seq);
+  // Internal routes (deep links; no bottom-tab button of their own):
+  else if (s.tab === 'statement') { s.txnId != null ? App.vTxnDetail(v, seq) : App.vStatement(v, seq); }
+  else if (s.tab === 'month') App.vHome(v, seq);
+  else if (s.tab === 'plan') App.vPlan(v, seq);
+  else if (s.tab === 'ask') App.vHome(v, seq); // Ask is folded into Home
+  else App.vHome(v, seq);
   App.renderOnboarding(); // fixed overlay; no-op unless App.state.onboardStep set
 };
 
@@ -1439,7 +1449,7 @@ App.vProcessing = function (v, seq) {
       '</div>' +
       '<button class="btn" data-action="pipe-review">Review clean statement</button>' +
       '<button class="btn ghost" data-action="goto" data-tab="add" data-addview="receipts">Add receipts (optional)</button>' +
-      '<button class="btn ghost" data-action="tab" data-tab="month">See your month</button>';
+      '<button class="btn ghost" data-action="tab" data-tab="home">See your month</button>';
   } else if (pipe.failed) {
     html += '<div class="banner bad"><strong>Pipeline stopped:</strong> ' + esc(pipe.failed) + '</div>' +
       '<button class="btn ghost" data-action="goto" data-tab="add" data-addview="home">Back to Add</button>';
@@ -1917,7 +1927,7 @@ App.vReceipts = async function (v, seq) {
   }
 
   html += '<button class="btn ghost" data-action="goto" data-tab="add" data-addview="home">Done — back to Add</button>' +
-    '<button class="btn ghost" data-action="tab" data-tab="month">Skip for now →</button>';
+    '<button class="btn ghost" data-action="tab" data-tab="home">Skip for now →</button>';
   App.show(v, seq, html);
   if (seq !== App._renderSeq) return; // superseded; skip thumbnail work
 
@@ -3053,8 +3063,8 @@ App.moversHtml = async function (monthAnchor) {
   return html;
 };
 
-/** Budgets summary card for monthOverride (Month tab, month-scoped), else
- * App.state.budgetMonth (Plan tab's chosen month) or the Plan default:
+/** Budgets summary card for monthOverride (Home, month-scoped), else
+ * App.state.budgetMonth (Plan view's chosen month) or the Plan default:
  * "X of Y on track" (on track = spent <= limit, split-aware). Hidden when
  * the month has no budgets. */
 App.budgetSummaryHtml = async function (monthOverride) {
@@ -3079,7 +3089,8 @@ App.budgetSummaryHtml = async function (monthOverride) {
 };
 
 /* ============================================================================
- * Screen 5 — Your Month (home after first import)
+ * Home tab (home after first import): slim summary on top (App.vHome),
+ * full detail sections one tap down (App.monthDetailsHtml).
  * An OVERALL month view: aggregates ALL non-excluded transactions whose
  * date falls in the chosen calendar month (date prefix 'YYYY-MM', NOT
  * statement periods — periods span month boundaries), across every
@@ -3144,14 +3155,20 @@ App.Changes['month-select'] = function (el) {
   if (/^\d{4}-\d{2}$/.test(el.value || '')) { App.state.month = el.value; App.render(); }
 };
 
-App.vMonth = async function (v, seq) {
+/* ============================================================================
+ * Home tab — a calm month summary.
+ * One glance: month navigator, net-spend headline, review nudge, a one-line
+ * Ask box, and plan highlights. Everything detailed (drivers, trends, the
+ * full briefing text) lives one tap down inside a <details> disclosure.
+ * Legacy route name vMonth kept as an alias so old deep links render it.
+ * ========================================================================== */
+
+/** All the data the Home view needs, computed once. Returns null when the
+ *  ledger is empty (first-run state). */
+App.monthContext = async function () {
   var txns = await sAll('txns');
   var stmts = await sAll('statements');
-  if (!txns.length) {
-    App.show(v, seq, '<h1>Your Month</h1><div class="empty">Nothing here yet — import a statement to get your first briefing.<br><br>' +
-      '<button class="btn" data-action="tab" data-tab="add">Add a statement</button></div>');
-    return;
-  }
+  if (!txns.length) return null;
   var months = App.monthsWithData(txns);
   if (!App.state.month || months.indexOf(App.state.month) === -1) {
     App.state.month = months[months.length - 1]; // default: latest month with data
@@ -3209,42 +3226,114 @@ App.vMonth = async function (v, seq) {
     try { c.netMinor = Engine.reconcile(c.txns, null).netSpendMinor; } catch (e) { c.netMinor = 0; }
   });
 
-  var html = '<h1>Your Month</h1>';
-
-  // Month navigator: back | Month Year (dropdown) | next.
   var idx = months.indexOf(month);
-  html += '<div class="card"><div class="month-nav">' +
+  // Honest coverage note: periods only partially covering the month say so.
+  var partialN = contributors.filter(function (c) { return c.coverage === 'partial'; }).length;
+  var unknownN = contributors.filter(function (c) { return c.coverage === 'unknown' || c.coverage === 'outside'; }).length;
+  var covNote = contributors.length + ' statement' + (contributors.length === 1 ? '' : 's') +
+    ' contribute' + (contributors.length === 1 ? 's' : '') + ' to ' + esc(fmtPeriod(month));
+  if (partialN) covNote += ' \u00b7 ' + partialN + ' partial';
+  if (unknownN) covNote += ' \u00b7 ' + unknownN + ' without a full period';
+
+  // Headline: the Engine's own first line (honesty rule — no final number
+  // while anything is unresolved), plus the net figure as a magnitude.
+  var headline = '';
+  try { headline = facts ? String(Engine.renderBriefingText(facts).split('\n')[0] || '') : ''; } catch (e) { headline = ''; }
+
+  var reviewTxns = App.reviewTxns(mTxns);
+  var reviewN = reviewTxns.length;
+  var noCatMonth = mTxns.filter(function (t) { return needsCategory(t); }).length;
+
+  var cov = await App.receiptCoverageFor(mTxns);
+  var rules = await sAll('householdRules');
+
+  var deltas = facts ? (facts.deltas || []) : [];
+  var drivers = facts ? (facts.topDrivers || []) : [];
+  var rs = facts ? facts.refundsSummary : null;
+  var move = mTxns.filter(function (t) { return ['refund', 'payment', 'transfer', 'fee'].indexOf(t.kind) !== -1 && !t.excluded; });
+
+  var briefingText = '';
+  try { briefingText = facts ? Engine.renderBriefingText(facts) : ''; } catch (e) { briefingText = ''; }
+
+  return {
+    months: months, month: month, idx: idx, prev: prev, covNote: covNote,
+    headline: headline, recon: recon, facts: facts,
+    mTxns: mTxns, pTxns: pTxns, contributors: contributors,
+    reviewN: reviewN, noCatMonth: noCatMonth, cov: cov, rules: rules,
+    deltas: deltas, drivers: drivers, rs: rs, move: move,
+    briefingText: briefingText
+  };
+};
+
+/** Month navigator: back | Month Year (dropdown) | next + coverage note. */
+App.monthNavHtml = function (ctx) {
+  var months = ctx.months, month = ctx.month, idx = ctx.idx;
+  return '<div class="card"><div class="month-nav">' +
     '<button class="btn ghost" data-action="month-prev" aria-label="Previous month"' + (idx <= 0 ? ' disabled' : '') + '>&#8249;</button>' +
     '<select id="month-select" data-change="month-select" aria-label="Choose month">' +
     months.map(function (m) {
       return '<option value="' + m + '"' + (m === month ? ' selected' : '') + '>' + esc(fmtPeriod(m)) + '</option>';
     }).join('') + '</select>' +
     '<button class="btn ghost" data-action="month-next" aria-label="Next month"' + (idx >= months.length - 1 ? ' disabled' : '') + '>&#8250;</button>' +
-    '</div>';
-  // Honest coverage note: periods only partially covering the month say so.
-  var partialN = contributors.filter(function (c) { return c.coverage === 'partial'; }).length;
-  var unknownN = contributors.filter(function (c) { return c.coverage === 'unknown' || c.coverage === 'outside'; }).length;
-  var covNote = contributors.length + ' statement' + (contributors.length === 1 ? '' : 's') +
-    ' contribute' + (contributors.length === 1 ? 's' : '') + ' to ' + esc(fmtPeriod(month));
-  if (partialN) covNote += ' · ' + partialN + ' partial';
-  if (unknownN) covNote += ' · ' + unknownN + ' without a full period';
-  html += '<p class="small" style="margin-bottom:0">' + covNote + ' · ' + mTxns.length + ' transactions</p></div>';
+    '</div><p class="small" style="margin-bottom:0">' + ctx.covNote + ' \u00b7 ' + ctx.mTxns.length + ' transactions</p></div>';
+};
 
-  // Headline: the Engine's own first line (honesty rule — no final number
-  // while anything is unresolved), plus the net figure as a magnitude.
-  var headline = '';
-  try { headline = facts ? String(Engine.renderBriefingText(facts).split('\n')[0] || '') : ''; } catch (e) { headline = ''; }
-  html += '<div class="card"><div class="headline-label">Net spend after refunds</div>' +
-    '<div class="headline-num">' + spendAbs(recon.netSpendMinor) + '</div>' +
-    '<p class="small" style="margin-bottom:0">' + esc(headline || ('Across ' + mTxns.length + ' transactions in ' + fmtPeriod(month) + ', all accounts.')) + '</p></div>';
+/** Headline card: net spend after refunds + the Engine's first line. */
+App.headlineHtml = function (ctx) {
+  return '<div class="card"><div class="headline-label">Net spend after refunds</div>' +
+    '<div class="headline-num">' + spendAbs(ctx.recon.netSpendMinor) + '</div>' +
+    '<p class="small" style="margin-bottom:0">' + esc(ctx.headline || ('Across ' + ctx.mTxns.length + ' transactions in ' + fmtPeriod(ctx.month) + ', all accounts.')) + '</p></div>';
+};
 
+/** Review nudge: one card when something needs a human look, else a quiet
+ *  all-clear banner. Points at the Activity tab's review queue. */
+App.homeReviewHtml = function (ctx) {
+  if (!ctx.reviewN) return '<div class="banner ok">All clear \u2014 nothing needs review.</div>';
+  return '<h2>Needs your review</h2><div class="card"><p><strong>' + ctx.reviewN + '</strong> transaction' + (ctx.reviewN === 1 ? '' : 's') +
+    ' need' + (ctx.reviewN === 1 ? 's' : '') + ' a human look' +
+    (ctx.noCatMonth ? ', including <strong>' + ctx.noCatMonth + '</strong> under \u201cNeeds a category\u201d' : '') + '.</p>' +
+    '<button class="btn" data-action="goto" data-tab="activity" data-filter="review"' +
+    (ctx.contributors.length ? ' data-sid="' + esc(ctx.contributors[0].id) + '"' : '') + '>Review now</button></div>';
+};
+
+/** One-line Ask box with the answer below; the six priority questions live
+ *  one tap down in "What can I ask?" so the screen stays calm. */
+App.homeAskHtml = async function () {
+  var html = '<h2>Ask about your money</h2>';
+  html += '<div class="card"><div class="ask-row">' +
+    '<input type="text" id="ask-free" placeholder="e.g. why did groceries rise?" value="' + esc(App.state.askText || '') + '" autocomplete="off" aria-label="Ask about your money">' +
+    '<button class="btn" data-action="ask-submit">Ask</button></div>' +
+    '<p class="tiny" style="margin-bottom:0">Answers are computed on this device from your ledger \u2014 nothing is uploaded.</p></div>';
+  if (App.state.askQ) html += await App.answerHtml(App.state.askQ);
+  else if (App.state.askText) html += await App.answerHtml('__free__');
+  html += '<details class="more"><summary>What can I ask?</summary><div>' +
+    QUESTIONS.map(function (q) {
+      return '<button class="chip' + (App.state.askQ === q.id ? ' on' : '') + '" data-action="ask-chip" data-q="' + q.id + '">' + esc(q.label) + '</button>';
+    }).join('') + '</div>' +
+    '<p class="tiny">Free text is matched by keyword to one of the questions above. Anything else gets an honest \u201cI can\u2019t answer that yet\u201d.</p></details>';
+  return html;
+};
+
+/** Plan highlights: the budget summary when budgets exist, else a single
+ *  quiet card pointing at the full Plan. */
+App.homePlanHtml = async function (ctx) {
+  var sum = await App.budgetSummaryHtml(ctx.month);
+  if (sum) return sum;
+  return '<h2>Plan</h2><div class="card"><p class="small" style="margin-top:0">Set monthly budgets, savings goals, and track subscriptions \u2014 all computed on this device.</p>' +
+    '<button class="btn ghost" data-action="tab" data-tab="plan">Open Plan</button></div>';
+};
+
+/** The detailed month sections (old Month tab body), kept intact but moved
+ *  one tap down inside the "Month details" disclosure. */
+App.monthDetailsHtml = async function (ctx) {
+  var month = ctx.month, prev = ctx.prev, facts = ctx.facts, recon = ctx.recon;
+  var html = '';
   // What changed: Engine deltas vs previous calendar month aggregate.
   html += '<div class="section-head"><h2>What changed</h2>' +
     '<button class="linklike" data-action="wrong" data-filter="purchases">This explanation is wrong</button></div>';
-  var deltas = facts ? (facts.deltas || []) : [];
-  if (deltas.length) {
-    html += '<div class="card"><p class="tiny" style="margin-top:0">' + esc(fmtPeriod(month)) + ' vs ' + esc(fmtPeriod(prev)) + ' · all accounts</p>';
-    deltas.slice(0, 3).forEach(function (d) {
+  if (ctx.deltas.length) {
+    html += '<div class="card"><p class="tiny" style="margin-top:0">' + esc(fmtPeriod(month)) + ' vs ' + esc(fmtPeriod(prev)) + ' \u00b7 all accounts</p>';
+    ctx.deltas.slice(0, 3).forEach(function (d) {
       var up = d.deltaMinor > 0;
       html += '<div class="bar-row"><span class="b-label">' + esc(catLabelSmart(d.category || '')) + '</span>' +
         '<span class="b-amt">' + (up ? 'up ' : 'down ') + spendAbs(d.deltaMinor) +
@@ -3252,19 +3341,17 @@ App.vMonth = async function (v, seq) {
     });
     html += '</div>';
   } else {
-    html += '<div class="card"><p style="margin:0">' + (pTxns.length
+    html += '<div class="card"><p style="margin:0">' + (ctx.pTxns.length
       ? 'Spending was flat across categories vs ' + esc(fmtPeriod(prev)) + '.'
       : 'No ' + esc(fmtPeriod(prev)) + ' data to compare against yet.') + '</p></div>';
   }
 
-  // Where it went: Engine top drivers (real categories now), each linking
-  // to its first transaction.
+  // Where it went: Engine top drivers, each linking to its first transaction.
   html += '<div class="section-head"><h2>Where it went</h2>' +
     '<button class="linklike" data-action="wrong" data-filter="purchases">This explanation is wrong</button></div>';
-  var drivers = facts ? (facts.topDrivers || []) : [];
-  if (drivers.length) {
-    drivers.slice(0, 5).forEach(function (d) {
-      var link = App.driverTxnId(mTxns, d.category);
+  if (ctx.drivers.length) {
+    ctx.drivers.slice(0, 5).forEach(function (d) {
+      var link = App.driverTxnId(ctx.mTxns, d.category);
       html += '<button class="driver" data-action="open-txn" data-id="' + esc(link || '') + '"' + (link ? '' : ' disabled') + '>' +
         '<span class="d-main"><span class="d-name">' + esc(catLabelSmart(d.category || '')) + '</span><br>' +
         '<span class="d-sub">' + (d.txnCount || 0) + ' transaction' + ((d.txnCount || 0) === 1 ? '' : 's') + '</span></span>' +
@@ -3275,83 +3362,76 @@ App.vMonth = async function (v, seq) {
   // Refunds & money movement, month-scoped.
   html += '<div class="section-head"><h2>Refunds &amp; money movement</h2>' +
     '<button class="linklike" data-action="wrong" data-filter="refunds">This explanation is wrong</button></div>';
-  var rs = facts ? facts.refundsSummary : null;
-  var move = mTxns.filter(function (t) { return ['refund', 'payment', 'transfer', 'fee'].indexOf(t.kind) !== -1 && !t.excluded; });
-  if (move.length) {
+  if (ctx.move.length) {
     html += '<div class="card">';
-    move.slice(0, 8).forEach(function (t) {
+    ctx.move.slice(0, 8).forEach(function (t) {
       t = nt(t);
       html += '<div class="bar-row"><span class="b-label">' + esc(t.desc) + '</span>' +
-        '<span class="b-amt">' + money(t.amountMinor) + ' · ' + esc(kindLabel(t.kind)) + '</span></div>';
+        '<span class="b-amt">' + money(t.amountMinor) + ' \u00b7 ' + esc(kindLabel(t.kind)) + '</span></div>';
     });
-    html += '<p class="small">Refunds received: <strong>' + spendAbs(rs ? rs.totalMinor : recon.refundsTotalMinor) + '</strong>' +
-      (rs ? ' across ' + rs.count + ' transaction(s)' : '') + ' (already subtracted from net spend).</p></div>';
+    html += '<p class="small">Refunds received: <strong>' + spendAbs(ctx.rs ? ctx.rs.totalMinor : recon.refundsTotalMinor) + '</strong>' +
+      (ctx.rs ? ' across ' + ctx.rs.count + ' transaction(s)' : '') + ' (already subtracted from net spend).</p></div>';
   } else html += '<p class="small">No refunds, payments, transfers or fees this month.</p>';
 
   // Per-account breakdown: each contributing statement's net spend for the
   // month + its own balance-check state. Tap to drill into the statement.
   html += '<h2>Per-account breakdown</h2><div class="card">';
-  contributors.forEach(function (c) {
+  ctx.contributors.forEach(function (c) {
     var label = c.statement ? (c.statement.scopeLabel || c.statement.periodLabel || 'Statement') : '(statement removed)';
     var checkPill = c.checkState === 'ok' ? 'ok' : (c.checkState === 'gap' ? 'bad' : 'dim');
-    html += '<button class="driver" data-action="goto" data-tab="statement" data-sid="' + esc(c.id) + '"' + (c.statement ? '' : ' disabled') + '>' +
+    html += '<button class="driver" data-action="goto" data-tab="activity" data-sid="' + esc(c.id) + '"' + (c.statement ? '' : ' disabled') + '>' +
       '<span class="d-main"><span class="d-name">' + esc(label) + '</span><br>' +
-      '<span class="d-sub">' + c.txns.length + ' transaction' + (c.txns.length === 1 ? '' : 's') + ' · ' +
+      '<span class="d-sub">' + c.txns.length + ' transaction' + (c.txns.length === 1 ? '' : 's') + ' \u00b7 ' +
       esc(c.coverage === 'full' ? 'full month' : (c.coverage === 'partial' ? 'partial month' : c.coverage)) +
-      ' · <span class="pill ' + checkPill + '">check: ' + esc(c.checkState) + '</span></span></span>' +
+      ' \u00b7 <span class="pill ' + checkPill + '">check: ' + esc(c.checkState) + '</span></span></span>' +
       '<span class="d-amt">' + spendAbs(c.netMinor) + '</span></button>';
   });
   html += '<p class="tiny" style="margin-bottom:0">Net spend per account for ' + esc(fmtPeriod(month)) +
     ', magnitudes. Tap an account to drill into its statement.</p></div>';
 
-  // Needs your review: uncertain rows + uncategorized spend, month-scoped
-  // and deduplicated (an uncategorized purchase with needs_review row
-  // confidence belongs to both sets but is one row to review).
-  var reviewTxns = App.reviewTxns(mTxns);
-  var reviewN = reviewTxns.length;
-  var noCatMonth = mTxns.filter(function (t) { return needsCategory(t); }).length;
-  html += '<div class="section-head"><h2>Needs your review</h2>' +
-    '<button class="linklike" data-action="wrong" data-filter="review">This explanation is wrong</button></div>';
-  if (reviewN) {
-    html += '<div class="card"><p><strong>' + reviewN + '</strong> transaction' + (reviewN === 1 ? '' : 's') +
-      ' need' + (reviewN === 1 ? 's' : '') + ' a human look' +
-      (noCatMonth ? ', including <strong>' + noCatMonth + '</strong> under \u201cNeeds a category\u201d' : '') + '.</p>' +
-      '<button class="btn" data-action="goto" data-tab="statement" data-filter="review"' +
-      (contributors.length ? ' data-sid="' + esc(contributors[0].id) + '"' : '') + '>Open review queue</button></div>';
-  } else html += '<div class="banner ok">All clear — nothing needs review.</div>';
-
   // Evidence quality. The aggregate balance check is meaningless (balances
   // never sum across accounts) — per-statement states are above.
-  var cov = await App.receiptCoverageFor(mTxns);
-  var rules = await sAll('householdRules');
   html += '<h2>Evidence quality</h2><div class="card"><table class="kv">' +
-    '<tr><th>Transactions</th><td>' + mTxns.length + ' across ' + contributors.length + ' statement' + (contributors.length === 1 ? '' : 's') + '</td></tr>' +
-    '<tr><th>Receipt coverage</th><td>' + Math.round(cov.ratio * 100) + '% of ' + esc(fmtPeriod(month)) + ' purchases (' + spendAbs(cov.matchedMinor) + ' / ' + spendAbs(cov.grossMinor) + ')</td></tr>' +
-    '<tr><th>Household rules</th><td>' + rules.length + ' (' + rules.filter(function (r) { return r.enabled !== false; }).length + ' active)</td></tr>' +
-    '<tr><th>Unresolved</th><td>' + reviewN + '</td></tr>' +
+    '<tr><th>Transactions</th><td>' + ctx.mTxns.length + ' across ' + ctx.contributors.length + ' statement' + (ctx.contributors.length === 1 ? '' : 's') + '</td></tr>' +
+    '<tr><th>Receipt coverage</th><td>' + Math.round(ctx.cov.ratio * 100) + '% of ' + esc(fmtPeriod(month)) + ' purchases (' + spendAbs(ctx.cov.matchedMinor) + ' / ' + spendAbs(ctx.cov.grossMinor) + ')</td></tr>' +
+    '<tr><th>Household rules</th><td>' + ctx.rules.length + ' (' + ctx.rules.filter(function (r) { return r.enabled !== false; }).length + ' active)</td></tr>' +
+    '<tr><th>Unresolved</th><td>' + ctx.reviewN + '</td></tr>' +
     '<tr><th>Balance check</th><td>n/a (per-account above)</td></tr>' +
     '</table></div>';
 
-  // Trends, biggest movers, budgets summary — month-scoped.
+  // Trends, biggest movers — month-scoped.
   html += await App.trendsHtml(month);
   html += await App.moversHtml(month);
-  html += await App.budgetSummaryHtml(month);
 
   // Full deterministic briefing text (month-scoped facts).
-  var briefingText = '';
-  try { briefingText = facts ? Engine.renderBriefingText(facts) : ''; } catch (e) { briefingText = ''; }
-  if (briefingText) {
-    html += '<details class="more"><summary>Full briefing text</summary><pre class="brief">' + esc(briefingText) + '</pre>';
+  if (ctx.briefingText) {
+    html += '<details class="more"><summary>Full briefing text</summary><pre class="brief">' + esc(ctx.briefingText) + '</pre>';
     if (typeof LLM !== 'undefined' && LLM.isActive()) {
-      html += '<div style="margin-top:8px"><button class="btn ghost smallbtn" data-action="llm-rephrase-briefing">Rephrase with AI</button> <span class="tiny">Rewords only — the facts stay on this device.</span></div>';
+      html += '<div style="margin-top:8px"><button class="btn ghost smallbtn" data-action="llm-rephrase-briefing">Rephrase with AI</button> <span class="tiny">Rewords only \u2014 the facts stay on this device.</span></div>';
       App._lastBriefing = {
-        briefing: { text: briefingText, facts: facts },
-        st: { periodLabel: month, scopeLabel: 'All accounts · ' + fmtPeriod(month) },
+        briefing: { text: ctx.briefingText, facts: facts },
+        st: { periodLabel: month, scopeLabel: 'All accounts \u00b7 ' + fmtPeriod(month) },
         recon: recon
       };
     }
     html += '</details><div id="llm-preview"></div>';
   }
+  return html;
+};
+
+App.vHome = async function (v, seq) {
+  var ctx = await App.monthContext();
+  if (!ctx) {
+    App.show(v, seq, '<h1>Home</h1><div class="empty">Nothing here yet \u2014 import a statement to get your first briefing.<br><br>' +
+      '<button class="btn" data-action="tab" data-tab="add">Add a statement</button></div>');
+    return;
+  }
+  var html = '<h1>Home</h1>' + App.monthNavHtml(ctx) + App.headlineHtml(ctx);
+  html += App.homeReviewHtml(ctx);
+  html += await App.homeAskHtml();
+  html += await App.homePlanHtml(ctx);
+  html += '<details class="more"><summary>Month details</summary>' +
+    await App.monthDetailsHtml(ctx) + '</details>';
   App.show(v, seq, html);
   // Hand-rolled trend chart: draw after the canvas is in the DOM.
   if (seq === App._renderSeq && typeof document !== 'undefined') {
@@ -3359,6 +3439,10 @@ App.vMonth = async function (v, seq) {
     if (c) App.drawTrends(c, App._trendData || []);
   }
 };
+
+/** Legacy route name: the old Month tab now renders the Home summary. */
+App.vMonth = App.vHome;
+
 
 
 /** Find a txn id for a driver category (V8: categoryTotals keys are
@@ -3399,14 +3483,10 @@ App.Actions.wrong = function (d) {
   App.go('statement', { sfilter: d.filter || 'review', txnId: null });
 };
 
-/* ============================================================================
- * Screen 6 — Ask
- * Deterministic answers from ledger facts only. No LLM in Gate 1.
- * Free text is keyword-matched to the 6 priority questions; anything else
- * gets an honest "I can't answer that from your ledger yet."
- * The "AI phrasing (BYO key)" toggle is a labeled stub with a pre-send
- * scope preview — nothing leaves the device.
- * ========================================================================== */
+/* Ask lives on the Home tab now (one-line box + "What can I ask?" details).
+ * The optional AI phrasing settings moved to More > AI phrasing. The
+ * QUESTIONS list, answerHtml/buildAnswer/matchQuestion, and the
+ * 'ask-chip' / 'ask-submit' actions below still power the Home ask box. */
 
 var QUESTIONS = [
   { id: 'q-spend',     label: 'Actual spend after refunds?', keys: ['spend', 'total', 'much', 'net', 'actually'] },
@@ -3416,33 +3496,6 @@ var QUESTIONS = [
   { id: 'q-move',      label: 'Payments, transfers, fees?',  keys: ['payment', 'transfer', 'fee', 'duplicate', 'cash'] },
   { id: 'q-uncertain', label: 'What remains uncertain?',     keys: ['uncertain', 'unsure', 'unknown', 'review', 'missing', 'left'] }
 ];
-
-App.vAsk = async function (v, seq) {
-  var html = '<h1>Ask</h1>';
-  html += '<p class="small">Answers are computed <strong>only</strong> from your on-device ledger. Optional AI phrasing (below) only rewords them — it never recomputes and never sees raw data without your per-call approval.</p>';
-  html += '<div>';
-  QUESTIONS.forEach(function (q) {
-    html += '<button class="chip' + (App.state.askQ === q.id ? ' on' : '') + '" data-action="ask-chip" data-q="' + q.id + '">' + esc(q.label) + '</button>';
-  });
-  html += '</div>';
-
-  if (App.state.askQ) html += await App.answerHtml(App.state.askQ);
-  else if (App.state.askText) html += await App.answerHtml('__free__');
-
-  html += '<div class="card"><h3 style="margin-top:0">Ask in your own words</h3>' +
-    '<input type="text" id="ask-free" placeholder="e.g. why did groceries rise?" value="' + esc(App.state.askText || '') + '" autocomplete="off">' +
-    '<button class="btn" data-action="ask-submit">Ask</button>' +
-    '<p class="tiny">Free text is matched by keyword to one of the questions above. Anything else gets an honest “I can’t answer that yet”.</p></div>';
-
-  // Optional AI phrasing (BYO key): rewords — never recomputes — the
-  // deterministic answer. Off by default; nothing leaves the device
-  // until you approve the exact payload, every time.
-  html += '<div class="card"><h3 style="margin-top:0">AI phrasing <span class="pill dim">optional · bring your own key</span></h3>' +
-    '<p class="small">Rephrases the deterministic answer above in plainer words. The facts are computed on this device and never change.</p>' +
-    App.llmSettingsHtml() + '</div>';
-
-  App.show(v, seq, html);
-};
 
 App.Actions['ask-chip'] = function (d) { App.state.askQ = d.q; App.state.askText = ''; App.render(); };
 App.Actions['ask-submit'] = function () {
@@ -3822,6 +3875,7 @@ App.vMore = async function (v, seq) {
   if (m === 'rules') return App.vRules(v, seq);
   if (m === 'privacy') return App.vPrivacy(v, seq);
   if (m === 'accounts') return App.vAccounts(v, seq);
+  if (m === 'ai') return App.vAi(v, seq);
   var rules = await sAll('householdRules');
   var active = rules.filter(function (r) { return r.enabled !== false; }).length;
   var accounts = await sAll('accounts');
@@ -3848,9 +3902,31 @@ App.vMore = async function (v, seq) {
     '<div class="card"><h3 style="margin:0 0 6px">Privacy &amp; data</h3>' +
     '<p class="small"><strong>Your data stays on this device.</strong> The only network use is optional AI phrasing, which you preview and approve per call. Export or delete any time.</p>' +
     '<button class="btn ghost" data-action="goto" data-tab="more" data-more="privacy">Privacy, export &amp; delete</button></div>' +
+    '<div class="card"><div class="section-head"><h3 style="margin:0">AI phrasing</h3><span class="pill ' + (App.llmOn() ? 'ok' : 'dim') + '">' + (App.llmOn() ? 'on' : 'off') + '</span></div>' +
+    '<p class="small">Optional. Rewords an answer in plainer language — the numbers are still computed on this device and never change. Off by default; every send needs your approval.</p>' +
+    '<button class="btn ghost" data-action="goto" data-tab="more" data-more="ai">AI phrasing settings</button></div>' +
     '<div class="card"><h3 style="margin:0 0 6px">Take the tour again</h3>' +
     '<p class="small">Replay the 3-step first-run walkthrough.</p>' +
     '<button class="btn ghost" data-action="onboard-replay">Replay tour</button></div>');
+};
+
+/** Whether optional AI phrasing is currently enabled (BYO key, off by default). */
+App.llmOn = function () {
+  try { return typeof LLM !== 'undefined' && !!LLM.getSettings().enabled; }
+  catch (e) { return false; }
+};
+
+/** More > AI phrasing: the optional BYO-key rewording settings. Off by
+ *  default; nothing leaves the device until the user previews and approves
+ *  the exact payload, every time. */
+App.vAi = async function (v, seq) {
+  var html = '<button class="linklike" data-action="back-more">\u2190 More</button><h1>AI phrasing</h1>' +
+    '<div class="card"><p class="small" style="margin-top:0">Rephrases an answer in plainer words. ' +
+    'The numbers are always computed on this device first and never change. ' +
+    '<strong>Off by default</strong> \u2014 nothing leaves this device until you preview and approve ' +
+    'the exact provider, model, privacy mode, and payload, every time. Your key is kept in memory only and forgotten when the app closes.</p>' +
+    App.llmSettingsHtml() + '</div>';
+  App.show(v, seq, html);
 };
 
 App.vAccounts = async function (v, seq) {
@@ -3977,11 +4053,11 @@ App.insertSampleData = async function (data) {
 
 App.Actions['sample-add'] = async function () {
   var txns0 = await sAll('txns');
-  if (txns0.some(function (t) { return t && t.sampleBatch === 'v2-sample'; })) { App.go('month'); return; }
+  if (txns0.some(function (t) { return t && t.sampleBatch === 'v2-sample'; })) { App.go('home'); return; }
   var n = await App.insertSampleData(Engine.sampleData(42));
   audit('sample.created', 'ledger', null, { seed: 42, batch: 'v2-sample', statements: n.statements, txns: n.txns });
   App.bumpDataRev();
-  App.go('month');
+  App.go('home');
 };
 
 App.Actions['sample-remove'] = async function (d, el) {
@@ -4014,9 +4090,9 @@ var ONBOARD_STEPS = [
   { title: 'Add a statement',
     body: 'Import a CSV or PDF bank statement. Everything is read on this device — nothing is ever uploaded.' },
   { title: 'See your month',
-    body: 'Your spending explained with evidence. Every claim links back to the transactions behind it.' },
+    body: 'Your spending explained with evidence, on the Home tab. Every claim links back to the transactions behind it.' },
   { title: 'Ask anything',
-    body: 'Ask “Where did my money go?” and get answers with cited transactions — all computed on-device.' }
+    body: 'Ask “Where did my money go?” in the Home ask box and get answers with cited transactions — all computed on-device.' }
 ];
 
 /** First-run hook: show the tour when there are no statements and it was never finished/skipped. */
@@ -4231,7 +4307,7 @@ App.Actions['wipe-go'] = async function () {
 };
 
 /* ============================================================================
- * Plan tab (Phase 2): budgets, goals, subscriptions
+ * Plan view (Phase 2): budgets, goals, subscriptions — opened from Home
  * ----------------------------------------------------------------------------
  * All money inputs go through App.parseDollarsToMinor — strict, integer-only:
  * an optional "$", 1-9 digits, optional .NN cents. Commas are NOT accepted
@@ -4304,7 +4380,7 @@ function prevMonthOf(ym) {
 }
 
 /** Default month for budget views: the latest statement's periodEnd month,
- * else the current calendar month. Shared by the Plan tab and the Month
+ * else the current calendar month. Shared by the Plan view and Home
  * view's budget summary card. */
 App.defaultBudgetMonth = function (stmts) {
   var curMonth = planCurrentMonth();
