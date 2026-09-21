@@ -1859,6 +1859,39 @@ App.commitPipeline = async function (pipe) {
       break; // one suggested original per refund
     }
   }
+  // Cross-statement: a refund with no in-statement match may return a purchase
+  // from an earlier statement. Match the most recent eligible purchase
+  // (same merchant, matching amount, purchase on/before refund). One link per
+  // refund; never re-link a refund that already has one.
+  var alreadyLinked = {};
+  (await sAll('refundLinks')).forEach(function (l) { alreadyLinked[String(l.refundTxnId)] = 1; });
+  var priorTxns = await sAll('txns'); // this statement's rows are stored by now
+  for (var r2 = 0; r2 < refunds.length; r2++) {
+    var rid2 = rowToId[refunds[r2]];
+    if (alreadyLinked[String(rid2)]) continue;
+    var rt2 = pipe.txns[refunds[r2]];
+    var rk2 = merchKey(rt2.merchantRaw || rt2.rawDescription);
+    var ra2 = Math.abs(rt2.amountMinor || 0);
+    var best = null;
+    for (var p2 = 0; p2 < priorTxns.length; p2++) {
+      var pt2 = priorTxns[p2];
+      if (String(pt2.statementId) === String(statementId)) continue; // other statements only
+      if (pt2.kind !== 'purchase' && pt2.kind !== 'cash_advance') continue;
+      if (pt2.excluded) continue;
+      if (pt2.status === 'duplicate') continue;
+      if (merchKey(pt2.merchantRaw || pt2.rawDescription) !== rk2) continue;
+      if (Math.abs(Math.abs(pt2.amountMinor || 0) - ra2) > 1) continue;
+      if (rt2.date && pt2.date && rt2.date < pt2.date) continue;
+      if (!best || String(pt2.date || '') > String(best.date || '')) best = pt2;
+    }
+    if (best) {
+      await Store.put('refundLinks', {
+        statementId: statementId, refundTxnId: rid2, purchaseTxnId: best.id,
+        basis: 'same merchant + matching amount (earlier statement)', status: 'suggested', createdAt: now
+      });
+    }
+    if (r2 % 20 === 0) await tick();
+  }
 
   // Briefing (V9: factsJson per schema; facts/text kept for direct use).
   await Store.put('briefings', {
@@ -3009,9 +3042,13 @@ App.trendsHtml = async function (monthAnchor) {
     ? monthAnchor : App.defaultBudgetMonth(stmts);
   var windowMonths = lastNMonths(anchor, 6);
   var monthly = [];
-  try { monthly = Engine.monthlyNetSpend(await sAll('txns')) || []; } catch (e) { monthly = []; }
+  try { monthly = Engine.monthlyNetSpend(await sAll('txns'), await sAll('refundLinks')) || []; } catch (e) { monthly = []; }
   var byMonth = {};
-  monthly.forEach(function (r) { byMonth[r.month] = r.netMinor; });
+  var anyReturnAdj = false;
+  monthly.forEach(function (r) {
+    byMonth[r.month] = r.netMinor;
+    if (r.returnAdjMinor) anyReturnAdj = true;
+  });
   var present = 0;
   var data = windowMonths.map(function (m) {
     if (byMonth[m] !== undefined) present++;
@@ -3025,7 +3062,8 @@ App.trendsHtml = async function (monthAnchor) {
   }
   return html + '<div class="card"><canvas id="trend-canvas" width="680" height="240" ' +
     'style="width:100%;display:block" role="img" aria-label="Net spend per month, last 6 months"></canvas>' +
-    '<p class="tiny" style="margin:8px 0 0">Net spend per month (after refunds), magnitudes.</p></div>';
+    '<p class="tiny" style="margin:8px 0 0">Net spend per month (after refunds), magnitudes.' +
+    (anyReturnAdj ? ' Returns are attributed to the month of the original purchase.' : '') + '</p></div>';
 };
 
 /** Hand-rolled bar chart for monthly net spend. No dependencies: scales by
@@ -3257,6 +3295,17 @@ App.monthContext = async function () {
   var recon = null;
   try { recon = Engine.reconcile(mTxns, null); } catch (e) { recon = null; }
   if (!recon) recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'no_baseline', gapMinor: 0 };
+  // Return-adjusted headline: refunds linked to purchases in other months are
+  // attributed to the purchase's month, so the month you bought something
+  // shows the true net. Components (gross/refunds) stay factual as-received.
+  try {
+    var retAdj = Engine.returnAdjustment(txns, await sAll('refundLinks'), month);
+    if (retAdj) {
+      recon.netSpendMinor += retAdj.deltaMinor;
+      recon.returnAdjMinor = retAdj.movedMinor; // <= 0: returns attributed INTO this month
+      recon.returnOutMinor = retAdj.deltaMinor - retAdj.movedMinor; // >= 0: refunds moved OUT
+    }
+  } catch (e) { /* keep the unadjusted headline */ }
 
   // Contributors: statements with transactions dated in this month.
   var byStmt = {};
@@ -3347,9 +3396,19 @@ App.monthNavHtml = function (ctx) {
 
 /** Headline card: net spend after refunds + the Engine's first line. */
 App.headlineHtml = function (ctx) {
+  var retNote = '';
+  if (ctx.recon.returnAdjMinor) {
+    retNote += '<p class="tiny" style="margin-bottom:0">Includes ' + spendAbs(ctx.recon.returnAdjMinor) +
+      ' in returns attributed to the month of the original purchase.</p>';
+  }
+  if (ctx.recon.returnOutMinor) {
+    retNote += '<p class="tiny" style="margin-bottom:0">Excludes ' + spendAbs(ctx.recon.returnOutMinor) +
+      ' in refunds matched to earlier purchases (counted in those months).</p>';
+  }
   return '<div class="card"><div class="headline-label">Net spend after refunds</div>' +
     '<div class="headline-num">' + spendAbs(ctx.recon.netSpendMinor) + '</div>' +
-    '<p class="small" style="margin-bottom:0">' + esc(ctx.headline || ('Across ' + ctx.mTxns.length + ' transactions in ' + fmtPeriod(ctx.month) + ', all accounts.')) + '</p></div>';
+    '<p class="small" style="margin-bottom:0">' + esc(ctx.headline || ('Across ' + ctx.mTxns.length + ' transactions in ' + fmtPeriod(ctx.month) + ', all accounts.')) + '</p>' +
+    retNote + '</div>';
 };
 
 /** Review nudge: one card when something needs a human look, else a quiet

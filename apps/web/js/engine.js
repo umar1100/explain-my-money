@@ -707,12 +707,20 @@
   };
 
   /**
-   * Engine.monthlyNetSpend(txns) -> [{month 'YYYY-MM', netMinor}, ...] oldest -> newest.
+   * Engine.monthlyNetSpend(txns, links) -> [{month 'YYYY-MM', netMinor,
+   *   returnAdjMinor}, ...] oldest -> newest.
    * Groups txns by calendar month (valid ISO dates only) and reports each
    * month's net spend = Engine.reconcile(monthTxns, null).netSpendMinor
    * (signed minor units; the app displays magnitudes).
+   * links (optional): refund-link rows {refundTxnId, purchaseTxnId, status}.
+   * A refund linked to a purchase in a DIFFERENT month is attributed to the
+   * purchase's month (return-adjusted spend: the month you bought it shows
+   * the true net). Same-month links change nothing. Rejected links are
+   * ignored. returnAdjMinor is the signed total of returns attributed INTO
+   * that month (negative = returns reduced this month's net), 0 when no
+   * link moved anything. Pure: txns and links are never mutated.
    */
-  Engine.monthlyNetSpend = function (txns) {
+  Engine.monthlyNetSpend = function (txns, links) {
     var byMonth = {};
     txns = txns || [];
     for (var i = 0; i < txns.length; i++) {
@@ -724,14 +732,80 @@
       if (!byMonth[key]) byMonth[key] = [];
       byMonth[key].push(t);
     }
+    var intoAdj = {};
+    var moves = Engine.refundMoves(txns, links);
+    for (var v = 0; v < moves.length; v++) {
+      var mv = moves[v];
+      if (!byMonth[mv.fromMonth] || !byMonth[mv.toMonth]) continue;
+      var idx = byMonth[mv.fromMonth].indexOf(mv.refund);
+      if (idx === -1) continue;
+      byMonth[mv.fromMonth].splice(idx, 1);
+      byMonth[mv.toMonth].push(mv.refund);
+      intoAdj[mv.toMonth] = (intoAdj[mv.toMonth] || 0) + mv.amountMinor;
+    }
     var months = Object.keys(byMonth).sort();
     var out = [];
     for (var k = 0; k < months.length; k++) {
       var rec = null;
       try { rec = Engine.reconcile(byMonth[months[k]], null); } catch (e) { rec = null; }
-      out.push({ month: months[k], netMinor: rec ? rec.netSpendMinor : 0 });
+      out.push({ month: months[k], netMinor: rec ? rec.netSpendMinor : 0,
+                 returnAdjMinor: intoAdj[months[k]] || 0 });
     }
     return out;
+  };
+
+  /**
+   * Engine.refundMoves(txns, links) -> [{refund, fromMonth, toMonth,
+   *   amountMinor}]. Pure helper behind return-adjusted monthly spend: for
+   * each refund link whose refund and purchase fall in different calendar
+   * months, the refund's signed amount (refunds are negative) moves from the
+   * refund's month to the purchase's month. Rejected links and same-month
+   * links produce no move.
+   */
+  Engine.refundMoves = function (txns, links) {
+    var byId = {};
+    (txns || []).forEach(function (t) {
+      if (t && t.id !== null && t.id !== undefined) byId[String(t.id)] = t;
+    });
+    var moves = [];
+    (links || []).forEach(function (l) {
+      if (!l || l.status === 'rejected') return;
+      var rf = byId[String(l.refundTxnId)], pu = byId[String(l.purchaseTxnId)];
+      if (!rf || !pu || rf.kind !== 'refund') return;
+      var rm = Engine._monthOf(rf.date), pm = Engine._monthOf(pu.date);
+      if (!rm || !pm || rm === pm) return;
+      moves.push({ refund: rf, fromMonth: rm, toMonth: pm,
+                   amountMinor: rf.amountMinor || 0 });
+    });
+    return moves;
+  };
+
+  /** 'YYYY-MM-DD' -> 'YYYY-MM', else null. */
+  Engine._monthOf = function (dateStr) {
+    var m = /^(\d{4}-\d{2})-\d{2}$/.exec(String(dateStr || ''));
+    return m ? m[1] : null;
+  };
+
+  /**
+   * Engine.returnAdjustment(txns, links, month) -> {deltaMinor, movedMinor,
+   *   linkCount} | null. The signed delta to ADD to a month's reconcile()
+   * net so returns are attributed to the month of the original purchase:
+   * refunds received in `month` for earlier purchases move out (net rises),
+   * refunds received later for `month`'s purchases move in (net falls).
+   * movedMinor is the signed total attributed INTO the month (for labeling);
+   * null when no link affects the month. Pure.
+   */
+  Engine.returnAdjustment = function (txns, links, month) {
+    if (!/^\d{4}-\d{2}$/.test(String(month || ''))) return null;
+    var moves = Engine.refundMoves(txns, links);
+    var delta = 0, movedIn = 0, n = 0;
+    for (var i = 0; i < moves.length; i++) {
+      var mv = moves[i];
+      if (mv.fromMonth === month) { delta -= mv.amountMinor; n++; }
+      else if (mv.toMonth === month) { delta += mv.amountMinor; movedIn += mv.amountMinor; n++; }
+    }
+    if (!n) return null;
+    return { deltaMinor: delta, movedMinor: movedIn, linkCount: n };
   };
 
   /* ================================================================== */
@@ -1360,7 +1434,7 @@
   Engine.categoryKeywordRules = [
     // --- specific keys that must beat a generic rule below ---
     { category: 'transport', confidence: 0.95, keywords: ['COSTCO GAS', 'COSTCO FUEL', 'CANADIAN TIRE GAS', 'GO TRANSIT', 'PRESTO CARD', 'GREEN P PARKING', 'VIA RAIL'] },
-    { category: 'groceries', confidence: 0.92, keywords: ['LOBLAWS', 'REAL CANADIAN SUPERSTORE', 'REAL CANADIAN', 'SUPERSTORE', 'NO FRILLS', 'NOFRILLS', 'SOBEYS', 'FRESHCO', 'FOOD BASICS', 'LONGOS', 'FORTINOS', 'FARM BOY', 'SAVE-ON-FOODS', 'SAVE ON FOODS', 'SAFEWAY', 'MARCHE ADONIS', 'T&T SUPERMARKET', 'H MART', 'COSTCO WHOLESALE'] },
+    { category: 'groceries', confidence: 0.92, keywords: ['LOBLAWS', 'REAL CANADIAN SUPERSTORE', 'REAL CANADIAN', 'SUPERSTORE', 'NO FRILLS', 'NOFRILLS', 'NOFR', 'SOBEYS', 'FRESHCO', 'FOOD BASICS', 'LONGOS', 'FORTINOS', 'FARM BOY', 'SAVE-ON-FOODS', 'SAVE ON FOODS', 'SAFEWAY', 'MARCHE ADONIS', 'T&T SUPERMARKET', 'H MART', 'COSTCO WHOLESALE'] },
     { category: 'dining', confidence: 0.92, keywords: ['TIM HORTONS', 'MCDONALD', 'KFC', 'POPEYES', 'SKIPTHEDISHES', 'SKIP THE DISHES', 'DOORDASH', 'UBER EATS', 'PIZZA PIZZA', 'THE KEG', 'STEAKHOUSE', 'HARVEYS', 'WENDY', 'SUBWAY', 'STARBUCKS', 'SECOND CUP', 'SUSHI', 'ICE CREAM', 'RESTAURANT', 'FOOD COURT', 'PIZZERIA', 'COFFEE', 'CAFE'] },
     { category: 'health_pharmacy', confidence: 0.92, keywords: ['SHOPPERS DRUG', 'DRUG MART', 'SHOPPERS', 'REXALL', 'PHARMAPRIX', 'JEAN COUTU', 'PHARMACY', 'LIFE LABS', 'LIFELABS', 'DENTAL', 'OPTICAL', 'PHYSIO', 'WALK-IN CLINIC', 'MEDICAL CENTRE'] },
     { category: 'subscriptions', confidence: 0.92, keywords: ['NETFLIX', 'SPOTIFY', 'DISNEY+', 'AMAZON PRIME', 'PRIME VIDEO', 'YOUTUBE PREMIUM', 'APPLE.COM/BILL', 'GOOGLE ONE', 'DROPBOX', 'ICLOUD', 'MICROSOFT 365', 'ROGERS WIRELESS', 'ROGERS', 'BELL MOBILITY', 'TELUS', 'KOODO', 'FREEDOM MOBILE', 'FIDO', 'VIRGIN MOBILE', 'GOODLIFE FITNESS', 'GOODLIFE', 'FITNESS'] },
