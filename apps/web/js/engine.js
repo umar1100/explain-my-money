@@ -655,6 +655,11 @@
    *               = grossPurchasesMinor - refundsTotalMinor
    * where refundsTotalMinor is the POSITIVE display magnitude of refunds.
    *
+   * EXCLUDED ROWS (user-excluded or marked duplicate) never count toward
+   * spend: they are skipped for grossPurchasesMinor/refundsTotalMinor/
+   * netSpendMinor. They are real printed rows, so they still feed
+   * excludedTotalMinor and the balance-check signed sum.
+   *
    * BALANCE CHECK (corrected card-account equation, mirrors
    * backend/engine/reconcile.py):
    *   reported.endMinor - reported.startMinor == SUM(signedAmountMinor)
@@ -701,8 +706,12 @@
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
       var amt = (r.amountMinor === null || r.amountMinor === undefined) ? 0 : r.amountMinor;
-      if (r.kind === 'purchase') gross += amt;
-      else if (r.kind === 'refund') { refundSigned += amt; refundCount++; }
+      // Excluded rows (user-excluded, duplicates) never count toward spend.
+      var isX = r.excluded === 1 || r.status === 'duplicate';
+      if (!isX) {
+        if (r.kind === 'purchase') gross += amt;
+        else if (r.kind === 'refund') { refundSigned += amt; refundCount++; }
+      }
       if (r.excluded === 1) excludedTotal += amt;
       if (rowNeedsReview(r)) unresolved++;
       var samt = r.signedAmountMinor;
@@ -797,6 +806,10 @@
       if (!l || l.status === 'rejected') return;
       var rf = byId[String(l.refundTxnId)], pu = byId[String(l.purchaseTxnId)];
       if (!rf || !pu || rf.kind !== 'refund') return;
+      // An excluded/duplicate leg makes the return unattributable: excluded
+      // rows are invisible to spend math, so the move must not happen.
+      if (rf.excluded === 1 || pu.excluded === 1 ||
+          rf.status === 'duplicate' || pu.status === 'duplicate') return;
       var rm = Engine._monthOf(rf.date), pm = Engine._monthOf(pu.date);
       if (!rm || !pm || rm === pm) return;
       moves.push({ refund: rf, purchase: pu, fromMonth: rm, toMonth: pm,
@@ -858,6 +871,8 @@
       var ex = expanded[i], r = ex.txn;
       if (!r) continue;
       if (r.kind !== 'purchase' && r.kind !== 'refund') continue;
+      // Excluded/duplicate rows never count toward category totals either.
+      if (r.excluded === 1 || r.status === 'duplicate') continue;
       var key = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(r);
       var amt;
       if (ex.fromSplit) {
@@ -873,6 +888,39 @@
     }
     return { totals: totals, counts: counts };
   }
+
+  /** Category key for one row: its category, else its merchant name, else
+   *  'Uncategorized'. Exposed so the Home drill-down matches rows to the
+   *  exact keys totalsByCategory produced. */
+  Engine.categoryKeyFor = categoryKeyFor;
+  /** Exposed for tests and the Home drill-down consistency checks. */
+  Engine.totalsByCategory = totalsByCategory;
+
+  /**
+   * Engine.categoryMembers(rows, key) -> [{txn, shareMinor}].
+   * Split-aware drill-down behind "Where it went": every purchase/refund row
+   * contributing to the categoryTotals `key`, with its signed share of that
+   * total (same sign convention as totalsByCategory). Excluded/duplicate rows
+   * never count, mirroring totalsByCategory. Pure.
+   */
+  Engine.categoryMembers = function (rows, key) {
+    var out = [];
+    var expanded = Engine.expandSplits(rows || []);
+    for (var i = 0; i < expanded.length; i++) {
+      var ex = expanded[i], r = ex.txn;
+      if (!r) continue;
+      if (r.kind !== 'purchase' && r.kind !== 'refund') continue;
+      if (r.excluded === 1 || r.status === 'duplicate') continue;
+      var k = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(r);
+      if (k !== key) continue;
+      var tAmt = (r.amountMinor === null || r.amountMinor === undefined) ? 0 : r.amountMinor;
+      var share = ex.fromSplit
+        ? (tAmt < 0 ? -(ex.amountMinor || 0) : (ex.amountMinor || 0))
+        : tAmt;
+      out.push({ txn: r, shareMinor: share });
+    }
+    return out;
+  };
 
   /**
    * Engine.buildBriefing(rows, periodStart, periodEnd, prevRows=null, scopeLabel='', reported=null)

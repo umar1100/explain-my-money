@@ -366,7 +366,9 @@ var App = {
     month: null,           // month tab focus 'YYYY-MM' (default: latest month with transactions)
     budgetEditId: null,    // budget id being edited (form prefill)
     goalEditId: null,      // goal id being edited (form prefill)
-    planMsg: ''            // one-shot notice shown at the top of the Plan tab
+    planMsg: '',           // one-shot notice shown at the top of the Plan tab
+    homeCat: null,         // Home "Where it went" drill-down category key
+    txnRet: null           // txn detail return route ('homecat' or null)
   },
   categories: [],          // seeded from Engine.defaultCategories()
   ready: false,
@@ -380,7 +382,7 @@ var TAB_TITLES = { home: 'Home', activity: 'Activity', add: 'Add', more: 'More' 
  * inside Activity, 'month' renders the Home summary, 'plan' is opened from
  * the Home plan-highlights card, 'ask' is folded into Home. The mapping
  * below keeps the right bottom tab highlighted for each internal route. */
-var TAB_HIGHLIGHT = { statement: 'activity', month: 'home', plan: 'home', ask: 'home' };
+var TAB_HIGHLIGHT = { statement: 'activity', month: 'home', plan: 'home', ask: 'home', homecat: 'home' };
 function tabHighlight(t) { return TAB_HIGHLIGHT[t] || t; }
 
 /** Natural-key preference read: null when unset. (ES2019: no ??, use ternary.) */
@@ -467,6 +469,8 @@ App.go = function (tab, params) {
   if (params.statementId !== undefined) App.state.statementId = params.statementId;
   if (params.sfilter) App.state.sfilter = params.sfilter;
   if (params.txnId !== undefined) App.state.txnId = params.txnId;
+  if (params.homeCat !== undefined) App.state.homeCat = params.homeCat;
+  if (params.txnRet !== undefined) App.state.txnRet = params.txnRet;
   if (params.more) App.state.more = params.more;
   if (params.month) App.state.month = params.month;
   if (params.askQ !== undefined) { App.state.askQ = params.askQ; App.state.askText = params.askText || ''; }
@@ -494,6 +498,7 @@ App.render = function () {
   else if (s.tab === 'month') App.vHome(v, seq);
   else if (s.tab === 'plan') App.vPlan(v, seq);
   else if (s.tab === 'ask') App.vHome(v, seq); // Ask is folded into Home
+  else if (s.tab === 'homecat') App.vHomeCat(v, seq); // Home category drill-down
   else App.vHome(v, seq);
   App.renderOnboarding(); // fixed overlay; no-op unless App.state.onboardStep set
 };
@@ -542,8 +547,13 @@ App.Actions['goto'] = function (d) {
                   month: d.month || undefined,
                   more: d.more || undefined });
 };
-App.Actions['open-txn'] = function (d) { App.go('statement', { txnId: d.id }); };
-App.Actions['txn-back'] = function () { App.go('statement', { txnId: null }); };
+App.Actions['open-txn'] = function (d) { App.go('statement', { txnId: d.id, txnRet: d.ret || null }); };
+App.Actions['txn-back'] = function () {
+  var ret = App.state.txnRet;
+  App.state.txnRet = null;
+  if (ret === 'homecat') App.go('homecat', { txnId: null });
+  else App.go('statement', { txnId: null });
+};
 App.Actions['back-more'] = function () { App.go('more', { more: 'menu' }); };
 
 /* ============================================================================
@@ -1712,11 +1722,16 @@ App.stageReconcile = async function (pipe) {
   catch (e) {
     // Last-resort local math mirroring the Engine's corrected card-account
     // equation: (reported_end - reported_start) == SUM(signedAmountMinor).
+    // Mirrors Engine.reconcile: excluded/duplicate rows never count toward
+    // spend, but still feed the excluded total and the balance-check sum.
     var g = 0, rfSigned = 0, rfCount = 0, ex = 0, un = 0, sSum = 0, sKnown = true;
     pipe.txns.forEach(function (t) {
       var amt = (t.amountMinor === null || t.amountMinor === undefined) ? 0 : t.amountMinor;
-      if (t.kind === 'purchase') g += amt;
-      else if (t.kind === 'refund') { rfSigned += amt; rfCount++; }
+      var isX = t.excluded === 1 || t.status === 'duplicate';
+      if (!isX) {
+        if (t.kind === 'purchase') g += amt;
+        else if (t.kind === 'refund') { rfSigned += amt; rfCount++; }
+      }
       if (t.excluded === 1) ex += amt;
       if (App.needsReview(t)) un++;
       if (t.signedAmountMinor === null || t.signedAmountMinor === undefined) sKnown = false;
@@ -2390,18 +2405,19 @@ App.vStatement = async function (v, seq) {
     html += '<p class="small">' + esc(st.scopeLabel || st.periodLabel || '') + ' · ' + txns.length + ' transactions</p>';
   }
 
-  // Reconciliation strip: gross − refunds − exclusions = net (the Engine sums
-  // SIGNED minor units; we display labeled magnitudes so "net spend" never
-  // reads as a negative). When the statement carries reported balances (PDF
-  // imports), the strip proves the rows add up to them.
+  // Reconciliation strip: gross − refunds = net (the Engine sums SIGNED minor
+  // units; we display labeled magnitudes so "net spend" never reads as a
+  // negative). Excluded rows never enter gross, so they are an informational
+  // note, not a subtraction line. When the statement carries reported
+  // balances (PDF imports), the strip proves the rows add up to them.
   html += '<div class="strip" role="region" aria-label="Reconciliation">' +
     '<div class="s-row"><span>Gross purchases</span><span>' + spendAbs(recon.grossPurchasesMinor) + '</span></div>' +
     '<div class="s-row"><span>− Refunds</span><span>' + spendAbs(recon.refundsTotalMinor) + '</span></div>' +
-    '<div class="s-row"><span>− Excluded</span><span>' + spendAbs(recon.excludedTotalMinor) + '</span></div>' +
     '<div class="s-row s-net"><span>Net spend</span><span>' + spendAbs(recon.netSpendMinor) + '</span></div>' +
     '<div class="s-note">' + (recon.unresolvedCount ? recon.unresolvedCount + ' unresolved · ' : '') +
     'balance check: ' + esc(String(recon.balanceCheck)) +
-    (recon.gapMinor ? ' · gap ' + money(recon.gapMinor) : '') + '</div>';
+    (recon.gapMinor ? ' · gap ' + money(recon.gapMinor) : '') +
+    (recon.excludedTotalMinor ? ' · excluded ' + spendAbs(recon.excludedTotalMinor) + ' (not counted)' : '') + '</div>';
   if (stmtReported) {
     html += '<div class="s-note">Reported: ' + money(stmtReported.startMinor) + ' → ' +
       money(stmtReported.endMinor) + ' · rows sum: ' + money(recon.signedRowsSumMinor) + '</div>';
@@ -2552,7 +2568,7 @@ App._moreBtn = function (remaining) {
     remaining + ' remaining)</button>';
 };
 
-App.txnRowHtml = function (t) {
+App.txnRowHtml = function (t, ret) {
   t = nt(t);
   var amt = t.amountMinor;
   var cls = amt > 0 ? 't-amt pos' : 't-amt';
@@ -2565,7 +2581,8 @@ App.txnRowHtml = function (t) {
   if (!t.category && t.lookupHint) pills += ' <span class="pill dim">web suggests: ' + esc(t.lookupHint) + '</span>';
   if (t.excluded && t.status !== 'duplicate') pills += ' <span class="pill dim">excluded</span>';
   if (t.splits && t.splits.length) pills += ' <span class="pill dim">split</span>';
-  return '<button class="txn" data-action="open-txn" data-id="' + esc(t.id) + '">' +
+  return '<button class="txn" data-action="open-txn" data-id="' + esc(t.id) + '"' +
+    (ret ? ' data-ret="' + esc(ret) + '"' : '') + '>' +
     '<span class="t-main"><span class="t-desc">' + esc(t.desc || '(no description)') + '</span><br>' +
     '<span class="t-sub">' + esc(fmtDate(t.date)) + ' · ' + esc(kindLabel(t.kind)) + pills + '</span></span>' +
     '<span class="' + cls + '">' + money(amt) + '</span></button>';
@@ -3383,6 +3400,8 @@ App.monthContext = async function () {
       recon.netSpendMinor += retAdj.deltaMinor;
       recon.returnAdjMinor = retAdj.movedMinor; // <= 0: returns attributed INTO this month
       recon.returnOutMinor = retAdj.deltaMinor - retAdj.movedMinor; // >= 0: refunds moved OUT
+      // The briefing's headline number must agree with the hero: attribute it too.
+      if (facts && typeof facts.netSpendMinor === 'number') facts.netSpendMinor += retAdj.deltaMinor;
     }
   } catch (e) { /* keep the unadjusted headline */ }
   // Cross-month refund moves, computed once: the per-account breakdown below
@@ -3491,24 +3510,44 @@ App.monthNavHtml = function (ctx) {
     '</div><p class="small" style="margin-bottom:0">' + ctx.covNote + ' \u00b7 ' + ctx.mTxns.length + ' transactions</p></div>';
 };
 
+/** Return-attribution-aware refund components for one month's recon.
+ *  outMinor (>=0): refunds received this month but counted in earlier
+ *    purchase months. inMinor (>=0): returns from later months counted here.
+ *  attrRefundsMinor: the refund magnitude actually netted against THIS
+ *    month's spend, so grossPurchasesMinor - attrRefundsMinor always equals
+ *    the (attributed) netSpendMinor. Pure. */
+App.attributedRefunds = function (recon) {
+  var r = recon || {};
+  var outMinor = r.returnOutMinor || 0;
+  var inMinor = -(r.returnAdjMinor || 0);
+  if (outMinor < 0) outMinor = 0;
+  if (inMinor < 0) inMinor = 0;
+  return {
+    outMinor: outMinor,
+    inMinor: inMinor,
+    attrRefundsMinor: (r.refundsTotalMinor || 0) - outMinor + inMinor
+  };
+};
+
 /** Hero card: net spend after refunds for the month, with the gross/refund
  *  build-up and any return-attribution notes, plus the Engine's first line.
  *  The numbers here already include cross-month return attribution; the
- *  per-account breakdown below applies the same rule, so the two agree. */
+ *  per-account breakdown below applies the same rule, so the two agree.
+ *  The build-up always resolves: purchases minus attributed refunds equals
+ *  the headline net. */
 App.headlineHtml = function (ctx) {
   var r = ctx.recon || {};
+  var at = App.attributedRefunds(r);
   var retNote = '';
-  if (r.returnAdjMinor) {
-    retNote += '<p class="tiny" style="margin-bottom:0">Includes ' + spendAbs(r.returnAdjMinor) +
-      ' in returns attributed to the month of the original purchase.</p>';
-  }
-  if (r.returnOutMinor) {
-    retNote += '<p class="tiny" style="margin-bottom:0">Excludes ' + spendAbs(r.returnOutMinor) +
-      ' in refunds matched to earlier purchases (counted in those months).</p>';
+  if (at.outMinor || at.inMinor) {
+    retNote = '<p class="tiny" style="margin-bottom:0">Returns are counted in the month of the original purchase' +
+      (at.outMinor ? ': ' + spendAbs(at.outMinor) + ' of this month\u2019s refunds belong to earlier months' : '') +
+      (at.inMinor ? (at.outMinor ? ' \u00b7 ' : ': ') + spendAbs(at.inMinor) + ' from later returns counted here' : '') +
+      '.</p>';
   }
   var buildup = '<span>' + spendAbs(r.grossPurchasesMinor) + ' purchases</span>';
-  if ((r.refundCount || 0) > 0) {
-    buildup += ' <span aria-hidden="true">&minus;</span> <span>' + spendAbs(r.refundsTotalMinor) + ' refunds</span>';
+  if ((r.refundsTotalMinor || 0) > 0 || at.outMinor || at.inMinor) {
+    buildup += ' <span aria-hidden="true">&minus;</span> <span>' + spendAbs(at.attrRefundsMinor) + ' refunds</span>';
   }
   return '<div class="card hero"><div class="headline-label">Net spend &middot; ' + esc(fmtPeriod(ctx.month)) + '</div>' +
     '<div class="headline-num">' + spendAbs(r.netSpendMinor) + '</div>' +
@@ -3530,8 +3569,9 @@ App.homeReviewHtml = function (ctx) {
 
 /** "Where it went": top spend categories for the month as tappable bars.
  *  Same Engine top-drivers the old Month tab showed, promoted to Home so the
- *  breakdown is visible without digging. Tap a category to open one of its
- *  transactions. Refunds are already netted into the category totals. */
+ *  breakdown is visible without digging. Tap a category to list every one of
+ *  its transactions for the month. Refunds are already netted into the
+ *  category totals. */
 App.homeCategoriesHtml = function (ctx) {
   var head = '<div class="section-head"><h2>Where it went</h2>' +
     '<button class="linklike" data-action="wrong" data-filter="purchases">This explanation is wrong</button></div>';
@@ -3545,17 +3585,57 @@ App.homeCategoriesHtml = function (ctx) {
   var html = head + '<div class="card">';
   for (i = 0; i < drivers.length; i++) {
     var d = drivers[i];
-    var link = App.driverTxnId(ctx.mTxns, d.category);
     var pct = max ? Math.round(100 * Math.abs(d.totalMinor || 0) / max) : 0;
-    html += '<button class="driver" data-action="open-txn" data-id="' + esc(link || '') + '"' + (link ? '' : ' disabled') + '>' +
+    html += '<button class="driver" data-action="open-homecat" data-cat="' + esc(d.category || '') + '">' +
       '<span class="d-main"><span class="d-name">' + esc(catLabelSmart(d.category || '')) + '</span><br>' +
       '<span class="d-sub">' + (d.txnCount || 0) + ' transaction' + ((d.txnCount || 0) === 1 ? '' : 's') + '</span>' +
       '<span class="b-track" style="display:block;margin-top:6px"><span class="b-fill" style="width:' + pct + '%"></span></span></span>' +
       '<span class="d-amt">' + spendAbs(d.totalMinor) + '</span></button>';
   }
   html += '<p class="tiny" style="margin-bottom:0">Top categories for ' + esc(fmtPeriod(ctx.month)) +
-    ', after refunds. Tap one to see a transaction.</p></div>';
+    ', after refunds. Tap one to see its transactions.';
+  var r = ctx.recon || {};
+  if (r.returnOutMinor || r.returnAdjMinor) {
+    html += ' Category totals count refunds in the month they were received;' +
+      ' the net figure above attributes cross-month returns to the purchase month.';
+  }
+  html += '</p></div>';
   return html;
+};
+
+/** Drill-down target for "Where it went": every transaction behind one
+ *  category bar for the selected month. Matches Engine.categoryMembers, so
+ *  the listed rows always add up to the bar's total. */
+App.Actions['open-homecat'] = function (d) {
+  App.go('homecat', { homeCat: d.cat || null, txnId: null, txnRet: null });
+};
+
+App.vHomeCat = async function (v, seq) {
+  var cat = App.state.homeCat;
+  var ctx = await App.monthContext();
+  if (!ctx || !cat) { App.go('home'); return; }
+  var members = [];
+  try { members = Engine.categoryMembers(ctx.mTxns, String(cat)) || []; } catch (e) { members = []; }
+  var seen = {}, rows = [], total = 0;
+  members.forEach(function (m) {
+    total += m.shareMinor || 0;
+    var id = String(m.txn && m.txn.id);
+    if (!seen[id]) { seen[id] = 1; rows.push(m.txn); }
+  });
+  rows.sort(function (a, b) {
+    var da = String(a.date || ''), db = String(b.date || '');
+    if (da !== db) return da < db ? 1 : -1;
+    return Math.abs(b.amountMinor || 0) - Math.abs(a.amountMinor || 0);
+  });
+  var html = '<button class="linklike" data-action="tab" data-tab="home">\u2190 Home</button>';
+  html += '<h1>' + esc(catLabelSmart(cat)) + '</h1>';
+  html += '<p class="small">' + rows.length + ' transaction' + (rows.length === 1 ? '' : 's') +
+    ' \u00b7 ' + esc(fmtPeriod(ctx.month)) + ' \u00b7 total ' + spendAbs(total) + '</p>';
+  html += '<div class="card">';
+  if (!rows.length) html += '<div class="empty">No transactions in this category for ' + esc(fmtPeriod(ctx.month)) + '.</div>';
+  rows.forEach(function (t) { html += App.txnRowHtml(t, 'homecat'); });
+  html += '</div>';
+  App.show(v, seq, html);
 };
 
 /** One-line Ask box with the answer below; the six priority questions live
@@ -3574,6 +3654,39 @@ App.homeAskHtml = async function () {
     }).join('') + '</div>' +
     '<p class="tiny">Free text is matched by keyword to one of the questions above. Anything else gets an honest \u201cI can\u2019t answer that yet\u201d.</p></details>';
   return html;
+};
+
+/** Excluded rows never enter gross/refunds/net, so they are an informational
+ *  note — never a subtraction line (that would double-count them). Pure. */
+App.excludedNoteHtml = function (recon) {
+  var x = (recon || {}).excludedTotalMinor || 0;
+  if (!x) return '';
+  return '<p class="tiny" style="margin-bottom:0">Excluded by you: <strong>' +
+    spendAbs(x) + '</strong> &mdash; left out of this total entirely.</p>';
+};
+
+/** Refunds & money-movement summary line. Honest about attribution: when
+ *  cross-month returns moved refunds between months, "already subtracted
+ *  from net spend" would be false, so the note breaks out what was received
+ *  as-received, what was attributed to other months, and what actually
+ *  reduced this month's net. Pure. */
+App.refundsNoteHtml = function (recon, rs) {
+  var r = recon || {};
+  var total = rs ? rs.totalMinor : r.refundsTotalMinor;
+  var count = rs ? rs.count : (r.refundCount || 0);
+  var at = App.attributedRefunds(r);
+  var s = 'Refunds received: <strong>' + spendAbs(total) + '</strong> across ' + count +
+    ' transaction' + (count === 1 ? '' : 's');
+  if (at.outMinor || at.inMinor) {
+    var netted = (total || 0) - at.outMinor + at.inMinor;
+    s += ' (as received).' +
+      (at.outMinor ? ' ' + spendAbs(at.outMinor) + ' counted in earlier purchase months.' : '') +
+      (at.inMinor ? ' ' + spendAbs(at.inMinor) + ' counted here from later returns.' : '') +
+      ' Netted against this month\u2019s spend: <strong>' + spendAbs(netted) + '</strong>.';
+  } else {
+    s += ' (already subtracted from net spend).';
+  }
+  return '<p class="small">' + s + '</p>';
 };
 
 /** Plan highlights: the budget summary when budgets exist, else a single
@@ -3621,8 +3734,7 @@ App.monthDetailsHtml = async function (ctx) {
       html += '<div class="bar-row"><span class="b-label">' + esc(t.desc) + '</span>' +
         '<span class="b-amt">' + money(t.amountMinor) + ' \u00b7 ' + esc(kindLabel(t.kind)) + '</span></div>';
     });
-    html += '<p class="small">Refunds received: <strong>' + spendAbs(ctx.rs ? ctx.rs.totalMinor : recon.refundsTotalMinor) + '</strong>' +
-      (ctx.rs ? ' across ' + ctx.rs.count + ' transaction(s)' : '') + ' (already subtracted from net spend).</p></div>';
+    html += App.refundsNoteHtml(recon, ctx.rs) + '</div>';
   } else html += '<p class="small">No refunds, payments, transfers or fees this month.</p>';
 
   // Per-account breakdown: each contributing statement's net spend for the
@@ -3697,22 +3809,6 @@ App.vHome = async function (v, seq) {
 App.vMonth = App.vHome;
 
 
-
-/** Find a txn id for a driver category (V8: categoryTotals keys are
-    category ids, falling back to merchant names). */
-App.driverTxnId = function (txns, category) {
-  var c = String(category || '');
-  for (var i = 0; i < txns.length; i++) {
-    var t = nt(txns[i]);
-    if (String(t.category) === c) return t.id;
-  }
-  var lc = c.toLowerCase();
-  for (var j = 0; j < txns.length; j++) {
-    var u = nt(txns[j]);
-    if (u.desc.toLowerCase() === lc) return u.id;
-  }
-  return null;
-};
 
 /** Headline: prefer the Engine briefing's first line (honesty rule), else a
     derived sentence. */
@@ -3996,12 +4092,15 @@ App.buildAnswer = async function (qid, ctx) {
 
   if (qid === 'q-spend') {
     // V7: the Engine reports SIGNED minor units; labeled totals are magnitudes.
+    // V15: excluded/duplicate rows never enter gross, so they are NOT a
+    // subtraction line (the old table subtracted them twice over). The table
+    // resolves: gross − refunds = net.
     return { title: 'How much did you actually spend?',
       body: '<p>Your <strong>actual spend after refunds</strong> was <strong>' + spendAbs(recon.netSpendMinor) + '</strong>.</p>' +
         '<table class="kv"><tr><th>Gross purchases</th><td>' + spendAbs(recon.grossPurchasesMinor) + '</td></tr>' +
         '<tr><th>− Refunds</th><td>' + spendAbs(recon.refundsTotalMinor) + '</td></tr>' +
-        '<tr><th>− Excluded</th><td>' + spendAbs(recon.excludedTotalMinor) + '</td></tr>' +
         '<tr><th>= Net spend</th><td><strong>' + spendAbs(recon.netSpendMinor) + '</strong></td></tr></table>' +
+        App.excludedNoteHtml(recon) +
         '<p class="small">Payments and transfers are money movement, not spending — they never enter this total.</p>',
       txnIds: ids(purch), basis: purch.length + ' purchase transactions', confidence: ctx.confidence };
   }
@@ -4705,7 +4804,8 @@ App.Actions['wipe-go'] = async function () {
                 pending: null, pipe: null, dupPairs: null, txnShown: 60, txnSearch: '',
                 splitForm: null, manualMsg: '', dataRev: 0,
                 planView: 'budgets', budgetMonth: null, budgetEditId: null,
-                goalEditId: null, planMsg: '', month: null, backfillMsg: '' };
+                goalEditId: null, planMsg: '', month: null, backfillMsg: '',
+                homeCat: null, txnRet: null };
   App.categories = [];
   await App.seedCategories();
   App.go('add');

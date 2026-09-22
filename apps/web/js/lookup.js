@@ -32,9 +32,12 @@
  * 2026-09-21): POST https://api.tavily.com/search with the key in the JSON
  * body as `api_key` (an `Authorization: Bearer` header is also accepted and
  * is sent as a fallback). Body: {api_key, query, search_depth:'basic',
- * max_results:5, include_answer:false, include_raw_content:false,
- * topic:'general'}. Response: {results:[{title, url, content, score}]}.
- * HTTP 401 = bad key, 429 = quota exhausted.
+ * max_results:10, include_answer:true, include_raw_content:false,
+ * topic:'general'}. `query` is the merchant name only — cleanQuery strips
+ * trailing store-number noise ("#1234", "No.56") so the search sees the
+ * merchant, never transaction data.
+ * Response: {results:[{title, url, content, score}], answer}. HTTP 401 =
+ * bad key, 429 = quota exhausted.
  */
 window.Lookup = (() => {
   'use strict';
@@ -44,7 +47,7 @@ window.Lookup = (() => {
   var KEY_KEY = 'emm-lookup-key-v1';
   var CACHE_KEY = 'emm-lookup-cache-v1';
   var CONCURRENCY = 3;
-  var TOP_RESULTS = 3;
+  var MAX_CLASSIFY = 10;  // classify every result Tavily returned, not just the first 3
   var MIN_VOTES_FOR_AUTO = 2;   // auto-categorize needs >=2 agreeing results
   var MIN_SUGGEST_CONF = 0.6;   // same bar Engine.autoCategorize uses
 
@@ -192,6 +195,16 @@ window.Lookup = (() => {
 
   /* ---------- request building (merchant name ONLY) ---------- */
 
+  /** Trailing store-number noise ("WALMART #1234", "COSTCO NO 56") hurts
+   *  search precision without identifying the merchant any better, so the
+   *  query strips it. A deterministic transform of the merchant string only:
+   *  still merchant-only, never transaction data. assertMerchantOnly
+   *  applies the same function when it recomputes the expected query. */
+  function cleanQuery(m) {
+    var q = String(m || '').replace(/\s*(#\s*\d+|no\.?\s*\d+)\s*$/i, '');
+    return q.replace(/\s+/g, ' ').trim().slice(0, 80);
+  }
+
   /**
    * Lookup.buildRequest(key, merchant) -> {url, options, body}.
    * The body is built from the merchant string alone — by construction it
@@ -199,13 +212,13 @@ window.Lookup = (() => {
    * field. `body` is exposed so callers (and tests) can assert that.
    */
   function buildRequest(key, merchant) {
-    var q = String(merchant || '').slice(0, 80);
+    var q = cleanQuery(String(merchant || ''));
     var body = {
       api_key: key,
       query: q,
       search_depth: 'basic',
-      max_results: 5,
-      include_answer: false,
+      max_results: 10,
+      include_answer: true,
       include_raw_content: false,
       topic: 'general'
     };
@@ -236,9 +249,11 @@ window.Lookup = (() => {
    */
   function assertMerchantOnly(req, txn) {
     if (!req || !req.body || !txn) return false;
-    var want = normalizeMerchant(txn.merchantRaw).slice(0, 80);
+    var want = cleanQuery(normalizeMerchant(txn.merchantRaw));
     if (!want) return false;
     if (req.body.query !== want) return false;
+    // cleanQuery only transforms the merchant string (store-number noise);
+    // the query remains the merchant and nothing else.
     // The query is the only transaction-derived field; scan it alone for
     // banned values. Scanning the whole body would pointlessly include the
     // API key and risk false positives.
@@ -282,14 +297,11 @@ window.Lookup = (() => {
    *  - 'low': exactly one result suggests a category (hint chip in Review).
    *  - 'none': no suggestion, or results disagree (ambiguous).
    */
-  function classifyResults(results) {
+  function classifyResults(results, answer) {
     if (!hasEngine()) return { level: 'none' };
     var votes = {}; // categoryId -> {count, best, reason}
-    var top = (results || []).slice(0, TOP_RESULTS);
-    for (var i = 0; i < top.length; i++) {
-      var r = top[i] || {};
-      var text = String(r.title || '') + ' ' + String(r.content || '');
-      if (!text.trim()) continue;
+    function vote(text) {
+      if (!text || !text.trim()) return;
       var sug = null;
       try { sug = Engine.suggestCategory({ merchantRaw: text, kind: 'purchase' }); } catch (e) { sug = null; }
       if (sug && sug.categoryId && sug.confidence >= MIN_SUGGEST_CONF) {
@@ -299,6 +311,16 @@ window.Lookup = (() => {
         votes[sug.categoryId] = v;
       }
     }
+    var list = (results || []).slice(0, MAX_CLASSIFY);
+    for (var i = 0; i < list.length; i++) {
+      var r = list[i] || {};
+      // URL domains carry merchant-identity signal (e.g. a known retailer
+      // domain votes with the merchant's own words), so they are evidence.
+      vote(String(r.title || '') + ' ' + String(r.url || '') + ' ' + String(r.content || ''));
+    }
+    // Tavily's synthesized answer is merchant-derived (built from the same
+    // merchant-only query); it counts as one more vote, never two.
+    vote(String(answer || ''));
     var cats = Object.keys(votes);
     if (!cats.length) return { level: 'none' };
     cats.sort(function (a, b) { return votes[b].count - votes[a].count; });
@@ -337,7 +359,7 @@ window.Lookup = (() => {
       throw err;
     }
     var data = await res.json();
-    return classifyResults(data && data.results);
+    return classifyResults(data && data.results, data && data.answer);
   }
 
   /**
@@ -609,6 +631,7 @@ window.Lookup = (() => {
     saveCache: saveCache,
     recordOutcome: recordOutcome,
     normalizeMerchant: normalizeMerchant,
+    cleanQuery: cleanQuery,
     candidates: candidates,
     buildRequest: buildRequest,
     assertMerchantOnly: assertMerchantOnly,

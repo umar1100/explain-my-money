@@ -242,8 +242,13 @@ async function main() {
     ok(ans && ans.title && ans.body && !labeledNeg, 'answer ' + q + ' renders, no negative labeled total');
   }
   const spendAns = await App.buildAnswer('q-spend', ctx);
-  // MISC (-$18.44) was reclassified purchase->fee above: net = $1,403.09
-  ok(spendAns.body.indexOf('$1,403.09') !== -1, 'q-spend shows net magnitude', spendAns.body.slice(0, 120));
+  // v15: excluded rows never count toward spend. MISC (-$18.44) was
+  // reclassified purchase->fee above, and the excluded Loblaws row (-$87.43)
+  // is out of gross entirely: net = $1,315.66, and the table resolves
+  // (gross − refunds = net) with excluded shown as a note, not a subtraction.
+  ok(spendAns.body.indexOf('$1,315.66') !== -1, 'q-spend shows net magnitude', spendAns.body.slice(0, 120));
+  ok(spendAns.body.indexOf('− Excluded</th>') === -1, 'q-spend no longer subtracts excluded twice', spendAns.body.slice(0, 600));
+  ok(/Excluded by you/.test(spendAns.body), 'q-spend notes the excluded amount', spendAns.body.slice(0, 600));
   ok(App.matchQuestion('why did groceries rise') === 'q-change' || App.matchQuestion('why did groceries rise') === 'q-grocery', 'keyword routing works');
 
   // --- audit trail ---

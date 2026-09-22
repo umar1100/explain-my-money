@@ -406,6 +406,64 @@ const groceryR1 = { title: 'Zed Mart Hamilton',
   ok(stMix.indexOf('tvly-test-key-123') === -1, 'mixed note never contains the key');
   delete global.navigator;
 
+  /* ---------- 8. v15 hit-rate improvements (privacy bars unchanged) ---------- */
+  function okResultsA(results, answer) {
+    return { ok: true, status: 200, json: async () => ({ results: results, answer: answer }) };
+  }
+  async function lookupOneM(merchant, results, answer, raw) {
+    reset();
+    L.saveSettings({ enabled: true });
+    L.setKey('tvly-test-key-123');
+    const spy = mockFetch(() => okResultsA(results, answer));
+    const t = txn('m1', raw || merchant, 1000, '2026-08-28');
+    const out = await L.lookupOne(merchant, 'tvly-test-key-123', spy, t);
+    return { out, calls: spy.calls };
+  }
+
+  // (a) request shape: 10 results, answer included, still merchant-only
+  const shapeReq = L.buildRequest('tvly-test-key-123', PIZZA);
+  ok(shapeReq.body.max_results === 10, 'v15 requests 10 results', shapeReq.body.max_results);
+  ok(shapeReq.body.include_answer === true, 'v15 requests the Tavily answer', shapeReq.body.include_answer);
+  ok(shapeReq.body.search_depth === 'basic', 'still basic depth (1 credit)', shapeReq.body.search_depth);
+  ok(shapeReq.body.include_raw_content === false, 'still no raw content', shapeReq.body.include_raw_content);
+
+  // (b) cleanQuery strips trailing store numbers; guard still passes
+  ok(L.cleanQuery('WALMART #1234') === 'WALMART', 'store number stripped', L.cleanQuery('WALMART #1234'));
+  ok(L.cleanQuery('COSTCO NO 56') === 'COSTCO', 'No. suffix stripped', L.cleanQuery('COSTCO NO 56'));
+  ok(L.cleanQuery('MAPLEWOOD PIZZA') === 'MAPLEWOOD PIZZA', 'plain merchant untouched');
+  const storeTxn = txn('s1', '  Walmart #1234 ', 1000, '2026-08-28');
+  const storeReq = L.buildRequest('tvly-test-key-123', L.normalizeMerchant(storeTxn.merchantRaw));
+  ok(storeReq.body.query === 'WALMART', 'query carries the cleaned merchant name', storeReq.body.query);
+  ok(L.assertMerchantOnly(storeReq, storeTxn) === true, 'guard accepts the cleaned query');
+
+  // (c) URL evidence: two results whose only Dining signal is in the URL -> auto
+  const urlR1 = { title: 'Maplewood listing', url: 'https://maplewoodpizzeria.example.com/menu',
+    content: 'Local business hours and directions.', score: 0.8 };
+  const urlR2 = { title: 'Maplewood reviews', url: 'https://www.example.com/dominos-maplewood',
+    content: 'Customer reviews and photos.', score: 0.7 };
+  let rUrl = await lookupOneM(PIZZA, [urlR1, urlR2], null);
+  ok(rUrl.out.level === 'high' && rUrl.out.categoryId === 'dining',
+     'URL-domain evidence counts: 2 URL votes -> auto-categorize', rUrl.out);
+  ok(rUrl.calls[0].body.query === PIZZA, 'query still merchant-only with URL evidence');
+
+  // (d) Tavily answer counts as ONE more vote, never two
+  let rAns = await lookupOneM(PIZZA, [pizzaR1], 'Maplewood Pizza is a pizzeria and restaurant in Toronto.');
+  ok(rAns.out.level === 'high' && rAns.out.categoryId === 'dining',
+     'one result + agreeing answer -> auto (2 votes)', rAns.out);
+  let rAnsSolo = await lookupOneM(PIZZA, [], 'Maplewood Pizza is a pizzeria in Toronto.');
+  ok(rAnsSolo.out.level === 'low' && rAnsSolo.out.categoryId === 'dining',
+     'answer alone -> hint only, never auto (one vote)', rAnsSolo.out);
+
+  // (e) results beyond the old top-3 now count
+  const filler = { title: 'Unrelated directory', content: 'A page with no category signal at all.', score: 0.3 };
+  let rDeep = await lookupOneM(PIZZA, [filler, filler, filler, pizzaR1, pizzaR2], null);
+  ok(rDeep.out.level === 'high' && rDeep.out.categoryId === 'dining',
+     'votes at positions 4-5 now categorize (old code only read 3)', rDeep.out);
+
+  // (f) disagreement is still silent, even with URL/answer evidence mixed in
+  let rDis = await lookupOneM(PIZZA, [pizzaR1, groceryR1], 'A local business listing with hours.');
+  ok(rDis.out.level === 'none', 'disagreeing votes -> silent, stays in Review', rDis.out);
+
   console.log('\nmerchant-lookup: ' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail ? 1 : 0);
 })().catch((e) => { console.error('FATAL', e); process.exit(1); });

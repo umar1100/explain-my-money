@@ -208,20 +208,22 @@ async function main() {
   ok(!!(ctxAug.recon.returnOutMinor), 'August hero carries the returnOut note', ctxAug && ctxAug.recon);
 
   /* --- 6. Home hero + category-breakdown HTML builders --- */
+  // Self-consistent fixture: $100 gross, $18.65 received refunds, $50 moved
+  // IN from later returns -> attributed refunds $68.65, net $31.35.
   const heroCtx = {
     month: '2026-08',
     recon: {
       grossPurchasesMinor: 10000, refundsTotalMinor: 1865, refundCount: 1,
-      netSpendMinor: 8135, returnAdjMinor: -5000, returnOutMinor: 0,
+      netSpendMinor: 3135, returnAdjMinor: -5000, returnOutMinor: 0,
     },
     headline: 'Engine first line.',
     mTxns: [],
   };
   const hero = App.headlineHtml(heroCtx);
-  ok(hero.includes('$81.35'), 'hero shows net spend $81.35', hero.slice(0, 160));
-  ok(hero.includes('$100.00') && hero.includes('$18.65'), 'hero shows purchases/refunds build-up', hero.slice(0, 400));
+  ok(hero.includes('$31.35'), 'hero shows net spend $31.35', hero.slice(0, 160));
+  ok(hero.includes('$100.00') && hero.includes('$68.65'), 'hero shows purchases/attributed-refunds build-up', hero.slice(0, 400));
   ok(hero.includes('August 2026'), 'hero labels the month', hero.slice(0, 160));
-  ok(hero.includes('returns attributed to the month of the original purchase'),
+  ok(hero.includes('from later returns counted here'),
      'hero explains the return attribution');
 
   const catCtx = {
@@ -236,7 +238,7 @@ async function main() {
   ok(cats.includes('Where it went'), 'categories section headed', cats.slice(0, 120));
   ok(cats.includes('Groceries') && cats.includes('Dining'), 'categories listed', cats.slice(0, 600));
   ok(cats.includes('$80.00') && cats.includes('$40.00'), 'category amounts shown', cats.slice(0, 900));
-  ok(cats.includes('data-action="open-txn"'), 'categories are tappable');
+  ok(cats.includes('data-action="open-homecat"'), 'categories open the drill-down list');
 
   const emptyCats = App.homeCategoriesHtml({ month: '2026-08', mTxns: [], drivers: [] });
   ok(emptyCats.includes('No categorized spend'), 'empty drivers: quiet empty state');
