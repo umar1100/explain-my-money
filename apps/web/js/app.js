@@ -4213,7 +4213,10 @@ App.lookupSettingsHtml = function () {
   h += '<label class="f" for="lookup-key">Tavily API key ' +
     (Lookup.hasKey() ? '<span class="pill ok">saved on this device</span>' : '<span class="pill dim">not set</span>') + '</label>' +
     '<input type="password" id="lookup-key" data-change="lookup-key" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="tvly-… (stored on this device only)">';
-  if (Lookup.hasKey()) h += '<div style="margin:4px 0"><button class="btn ghost smallbtn" data-action="lookup-forget-key">Delete key (turns lookup off)</button></div>';
+  h += '<div style="margin:4px 0"><button class="btn ghost smallbtn" data-action="lookup-test">Test connection</button>';
+  if (Lookup.hasKey()) h += ' <button class="btn ghost smallbtn" data-action="lookup-forget-key">Delete key (turns lookup off)</button>';
+  h += '</div>';
+  if (App._lookupTest && App._lookupTest.message) h += '<div class="banner dim"><p class="small" style="margin:0">' + esc(App._lookupTest.message) + '</p></div>';
   if (s.lastStatus) h += '<div class="banner dim"><p class="small" style="margin:0">' + esc(s.lastStatus) + '</p></div>';
   h += '<div class="f">How to get a free key</div>' +
     '<p class="small">1. Sign up at <strong>tavily.com</strong> — the free “Researcher” plan includes 1,000 searches a month (at signup, look for the small “Continue on Free” text).<br>' +
@@ -4235,6 +4238,21 @@ App.vLookup = async function (v, seq) {
 App.Changes['lookup-enabled'] = function (el) { Lookup.saveSettings({ enabled: !!el.checked }); App.render(); };
 App.Changes['lookup-key'] = function (el) { Lookup.setKey(el.value); /* no re-render: keeps focus while typing */ };
 App.Actions['lookup-forget-key'] = function () { Lookup.clearKey(); Lookup.saveSettings({ enabled: false }); App.render(); };
+
+/** "Test connection": one synthetic probe, exact plain-language result. */
+App.Actions['lookup-test'] = function () {
+  if (typeof Lookup === 'undefined') return;
+  App._lookupTest = { message: 'Testing the connection…', at: Date.now() };
+  App.render();
+  var fetchFn = (typeof fetch !== 'undefined') ? fetch : null;
+  Promise.resolve().then(function () { return Lookup.testConnection(fetchFn); }).then(function (r) {
+    App._lookupTest = { message: String((r && r.message) || 'The test could not run. Try again.'), at: Date.now() };
+    App.render();
+  }, function () {
+    App._lookupTest = { message: 'The test could not run. Try again.', at: Date.now() };
+    App.render();
+  });
+};
 
 /** Non-blocking toast used for lookup progress (works on any tab). */
 App._lookupToast = function (text, sticky) {

@@ -10,7 +10,12 @@
    - ambiguous (results disagree) -> stays in Review, no hint, no category.
    - cache: a merchant is looked up exactly once ever (repeat run = no fetch).
    - failures (network error, 401, 429) -> rows stay in Review, no crash,
-     plain-language status note that never contains the key.
+     plain-language status note that never contains the key; the all-failed
+     network note appends an offline-vs-blocked distinction.
+   - key pasted with surrounding whitespace is trimmed before saving/sending.
+   - testConnection(): one probe with the synthetic query "TEST MERCHANT"
+     (never a real merchant); precise outcomes for 200/401/429/network-throw
+     with onLine true/false; never includes the key in any message.
    All merchants are fictional. Run with node. */
 'use strict';
 const path = require('path');
@@ -256,6 +261,79 @@ const groceryR1 = { title: 'Zed Mart Hamilton',
   const spyDel = mockFetch(() => okResults([pizzaR1, pizzaR2]));
   await L.processTxns([txn('t11', PIZZA, 1000, '2026-08-01')], makeDeps(spyDel));
   ok(spyDel.calls.length === 0, 'no key -> zero network calls');
+
+  /* ---------- 13. pasted key is whitespace-trimmed before saving ---------- */
+  reset();
+  L.setKey('  tvly-test-key-123 \n');
+  ok(L.getKey() === 'tvly-test-key-123', 'surrounding whitespace trimmed on save', L.getKey());
+  L.saveSettings({ enabled: true });
+  const spyTrim = mockFetch(() => okResults([]));
+  await L.processTxns([txn('t12', BOOKS, 3400, '2026-08-25')], makeDeps(spyTrim));
+  ok(spyTrim.calls.length === 1, 'trimmed key still activates the feature');
+  ok(spyTrim.calls[0].body.api_key === 'tvly-test-key-123', 'the trimmed key is what gets sent');
+  ok(String(L.getSettings().lastStatus || '').indexOf('tvly-test-key-123') === -1, 'trimmed key never lands in status notes');
+
+  /* ---------- 14. testConnection(): one synthetic probe, exact outcomes ---------- */
+  reset();
+  L.setKey('tvly-test-key-123');
+  const spyT = mockFetch(() => okResults([]));
+  const resOk = await L.testConnection(spyT);
+  ok(resOk.ok === true && resOk.code === 'ok' && /ready/i.test(resOk.message), 'test 200 -> key works', resOk);
+  ok(spyT.calls.length === 1, 'test sends exactly ONE probe request');
+  ok(spyT.calls[0].body.query === L.TEST_QUERY && spyT.calls[0].body.query === 'TEST MERCHANT',
+     'probe uses the fixed synthetic query, never a real merchant', spyT.calls[0].body.query);
+  ok(spyT.calls[0].body.api_key === 'tvly-test-key-123', 'probe carries the stored key');
+  ok(!(L.getCache()['TEST MERCHANT']), 'probe does not pollute the merchant cache');
+
+  const res401 = await L.testConnection(mockFetch(() => httpError(401)));
+  ok(res401.ok === false && res401.code === 'bad-key' && /rejected/i.test(res401.message), 'test 401 -> rejected message', res401);
+
+  const res429 = await L.testConnection(mockFetch(() => httpError(429)));
+  ok(res429.ok === false && res429.code === 'quota' && /quota/i.test(res429.message), 'test 429 -> quota message', res429);
+
+  const throwFetch = mockFetch(() => { throw new Error('boom'); });
+  /* Node ships a getter-only global `navigator`; stub it via defineProperty. */
+  function stubOnline(v) {
+    Object.defineProperty(global, 'navigator', { value: { onLine: v }, configurable: true });
+  }
+  function unstubNavigator() { delete global.navigator; }
+  stubOnline(true);
+  const resBlk = await L.testConnection(throwFetch);
+  ok(resBlk.ok === false && resBlk.code === 'network' && /blocked before it reached tavily/i.test(resBlk.message),
+     'test throw while online -> blocked-by-device note', resBlk.message);
+
+  stubOnline(false);
+  const resOff = await L.testConnection(mockFetch(() => { throw new Error('boom'); }));
+  ok(resOff.ok === false && resOff.code === 'network' && /appear to be offline/i.test(resOff.message),
+     'test throw while offline -> offline note', resOff.message);
+  delete global.navigator;
+
+  reset(); // no key
+  const resNoKey = await L.testConnection(mockFetch(() => okResults([])));
+  ok(resNoKey.ok === false && resNoKey.code === 'no-key' && /paste your tavily key first/i.test(resNoKey.message),
+     'test without a key -> paste-key note, zero network calls', resNoKey);
+  [resOk, res401, res429, resBlk, resOff, resNoKey].forEach(function (r, i) {
+    ok(r.message.indexOf('tvly-test-key-123') === -1, 'test outcome #' + i + ' never contains the key');
+  });
+
+  /* ---------- 15. batch note: all-failed network case stays diagnosable ---------- */
+  reset();
+  L.saveSettings({ enabled: true });
+  L.setKey('tvly-test-key-123');
+  const failFetch = mockFetch(() => { throw new Error('down'); });
+  stubOnline(false);
+  await L.processTxns([txn('t13', BOOKS, 3400, '2026-08-25')], makeDeps(failFetch));
+  const stOff2 = L.getSettings().lastStatus;
+  ok(/could not reach the web/i.test(stOff2), 'batch note keeps the familiar reachability phrase', stOff2);
+  ok(/appear to be offline/i.test(stOff2), 'batch note appends the offline distinction', stOff2);
+  ok(stOff2.indexOf('tvly-test-key-123') === -1, 'batch note never contains the key');
+
+  stubOnline(true);
+  await L.processTxns([txn('t14', BOOKS, 3400, '2026-08-25')], makeDeps(failFetch));
+  const stBlk2 = L.getSettings().lastStatus;
+  ok(/could not reach the web/i.test(stBlk2), 'batch note keeps the phrase when blocked', stBlk2);
+  ok(/blocked before it reached tavily/i.test(stBlk2), 'batch note appends the blocked distinction', stBlk2);
+  delete global.navigator;
 
   console.log('\nmerchant-lookup: ' + pass + ' passed, ' + fail + ' failed');
   process.exit(fail ? 1 : 0);

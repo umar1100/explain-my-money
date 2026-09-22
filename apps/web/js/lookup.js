@@ -23,7 +23,10 @@
  *    normalized merchant: each merchant is queried at most once ever.
  *  - Failures (no network, bad key, quota exhausted) stand down quietly:
  *    rows stay in Review and a plain-language note is stored in settings.
- *    The key itself is never written into any message.
+ *    The key itself is never written into any message. The settings view
+ *    offers a "Test connection" button (Lookup.testConnection) that sends
+ *    ONE probe with a fixed synthetic query ("TEST MERCHANT") and reports
+ *    the exact outcome — distinguishing offline from blocked requests.
  *
  * Tavily request shape (verified against https://docs.tavily.com,
  * 2026-09-21): POST https://api.tavily.com/search with the key in the JSON
@@ -373,6 +376,53 @@ window.Lookup = (() => {
     return out;
   }
 
+  /**
+   * Lookup.networkHint() -> one plain-language sentence distinguishing
+   * "you look offline" from "something on the device blocked the request".
+   * Never includes the key. Used by both the connection test and the
+   * batch-run note so a generic failure becomes diagnosable.
+   */
+  function networkHint() {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+        return 'You appear to be offline — reconnect and try again.';
+      }
+    } catch (e) {}
+    return 'The request was blocked before it reached Tavily — check VPN, iCloud Private Relay, or a content/ad blocker, then test again.';
+  }
+
+  /**
+   * Lookup.testConnection(fetchFn) -> {ok, code, message}.
+   * Sends exactly ONE probe request with a fixed synthetic query
+   * (Lookup.TEST_QUERY) — never a real merchant name — and translates the
+   * outcome into plain language for the settings view. Never throws, never
+   * logs or includes the key, never touches the merchant cache or rules.
+   */
+  var TEST_QUERY = 'TEST MERCHANT';
+  async function testConnection(fetchFn) {
+    if (typeof fetchFn !== 'function') {
+      if (typeof fetch !== 'undefined') fetchFn = fetch;
+      else return { ok: false, code: 'no-fetch',
+        message: 'This browser could not run the test. Try again on the device where you use the app.' };
+    }
+    var key = getKey();
+    if (!key) return { ok: false, code: 'no-key',
+      message: 'Paste your Tavily key first, then test.' };
+    try {
+      await lookupOne(TEST_QUERY, key, fetchFn, null);
+      return { ok: true, code: 'ok',
+        message: 'Key works — merchant lookup is ready.' };
+    } catch (e) {
+      var st = e && e.httpStatus;
+      if (st === 401) return { ok: false, code: 'bad-key',
+        message: 'The key was rejected — double-check it in your Tavily dashboard.' };
+      if (st === 429) return { ok: false, code: 'quota',
+        message: 'The monthly search quota is used up — lookup resumes next month.' };
+      return { ok: false, code: 'network',
+        message: 'Could not reach Tavily. ' + networkHint() };
+    }
+  }
+
   /* ---------- teach-once rule ---------- */
 
   /**
@@ -505,7 +555,9 @@ window.Lookup = (() => {
     } else if (saw429) {
       note = 'The monthly search quota is used up — lookup resumes next month. Nothing was categorized.';
     } else if (summary.failed > 0) {
-      note = 'Could not reach the web — lookup will try again next time. Nothing was categorized.';
+      // All attempts failed at the network level: keep the familiar phrase
+      // but append the offline-vs-blocked distinction so it is actionable.
+      note = 'Could not reach the web — lookup will try again next time. Nothing was categorized. ' + networkHint();
     } else {
       note = statusText(summary);
     }
@@ -539,6 +591,9 @@ window.Lookup = (() => {
     run: run,
     makeRule: makeRule,
     statusText: statusText,
-    processTxns: processTxns
+    processTxns: processTxns,
+    TEST_QUERY: TEST_QUERY,
+    networkHint: networkHint,
+    testConnection: testConnection
   };
 })();
