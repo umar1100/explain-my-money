@@ -3,8 +3,9 @@
  * ----------------------------------------------------------------------------
  * Single-page, on-device app. HARD RULES:
  *   - No backend, no telemetry, no cloud, no CDN. No network calls for
- *     financial processing or storage (optional user-approved BYO-key AI
- *     phrasing is the sole exception).
+ *     financial processing or storage (the only exceptions: optional
+ *     user-approved BYO-key AI phrasing, and the opt-in online merchant
+ *     lookup which sends merchant names only).
  *   - All data lives in IndexedDB via the Store contract (js/store.js).
  *   - All money math/formatting goes through the Engine contract (js/engine.js).
  *   - This file never calls fetch(), never builds a remote URL, never loads
@@ -1516,6 +1517,9 @@ App.runPipeline = async function () {
     await App.stageExplain(pipe);
     await App.commitPipeline(pipe);
     pipe.done = true;
+    // Opt-in online merchant lookup: runs only after the import is fully
+    // done, never delays the import itself. No-op while the feature is off.
+    setTimeout(function () { App.runMerchantLookup(); }, 0);
   } catch (e) {
     pipe.failed = (e && e.message) || String(e);
   }
@@ -2556,6 +2560,9 @@ App.txnRowHtml = function (t) {
   if (t.status === 'duplicate') pills += ' <span class="pill bad">duplicate</span>';
   else if (App.needsReview(t)) pills += ' <span class="pill warn">review</span>';
   if (needsCategory(t)) pills += ' <span class="pill warn">no category</span>';
+  // Opt-in merchant lookup: a low-confidence web suggestion never
+  // categorizes the row — it shows as a hint in Review only (never-guess).
+  if (!t.category && t.lookupHint) pills += ' <span class="pill dim">web suggests: ' + esc(t.lookupHint) + '</span>';
   if (t.excluded && t.status !== 'duplicate') pills += ' <span class="pill dim">excluded</span>';
   if (t.splits && t.splits.length) pills += ' <span class="pill dim">split</span>';
   return '<button class="txn" data-action="open-txn" data-id="' + esc(t.id) + '">' +
@@ -2672,6 +2679,9 @@ App.vTxnDetail = async function (v, seq) {
     '<tr><th>Source</th><td>' + esc(t.classificationSource || '—') + '</td></tr>' +
     '<tr><th>Kind confidence</th><td>' + esc(t.kindConfidence != null ? t.kindConfidence : '—') + '</td></tr>' +
     '<tr><th>Category</th><td>' + esc(catName(t.category)) + '</td></tr>' +
+    // Opt-in merchant lookup: a weak web suggestion never changes the
+    // category — it shows as a hint only (never-guess).
+    (!t.category && t.lookupHint ? '<tr><th>Web hint</th><td>web suggests: ' + esc(t.lookupHint) + '</td></tr>' : '') +
     '<tr><th>Status</th><td>' + esc(t.status) + '</td></tr></table></div>';
 
   // Per-category splits (purchases only, never excluded/duplicates).
@@ -4119,6 +4129,7 @@ App.vMore = async function (v, seq) {
   if (m === 'privacy') return App.vPrivacy(v, seq);
   if (m === 'accounts') return App.vAccounts(v, seq);
   if (m === 'ai') return App.vAi(v, seq);
+  if (m === 'lookup') return App.vLookup(v, seq);
   var rules = await sAll('householdRules');
   var active = rules.filter(function (r) { return r.enabled !== false; }).length;
   var accounts = await sAll('accounts');
@@ -4143,11 +4154,14 @@ App.vMore = async function (v, seq) {
     (App.state.backfillMsg ? '<div class="banner ok">' + esc(App.state.backfillMsg) + '</div>' : '') +
     '<button class="btn ghost" data-action="autocat-backfill">Auto-categorize transactions</button></div>' +
     '<div class="card"><h3 style="margin:0 0 6px">Privacy &amp; data</h3>' +
-    '<p class="small"><strong>Your data stays on this device.</strong> The only network use is optional AI phrasing, which you preview and approve per call. Export or delete any time.</p>' +
+    '<p class="small"><strong>Your data stays on this device.</strong> The only network use is optional AI phrasing (which you preview and approve per call) and the opt-in merchant lookup (merchant names only). Export or delete any time.</p>' +
     '<button class="btn ghost" data-action="goto" data-tab="more" data-more="privacy">Privacy, export &amp; delete</button></div>' +
     '<div class="card"><div class="section-head"><h3 style="margin:0">AI phrasing</h3><span class="pill ' + (App.llmOn() ? 'ok' : 'dim') + '">' + (App.llmOn() ? 'on' : 'off') + '</span></div>' +
     '<p class="small">Optional. Rewords an answer in plainer language — the numbers are still computed on this device and never change. Off by default; every send needs your approval.</p>' +
     '<button class="btn ghost" data-action="goto" data-tab="more" data-more="ai">AI phrasing settings</button></div>' +
+    '<div class="card"><div class="section-head"><h3 style="margin:0">Merchant lookup</h3><span class="pill ' + (App.lookupOn() ? 'ok' : 'dim') + '">' + (App.lookupOn() ? 'on' : 'off') + '</span></div>' +
+    '<p class="small">Optional. Identifies unknown merchants with a one-time web search each — only the merchant name ever leaves this device. Off by default; needs your own free search key.</p>' +
+    '<button class="btn ghost" data-action="goto" data-tab="more" data-more="lookup">Merchant lookup settings</button></div>' +
     '<div class="card"><h3 style="margin:0 0 6px">Take the tour again</h3>' +
     '<p class="small">Replay the 3-step first-run walkthrough.</p>' +
     '<button class="btn ghost" data-action="onboard-replay">Replay tour</button></div>');
@@ -4170,6 +4184,118 @@ App.vAi = async function (v, seq) {
     'the exact provider, model, privacy mode, and payload, every time. Your key is kept in memory only and forgotten when the app closes.</p>' +
     App.llmSettingsHtml() + '</div>';
   App.show(v, seq, html);
+};
+
+/* ---------------- online merchant lookup (opt-in, BYO Tavily key) --------
+ * Identifies merchants the built-in keyword rules don't recognize, with one
+ * web search per merchant. Privacy posture:
+ *  - OFF by default; enabling it changes nothing until a key is set.
+ *  - Only the merchant NAME is ever sent (Lookup.assertMerchantOnly runs
+ *    before every send). Amounts, dates, accounts: never.
+ *  - The key lives on this device only (localStorage), in memory while the
+ *    app runs, never logged, never committed. Deleting it turns the
+ *    feature off.
+ *  - Clear identifications (>=2 agreeing web results) become household
+ *    rules you can edit/delete; weaker evidence shows as a hint chip in
+ *    Review; ambiguous merchants stay silent in Review (never-guess).
+ */
+
+/** Whether the lookup feature is currently live (enabled + key present). */
+App.lookupOn = function () {
+  try { return typeof Lookup !== 'undefined' && Lookup.isActive(); }
+  catch (e) { return false; }
+};
+
+App.lookupSettingsHtml = function () {
+  if (typeof Lookup === 'undefined') return '<p class="small">Lookup module failed to load.</p>';
+  var s = Lookup.getSettings();
+  var h = '<label class="switch"><input type="checkbox" data-change="lookup-enabled"' + (s.enabled ? ' checked' : '') + '> Enable merchant lookup</label>';
+  h += '<label class="f" for="lookup-key">Tavily API key ' +
+    (Lookup.hasKey() ? '<span class="pill ok">saved on this device</span>' : '<span class="pill dim">not set</span>') + '</label>' +
+    '<input type="password" id="lookup-key" data-change="lookup-key" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="tvly-… (stored on this device only)">';
+  if (Lookup.hasKey()) h += '<div style="margin:4px 0"><button class="btn ghost smallbtn" data-action="lookup-forget-key">Delete key (turns lookup off)</button></div>';
+  if (s.lastStatus) h += '<div class="banner dim"><p class="small" style="margin:0">' + esc(s.lastStatus) + '</p></div>';
+  h += '<div class="f">How to get a free key</div>' +
+    '<p class="small">1. Sign up at <strong>tavily.com</strong> — the free “Researcher” plan includes 1,000 searches a month (at signup, look for the small “Continue on Free” text).<br>' +
+    '2. Copy the API key from your Tavily dashboard (it starts with <code>tvly-</code>).<br>' +
+    '3. Paste it above.</p>';
+  h += '<p class="tiny">Off by default. When on, only the merchant <em>name</em> is sent to Tavily — never amounts, dates, or account info. Each merchant is looked up once ever; clear identifications become reusable household rules. The key never leaves this device except in direct HTTPS calls to Tavily.</p>';
+  return h;
+};
+
+/** More > Merchant lookup: the opt-in web-identification settings. */
+App.vLookup = async function (v, seq) {
+  var html = '<button class="linklike" data-action="back-more">\u2190 More</button><h1>Merchant lookup</h1>' +
+    '<div class="card"><p class="small" style="margin-top:0">Identifies merchants the built-in rules don\u2019t recognize, with a one-time web search per merchant. ' +
+    'Clear matches are categorized automatically and saved as household rules you can edit or delete; uncertain ones stay in your review queue with a hint.</p>' +
+    App.lookupSettingsHtml() + '</div>';
+  App.show(v, seq, html);
+};
+
+App.Changes['lookup-enabled'] = function (el) { Lookup.saveSettings({ enabled: !!el.checked }); App.render(); };
+App.Changes['lookup-key'] = function (el) { Lookup.setKey(el.value); /* no re-render: keeps focus while typing */ };
+App.Actions['lookup-forget-key'] = function () { Lookup.clearKey(); Lookup.saveSettings({ enabled: false }); App.render(); };
+
+/** Non-blocking toast used for lookup progress (works on any tab). */
+App._lookupToast = function (text, sticky) {
+  try {
+    var el = document.getElementById('lookup-toast');
+    if (!el) {
+      el = document.createElement('div');
+      el.id = 'lookup-toast';
+      el.className = 'lookup-toast';
+      document.body.appendChild(el);
+    }
+    el.textContent = String(text || '');
+    el.style.display = 'block';
+    if (el._t) { clearTimeout(el._t); el._t = null; }
+    if (!sticky) el._t = setTimeout(function () { el.style.display = 'none'; }, 30000);
+  } catch (e) {}
+};
+App._lookupToastHide = function () {
+  try {
+    var el = document.getElementById('lookup-toast');
+    if (el) { if (el._t) { clearTimeout(el._t); el._t = null; } el.style.display = 'none'; }
+  } catch (e) {}
+};
+
+/**
+ * App.runMerchantLookup(): identify still-uncategorized merchants via the
+ * web. Never blocks: it runs after import/backfill complete, shows a
+ * non-blocking progress toast, and re-renders once at the end. When the
+ * feature is off (default) this is a no-op.
+ */
+App.runMerchantLookup = async function () {
+  if (typeof Lookup === 'undefined' || !Lookup.isActive()) return;
+  var txns;
+  try { txns = await sAll('txns'); } catch (e) { return; }
+  var cands;
+  try { cands = Lookup.candidates(txns); } catch (e) { return; }
+  if (!cands.length) return;
+  App._lookupToast('Looking up ' + cands.length + ' merchant' + (cands.length === 1 ? '' : 's') + '\u2026');
+  var summary = null;
+  try {
+    summary = await Lookup.processTxns(txns, {
+      fetchFn: (typeof fetch !== 'undefined') ? fetch : null,
+      getRules: function () { return sAll('householdRules'); },
+      putRule: function (r) { return Store.put('householdRules', r); },
+      putTxn: function (t) { return Store.put('txns', t); },
+      onProgress: function (done, total) {
+        App._lookupToast('Looking up merchants\u2026 ' + done + '/' + total);
+      },
+      audit: function (ev, et, id, d) { audit(ev, et, id, d); }
+    });
+  } catch (e) {
+    summary = null; // processTxns already degrades per-merchant; this is belt & braces
+  }
+  App._lookupToastHide();
+  if (summary && summary.ran && (summary.auto || summary.hints)) {
+    App._lookupToast(Lookup.statusText(summary), true);
+    setTimeout(App._lookupToastHide, 8000);
+  }
+  App.bumpDataRev();
+  App.render();
+  return summary;
 };
 
 App.vAccounts = async function (v, seq) {
@@ -4265,6 +4391,9 @@ App.runAutocatBackfill = async function () {
     ' Your own categories were never touched.';
   App.bumpDataRev();
   App.render();
+  // Opt-in online merchant lookup: identifies whatever the local rules left
+  // unknown. Runs after the local backfill, never instead of it.
+  setTimeout(function () { App.runMerchantLookup(); }, 0);
   return { added: added, refreshed: refreshed, total: txns.length };
 };
 App.Actions['autocat-backfill'] = function () { return App.runAutocatBackfill(); };

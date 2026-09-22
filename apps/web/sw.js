@@ -6,7 +6,7 @@
  * The service worker only serves the cached shell so the installed
  * app opens without connectivity.
  */
-const CACHE = 'emm-shell-v11';      // app shell: tiny, installs fast — BUMP on any shell/JS change
+const CACHE = 'emm-shell-v12';      // app shell: tiny, installs fast — BUMP on any shell/JS change
 const VCACHE = 'emm-vendor-v1';    // heavy vendor files: cached on first use
 // The app shell is everything needed to boot and import statements.
 // Heavy vendor files (PDF worker, Tesseract OCR engine + language data,
@@ -24,6 +24,7 @@ const SHELL = [
   './js/store.js',
   './js/ocr.js',
   './js/llm.js',
+  './js/lookup.js',
   './vendor/pdf.min.js',
   './icons/icon-192.png',
   './icons/icon-512.png',
