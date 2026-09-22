@@ -227,14 +227,22 @@ window.Lookup = (() => {
 
   /**
    * Lookup.assertMerchantOnly(req, txn) -> bool.
-   * Defense in depth: verify the outbound body carries the merchant query
-   * and none of the txn's other fields (amount, date, ids). Called before
-   * every send; a failure skips that merchant and is audited.
+   * Defense in depth: verify the outbound query is exactly the normalized
+   * merchant descriptor that was sent (normalize the raw value before
+   * comparing — the wire form is always normalized), and that the query —
+   * the only transaction-derived field in the body — carries none of the
+   * txn's other fields (amount, date, ids). Fail-closed: any mismatch skips
+   * that merchant. Called before every send.
    */
   function assertMerchantOnly(req, txn) {
     if (!req || !req.body || !txn) return false;
-    if (req.body.query !== String(txn.merchantRaw).slice(0, 80)) return false;
-    var s = JSON.stringify(req.body);
+    var want = normalizeMerchant(txn.merchantRaw).slice(0, 80);
+    if (!want) return false;
+    if (req.body.query !== want) return false;
+    // The query is the only transaction-derived field; scan it alone for
+    // banned values. Scanning the whole body would pointlessly include the
+    // API key and risk false positives.
+    var q = String(req.body.query);
     var banned = [];
     if (txn.amountMinor !== null && txn.amountMinor !== undefined && txn.amountMinor !== '') {
       banned.push(String(txn.amountMinor));
@@ -243,7 +251,7 @@ window.Lookup = (() => {
     if (txn.id) banned.push(String(txn.id));
     if (txn.statementId) banned.push(String(txn.statementId));
     for (var i = 0; i < banned.length; i++) {
-      if (banned[i] && s.indexOf(banned[i]) !== -1) return false;
+      if (banned[i] && q.indexOf(banned[i]) !== -1) return false;
     }
     return true;
   }
@@ -312,12 +320,15 @@ window.Lookup = (() => {
    * Lookup.lookupOne(merchant, key, fetchFn, txn) -> {level,...}.
    * Throws on transport/HTTP errors (err.httpStatus when available).
    * When the source txn is supplied, the merchant-only payload assertion
-   * runs before every send; a failure aborts that merchant's lookup.
+   * runs before every send; a failure throws with code 'payload-guard' and
+   * aborts that merchant's lookup before anything is sent.
    */
   async function lookupOne(merchant, key, fetchFn, txn) {
     var req = buildRequest(key, merchant);
     if (txn && !assertMerchantOnly(req, txn)) {
-      throw new Error('merchant-only payload check failed');
+      var gerr = new Error('merchant-only payload check failed');
+      gerr.code = 'payload-guard';
+      throw gerr;
     }
     var res = await fetchFn(req.url, req.options);
     if (!res || !res.ok) {
@@ -331,8 +342,9 @@ window.Lookup = (() => {
 
   /**
    * Lookup.run(merchants, key, {fetchFn, concurrency, onProgress}) ->
-   *   [{merchant, ok, outcome|error, httpStatus}].
-   * Per-merchant errors never abort the batch.
+   *   [{merchant, ok, outcome|error, httpStatus, code}].
+   * Per-merchant errors never abort the batch. `code` carries the error
+   * code when one is set (e.g. 'payload-guard' for a privacy-guard hold).
    */
   async function run(merchants, key, opts) {
     opts = opts || {};
@@ -365,7 +377,8 @@ window.Lookup = (() => {
         } catch (e) {
           out[idx] = { merchant: m, ok: false,
                        error: String((e && e.message) || e),
-                       httpStatus: e && e.httpStatus };
+                       httpStatus: e && e.httpStatus,
+                       code: e && e.code };
         }
         done += 1;
         note();
@@ -467,7 +480,7 @@ window.Lookup = (() => {
    */
   async function processTxns(txns, deps) {
     deps = deps || {};
-    var summary = { ran: false, reason: '', lookedUp: 0, auto: 0, hints: 0, unknown: 0, failed: 0 };
+    var summary = { ran: false, reason: '', lookedUp: 0, auto: 0, hints: 0, unknown: 0, failed: 0, guardFailed: 0 };
     if (!isActive()) { summary.reason = 'off'; return summary; }
     var key = getKey();
     if (!key) {
@@ -512,9 +525,10 @@ window.Lookup = (() => {
       var rows = rowsByM[r.merchant] || [];
       if (!r.ok) {
         summary.failed += rows.length;
+        if (r.code === 'payload-guard') summary.guardFailed += rows.length;
         if (r.httpStatus === 401) saw401 = true;
         if (r.httpStatus === 429) saw429 = true;
-        continue; // transient failure: do NOT cache, retry next time
+        continue; // held-back or transient failure: do NOT cache, retry next time
       }
       summary.lookedUp += 1;
       var oc = r.outcome || { level: 'none' };
@@ -555,9 +569,22 @@ window.Lookup = (() => {
     } else if (saw429) {
       note = 'The monthly search quota is used up — lookup resumes next month. Nothing was categorized.';
     } else if (summary.failed > 0) {
-      // All attempts failed at the network level: keep the familiar phrase
-      // but append the offline-vs-blocked distinction so it is actionable.
-      note = 'Could not reach the web — lookup will try again next time. Nothing was categorized. ' + networkHint();
+      var g = summary.guardFailed || 0;
+      if (g > 0 && g === summary.failed) {
+        // Every failure was the on-device privacy guard holding a merchant
+        // back: nothing was ever sent, so say exactly that — never blame
+        // the network for a privacy hold.
+        note = 'Merchant lookup held back ' + g + ' merchant' + (g === 1 ? '' : 's') +
+          ' — the on-device privacy check did not pass, so nothing was sent. Nothing was categorized.';
+      } else {
+        // Network-level failures (possibly alongside guard holds): keep the
+        // familiar phrase and append the offline-vs-blocked distinction.
+        note = 'Could not reach the web — lookup will try again next time. Nothing was categorized. ' + networkHint();
+        if (g > 0) {
+          note += ' Merchant lookup also held back ' + g + ' merchant' + (g === 1 ? '' : 's') +
+            ' — the on-device privacy check did not pass, so nothing was sent for those.';
+        }
+      }
     } else {
       note = statusText(summary);
     }

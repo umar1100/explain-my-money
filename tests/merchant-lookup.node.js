@@ -138,7 +138,7 @@ const groceryR1 = { title: 'Zed Mart Hamilton',
   const req = L.buildRequest('tvly-test-key-123', PIZZA);
   ok(L.assertMerchantOnly(req, privTxn) === true, 'assertMerchantOnly passes for a clean request');
   const badReq = L.buildRequest('tvly-test-key-123', PIZZA);
-  badReq.body.amount_minor = 77777;
+  badReq.body.query = PIZZA + ' 77777'; // tampered: amount digits smuggled into the query
   ok(L.assertMerchantOnly(badReq, privTxn) === false, 'assertMerchantOnly catches a tainted payload');
   ok(!privTxn.category, 'empty results -> row stays uncategorized (never-guess)');
 
@@ -333,6 +333,77 @@ const groceryR1 = { title: 'Zed Mart Hamilton',
   const stBlk2 = L.getSettings().lastStatus;
   ok(/could not reach the web/i.test(stBlk2), 'batch note keeps the phrase when blocked', stBlk2);
   ok(/blocked before it reached tavily/i.test(stBlk2), 'batch note appends the blocked distinction', stBlk2);
+  delete global.navigator;
+
+  /* ---------- 16. privacy guard: normalized comparison, fail-closed, honest notes ---------- */
+  reset();
+  L.saveSettings({ enabled: true });
+  L.setKey('tvly-test-key-123');
+
+  // (a) raw mixed-case/padded merchantRaw vs the normalized query actually sent
+  const rawDom = "  Domino's Pizza #123 ";
+  const normDom = L.normalizeMerchant(rawDom);
+  ok(normDom === "DOMINO'S PIZZA #123", 'normalization uppercases + collapses whitespace', normDom);
+  const domTxn = txn('d1', rawDom, 4599, '2026-08-10');
+  const domReq = L.buildRequest('tvly-test-key-123', normDom);
+  ok(L.assertMerchantOnly(domReq, domTxn) === true,
+     'assert passes for raw mixed-case merchantRaw vs normalized query (the v14 bug: this used to fail)', domTxn.merchantRaw);
+
+  // (b) fail-closed: amount digits embedded in the query (equality passes, banned scan catches it)
+  const cafeTxn = txn('c1', 'Cafe 77777', 77777, '2026-08-10');
+  const cafeReq = L.buildRequest('tvly-test-key-123', L.normalizeMerchant(cafeTxn.merchantRaw));
+  ok(cafeReq.body.query === 'CAFE 77777', 'fixture sanity: query equals normalized merchant', cafeReq.body.query);
+  ok(L.assertMerchantOnly(cafeReq, cafeTxn) === false,
+     'assert fails closed when amount digits appear inside the query');
+
+  // (c) fail-closed: query is not this txn's merchant at all
+  const otherReq = L.buildRequest('tvly-test-key-123', PIZZA);
+  ok(L.assertMerchantOnly(otherReq, domTxn) === false,
+     'assert fails when the query does not match the txn merchant');
+
+  // (d) fail-closed: empty merchant
+  ok(L.assertMerchantOnly(L.buildRequest('tvly-test-key-123', ''), txn('e1', '', 100, '2026-01-01')) === false,
+     'assert fails closed on an empty merchant');
+
+  // (e) run() propagates code 'payload-guard' and sends nothing
+  const spyGuard = mockFetch(() => okResults([pizzaR1, pizzaR2]));
+  const guardRows = { 'MISMATCH MERCHANT': [txn('g1', 'Some Other Raw', 100, '2026-01-01')] };
+  const guardRes = await L.run(['MISMATCH MERCHANT'], 'tvly-test-key-123',
+                              { fetchFn: spyGuard, rowsByMerchant: guardRows });
+  ok(guardRes.length === 1 && guardRes[0].ok === false, 'guard failure -> not ok', guardRes);
+  ok(guardRes[0].code === 'payload-guard', "run() propagates code 'payload-guard'", guardRes[0]);
+  ok(spyGuard.calls.length === 0, 'guard failure -> zero network calls (nothing sent)');
+
+  // (f) processTxns: ALL failures are guard holds -> honest privacy-hold note
+  const spyNone = mockFetch(() => okResults([pizzaR1, pizzaR2]));
+  const rowsAllGuard = [txn('g2', 'Cafe 77777', 77777, '2026-08-10'),
+                        txn('g3', 'Diner 77777', 77777, '2026-08-11')];
+  const sumAllGuard = await L.processTxns(rowsAllGuard, makeDeps(spyNone));
+  ok(spyNone.calls.length === 0, 'all-guard run -> zero network calls', spyNone.calls.length);
+  ok(sumAllGuard.failed === 2 && sumAllGuard.guardFailed === 2, 'guard failures counted separately', sumAllGuard);
+  ok(!rowsAllGuard[0].category && !rowsAllGuard[1].category, 'held-back rows stay in Review');
+  ok(!(L.getCache()['CAFE 77777']) && !(L.getCache()['DINER 77777']), 'guard holds are NOT cached');
+  const stGuard = L.getSettings().lastStatus;
+  ok(/held back 2 merchants/i.test(stGuard), 'all-guard note names the privacy hold', stGuard);
+  ok(stGuard.indexOf('tvly-test-key-123') === -1, 'all-guard note never contains the key');
+  ['blocked', 'VPN', 'web', 'reach'].forEach(function (w) {
+    ok(stGuard.toLowerCase().indexOf(w) === -1, 'all-guard note never mentions "' + w + '" (nothing network-related happened)', stGuard);
+  });
+
+  // (g) processTxns: MIXED guard + network failures -> mentions both accurately
+  reset();
+  L.saveSettings({ enabled: true });
+  L.setKey('tvly-test-key-123');
+  const spyMix = mockFetch(() => { throw new Error('down'); });
+  const rowsMix = [txn('g4', 'Cafe 77777', 77777, '2026-08-10'),
+                   txn('g5', BOOKS, 3400, '2026-08-25')];
+  const sumMix = await L.processTxns(rowsMix, makeDeps(spyMix));
+  ok(sumMix.failed === 2 && sumMix.guardFailed === 1, 'mixed failures counted', sumMix);
+  ok(spyMix.calls.length === 1, 'only the non-held merchant hits the network', spyMix.calls.length);
+  const stMix = L.getSettings().lastStatus;
+  ok(/could not reach the web/i.test(stMix), 'mixed note keeps the network phrase for the real network failure', stMix);
+  ok(/held back 1 merchant/i.test(stMix), 'mixed note also names the privacy hold', stMix);
+  ok(stMix.indexOf('tvly-test-key-123') === -1, 'mixed note never contains the key');
   delete global.navigator;
 
   console.log('\nmerchant-lookup: ' + pass + ' passed, ' + fail + ' failed');
