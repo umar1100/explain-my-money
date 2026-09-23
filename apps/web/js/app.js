@@ -419,6 +419,7 @@ App.boot = async function () {
     return;
   }
   await App.migrateSignConvention();
+  await App.migratePaymentDescriptors();
   await App.seedCategories();
 
   var statements = await sAll('statements');
@@ -464,6 +465,38 @@ App.migrateSignConvention = async function () {
     await App.prefSet('signconv_v17', '1');
     try { audit('migrate.signconvention', 'db', 'txns', { stamped: n }); } catch (e2) { /* audit best-effort */ }
   } catch (e) { /* migration is best-effort: unstamped rows default to 'pdf-card' */ }
+};
+
+/** v18 one-time data migration: recognize bank bill-payment descriptors
+ * ("PAYMENT CIBC", "PAYMENT", "PAYMENT - THANK YOU", …) as kind='payment'.
+ * Rows imported before v18 defaulted these to kind='purchase'; v17's
+ * sign-contradiction fallback then counted a card bill payment as a
+ * spend-reducing statement credit. Paying the bill is money movement — it
+ * must not reduce spend. Only rows auto-classified at import
+ * (classificationSource 'builtin') are re-run, through the current
+ * classifier with the household's own rules, so a fresh import today and
+ * this migration agree exactly; user corrections ('user'), manual entries
+ * ('manual') and household-rule rows ('rule') are never touched. Guarded
+ * by a pref so it runs exactly once. */
+App.migratePaymentDescriptors = async function () {
+  try {
+    if (await App.prefGet('paydesc_v18') === '1') return;
+  } catch (e) { return; }
+  try {
+    var rules = rulePayloads(await enabledRules());
+    var txns = await sAll('txns');
+    var n = 0;
+    for (var i = 0; i < txns.length; i++) {
+      var t = txns[i];
+      if (!t || t.classificationSource !== 'builtin') continue;
+      if (!Engine.isBankPaymentDescriptor(t)) continue;
+      Engine.classifyRows([t], rules);
+      await Store.put('txns', t);
+      n++;
+    }
+    await App.prefSet('paydesc_v18', '1');
+    try { audit('migrate.paydesc', 'db', 'txns', { reclassified: n }); } catch (e2) { /* audit best-effort */ }
+  } catch (e) { /* migration is best-effort: unmatched rows keep their stored kind */ }
 };
 
 /** Seed categories from Engine.defaultCategories() once. */

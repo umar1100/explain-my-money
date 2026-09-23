@@ -462,6 +462,15 @@
     // r.confidence, so their behaviour is unchanged.
     var parserConfidence = r.confidence;
     var hay = r.merchantRaw || '';
+    // v18: bank bill-payment descriptors are ANCHORED, not substring
+    // keywords — "PAYMENT CIBC" is a bill payment (money movement), while
+    // "TELUS PRE-AUTH PAYMENT" is not (it stays a statement credit via the
+    // v17 sign-contradiction fallback). Checked before the substring
+    // rules so the anchor wins over any looser keyword.
+    if (isBankPaymentDescriptor(r)) {
+      applyKindToRow(r, 'payment', 0.95, 'builtin: bank bill-payment descriptor ("PAYMENT …")', 'builtin');
+      return downgradeHeuristic(r, parserConfidence);
+    }
     for (var i = 0; i < BUILTIN_RULES.length; i++) {
       var rule = BUILTIN_RULES[i];
       for (var k = 0; k < rule.keywords.length; k++) {
@@ -710,6 +719,35 @@
     return (m > 0 ? 1 : -1) !== purchaseExpectedSign(r);
   }
   Engine.purchaseSignContradicts = purchaseSignContradicts;
+
+  /**
+   * Engine.isBankPaymentDescriptor(r) -> bool.
+   * v18: a credit-card statement prints the customer's bill payment as a
+   * row whose description is the bank's own payment label: "PAYMENT",
+   * "PAYMENT CIBC", "PAYMENT - THANK YOU", "PAYMENT THANK YOU", etc.
+   * Recognizing it as kind='payment' keeps a bill payment out of spend
+   * math entirely — v17's sign-contradiction fallback would otherwise
+   * count it as a spend-reducing statement credit, but paying the card
+   * bill is money movement, not money back.
+   *
+   * Conservative by design (never-guess): the descriptor must START with
+   * the word PAYMENT (word boundary — end, whitespace, or a separator),
+   * and the row must be a credit in its own sign convention (bill payments
+   * reduce the balance owed). "TELUS PRE-AUTH PAYMENT" does NOT start with
+   * PAYMENT, so it stays a statement credit; "PAYMENTS" (no boundary) and
+   * a positive-signed "PAYMENT" row are left for the normal rules rather
+   * than guessed. Pure. Exposed for tests and the v18 migration.
+   */
+  function isBankPaymentDescriptor(r) {
+    r = r || {};
+    var hay = String(r.merchantRaw || '').toUpperCase().replace(/\s+/g, ' ').trim();
+    if (!/^PAYMENT(\s|$|[-\/:(\[])/.test(hay)) return false;
+    var m = r.amountMinor;
+    if (m === null || m === undefined || m === 0) return false;
+    var creditSign = -purchaseExpectedSign(r);
+    return (m > 0 ? 1 : -1) === creditSign;
+  }
+  Engine.isBankPaymentDescriptor = isBankPaymentDescriptor;
 
   /**
    * Canonical spend for one row, in Engine convention:

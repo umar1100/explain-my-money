@@ -99,6 +99,17 @@ Canonical rules (`Engine.canonicalSpendMinor`, `Engine.spendMagnitudeOf`,
 - payment / transfer / fee / cash advance / uncertain → 0 (money movement, never spend)
 - excluded / duplicate rows → 0 (invisible to every spend figure)
 
+Bill-payment recognition (v18): a negative row whose description STARTS
+with the word PAYMENT (`PAYMENT CIBC`, `PAYMENT`, `PAYMENT - THANK YOU`)
+is classified kind=`payment` at import (`Engine.isBankPaymentDescriptor`),
+so a card bill payment is money movement — it never enters spend and, via
+the v17 fallback, could otherwise be miscounted as a spend-reducing
+statement credit. Anchored, not substring: `TELUS PRE-AUTH PAYMENT` does
+not start with PAYMENT and stays a statement credit (money back). Rows
+imported before v18 are re-classified once by a guarded boot migration
+(`paydesc_v18`); user corrections, manual entries, and household-rule rows
+are never touched.
+
 Rows whose kind a human set explicitly (`classificationSource` `user` or
 `manual`) are trusted as-is and never treated as statement credits.
 
