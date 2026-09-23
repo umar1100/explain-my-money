@@ -467,6 +467,14 @@
     // "TELUS PRE-AUTH PAYMENT" is not (it stays a statement credit via the
     // v17 sign-contradiction fallback). Checked before the substring
     // rules so the anchor wins over any looser keyword.
+    // v19: a parser-verified bill-payments section (CIBC "Your payments"
+    // table) outranks even the descriptor — the statement's own structure
+    // is the strongest evidence. The generic parser's 'payments' section
+    // is NOT trusted (it also covers credit/return sections).
+    if (isParserPaymentSection(r)) {
+      applyKindToRow(r, 'payment', 0.95, "builtin: parser-identified bill-payments section", 'builtin');
+      return downgradeHeuristic(r, parserConfidence);
+    }
     if (isBankPaymentDescriptor(r)) {
       applyKindToRow(r, 'payment', 0.95, 'builtin: bank bill-payment descriptor ("PAYMENT …")', 'builtin');
       return downgradeHeuristic(r, parserConfidence);
@@ -750,6 +758,59 @@
   Engine.isBankPaymentDescriptor = isBankPaymentDescriptor;
 
   /**
+   * v19: bill-payment descriptors VERIFIED against real Canadian statements.
+   * Every one of these starts with the word PAYMENT, so the anchored
+   * isBankPaymentDescriptor rule above recognizes all of them with no
+   * per-issuer special cases. Listed here (and covered by tests) so the
+   * coverage is explicit and reviewable — not guessed.
+   *
+   * Verified examples:
+   *  - CIBC ........... "PAYMENT CIBC" (parsed from a real CIBC statement in-app);
+   *                     plus the parser-identified "Your payments" table section
+   *  - TD ............. "PAYMENT - THANK YOU" (td_statement_extractor README,
+   *                     real TD Emerald Flex Rate Visa rows)
+   *  - RBC ............ "PAYMENT RBC" (transaction-row wording seen by the
+   *                     generic-table parser)
+   *  - Discover ....... "PAYMENT THANK YOU" (Data River statement guide)
+   *  - US Bank ........ "PAYMENT THANK YOU" (sample USBank statement)
+   *  - Amex ........... "PAYMENT - THANK YOU" (Data River statement guide)
+   *  - PC Financial ... any "PAYMENT ..." descriptor via the anchored rule
+   *                     (PC transaction-row wording not independently verified
+   *                     beyond the anchor, so no PC-specific pattern is claimed)
+   *
+   * Anything not verified — other issuers' unknown wordings, "PAYMENTS"
+   * (plural), "TELUS PRE-AUTH PAYMENT" — is NEVER guessed as a payment:
+   * those rows keep flowing to statement credits / Review.
+   */
+  Engine.BANK_PAYMENT_EXAMPLES = [
+    { issuer: 'CIBC', descriptor: 'PAYMENT CIBC' },
+    { issuer: 'CIBC', descriptor: 'PAYMENT - THANK YOU' },
+    { issuer: 'TD', descriptor: 'PAYMENT - THANK YOU' },
+    { issuer: 'RBC', descriptor: 'PAYMENT RBC' },
+    { issuer: 'Discover', descriptor: 'PAYMENT THANK YOU' },
+    { issuer: 'US Bank', descriptor: 'PAYMENT THANK YOU' },
+    { issuer: 'Amex', descriptor: 'PAYMENT - THANK YOU' }
+  ];
+
+  /**
+   * Engine.isParserPaymentSection(r) -> bool.
+   * v19: some parsers positively identify a bill-payments table (CIBC's
+   * "Your payments" heading). Those rows carry section 'payments' AND the
+   * parser's own sectionVerified stamp — trusting them as kind='payment'
+   * is reading the statement's structure, not guessing.
+   *
+   * Conservative by design: the generic-table parser ALSO uses
+   * section 'payments' for credit/return summary sections, so an
+   * unverified section is never trusted — only a parser that explicitly
+   * stamps sectionVerified (currently the CIBC template) qualifies.
+   */
+  function isParserPaymentSection(r) {
+    r = r || {};
+    return r.section === 'payments' && r.sectionVerified === true;
+  }
+  Engine.isParserPaymentSection = isParserPaymentSection;
+
+  /**
    * Canonical spend for one row, in Engine convention:
    *   genuine purchase -> positive spend
    *   refund          -> negative spend (refunds reduce net spend)
@@ -856,6 +917,7 @@
     var gross = 0, refundsMag = 0, stmtCreditsMag = 0, excludedTotal = 0;
     var unresolved = 0;
     var refundCount = 0, stmtCreditCount = 0;
+    var paymentsMag = 0, paymentCount = 0;
     var signedSum = 0, signedKnown = true;
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
@@ -863,6 +925,9 @@
       // mis-signed "purchases" (v17 statement credits) negative as
       // magnitudes, everything else 0 — identical for PDF, CSV and manual
       // row conventions. Excluded/duplicate rows never count toward spend.
+      // v19: bill payments are tracked separately as money movement — they
+      // are NEVER part of net spend, so a payment can never manufacture a
+      // "net credit" or shrink spending.
       var isX = r.excluded || r.status === 'duplicate';
       if (!isX) {
         if (r.kind === 'purchase') {
@@ -871,6 +936,14 @@
           else { gross += c; }
         }
         else if (r.kind === 'refund') { refundsMag += spendMagnitudeOf(r); refundCount++; }
+        else if (r.kind === 'payment') { /* movement: counted below, never spend */ }
+      }
+      // v19: bill payments are money movement. The engine marks them
+      // excluded from spend, so they are counted OUTSIDE the !isX block —
+      // a payment must still be reported even though it never enters
+      // gross/refunds/net. Duplicates stay out.
+      if (r.kind === 'payment' && r.status !== 'duplicate') {
+        paymentsMag += Math.abs(r.amountMinor || 0); paymentCount++;
       }
       if (r.excluded) excludedTotal += Math.abs(r.amountMinor || 0);
       if (rowNeedsReview(r)) unresolved++;
@@ -888,6 +961,10 @@
       // the source convention). Positive display magnitude, always >= 0.
       statementCreditsMinor: stmtCreditsMag,
       statementCreditCount: stmtCreditCount,
+      // v19: bill payments — money movement, never part of net spend.
+      // Positive display magnitude, always >= 0.
+      paymentsTotalMinor: paymentsMag,
+      paymentCount: paymentCount,
       excludedTotalMinor: excludedTotal,
       netSpendMinor: netSpendMinor,
       unresolvedCount: unresolved,
@@ -1163,6 +1240,8 @@
       refundsTotalMinor: rec.refundsTotalMinor,
       statementCreditsMinor: rec.statementCreditsMinor,
       statementCreditCount: rec.statementCreditCount,
+      paymentsTotalMinor: rec.paymentsTotalMinor,
+      paymentCount: rec.paymentCount,
       categoryTotals: categoryTotals,
       deltas: deltas,
       topDrivers: topDrivers,
@@ -1207,6 +1286,7 @@
       // "You spent" frame over a negative total.
       var net = facts.netSpendMinor || 0;
       var sc = facts.statementCreditsMinor || 0;
+      var pay = facts.paymentsTotalMinor || 0;
       if (net < 0) {
         lines.push(period + ' was a net-credit month: you spent ' +
           Engine.fmtMoneyAbs(facts.grossPurchasesMinor || 0) + ' but got ' +
@@ -1215,8 +1295,14 @@
       } else {
         var hl = 'You spent ' + Engine.fmtMoneyAbs(net) + ' in ' + period +
           ' \u2014 after ' + Engine.fmtMoneyAbs(facts.refundsTotalMinor || 0) + ' in refunds';
-        if (sc > 0) hl += ' and ' + Engine.fmtMoneyAbs(sc) + ' in statement credits';
+        if (sc > 0) hl += ' and ' + Engine.fmtMoneyAbs(sc) + ' in other credits';
         lines.push(hl + '.');
+      }
+      // v19: bill payments are money movement, never spending — name them
+      // separately so they can never be mistaken for money back.
+      if (pay > 0) {
+        lines.push('You also paid ' + Engine.fmtMoneyAbs(pay) +
+          ' toward the card bill. That is money movement, not spending, so it is not subtracted above.');
       }
     }
     lines.push('');
@@ -1256,15 +1342,19 @@
     // Refunds & money movement
     lines.push('Refunds & money movement');
     var rs = facts.refundsSummary || { count: 0, totalMinor: 0 };
-    lines.push('- Refunds/credits: ' + rs.count + ' transaction(s), ' +
+    lines.push('- Refunds (money back from stores): ' + rs.count + ' transaction(s), ' +
       Engine.fmtMoneyAbs(rs.totalMinor || 0) + ' back.');
     if ((facts.statementCreditsMinor || 0) > 0) {
-      lines.push('- Statement credits (returns/rebates the import could not ' +
-        'match to a refund word): ' + (facts.statementCreditCount || 0) +
+      lines.push('- Other credits (money back that is not a store refund): ' + (facts.statementCreditCount || 0) +
         ' transaction(s), ' + Engine.fmtMoneyAbs(facts.statementCreditsMinor) + ' back.');
     }
-    lines.push('- Gross purchases before refunds: ' + Engine.fmtMoneyAbs(facts.grossPurchasesMinor || 0) + '.');
-    lines.push('- Card payments and transfers are money movement, not spending: they never appear in the totals above.');
+    lines.push('- Gross purchases before money back: ' + Engine.fmtMoneyAbs(facts.grossPurchasesMinor || 0) + '.');
+    if ((facts.paymentsTotalMinor || 0) > 0) {
+      lines.push('- Bill payments (what you paid toward the card bill): ' + (facts.paymentCount || 0) +
+        ' transaction(s), ' + Engine.fmtMoneyAbs(facts.paymentsTotalMinor) + '. Money movement, not spending — never subtracted above.');
+    } else {
+      lines.push('- Card payments and transfers are money movement, not spending: they never appear in the totals above.');
+    }
     lines.push('');
 
     // Needs your review

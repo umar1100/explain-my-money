@@ -251,7 +251,10 @@ async function main() {
   // (gross − refunds = net) with excluded shown as a note, not a subtraction.
   ok(spendAns.body.indexOf('$1,315.66') !== -1, 'q-spend shows net magnitude', spendAns.body.slice(0, 120));
   ok(spendAns.body.indexOf('− Excluded</th>') === -1, 'q-spend no longer subtracts excluded twice', spendAns.body.slice(0, 600));
-  ok(/Excluded by you/.test(spendAns.body), 'q-spend notes the excluded amount', spendAns.body.slice(0, 600));
+  ok(/Left out of spending/.test(spendAns.body), 'q-spend notes the excluded amount', spendAns.body.slice(0, 600));
+  // v19: bill payments are named on their own line — movement, not spending.
+  ok(/Bill payments/.test(spendAns.body) && /never subtracted/.test(spendAns.body),
+    'q-spend names bill payments separately (never subtracted)', spendAns.body.slice(0, 900));
   ok(App.matchQuestion('why did groceries rise') === 'q-change' || App.matchQuestion('why did groceries rise') === 'q-grocery', 'keyword routing works');
 
   // --- audit trail ---

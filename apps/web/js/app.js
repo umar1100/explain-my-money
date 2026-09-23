@@ -420,6 +420,7 @@ App.boot = async function () {
   }
   await App.migrateSignConvention();
   await App.migratePaymentDescriptors();
+  await App.migratePaymentClarity();
   await App.seedCategories();
 
   var statements = await sAll('statements');
@@ -496,6 +497,56 @@ App.migratePaymentDescriptors = async function () {
     }
     await App.prefSet('paydesc_v18', '1');
     try { audit('migrate.paydesc', 'db', 'txns', { reclassified: n }); } catch (e2) { /* audit best-effort */ }
+  } catch (e) { /* migration is best-effort: unmatched rows keep their stored kind */ }
+};
+
+/* ============================================================================
+ * v19 migration — parser-verified bill-payment sections + clarified naming.
+ *
+ * Two jobs, one pass, guarded by pref 'payclarity_v19':
+ *  1. Rows in a parser-VERIFIED bill-payments section (CIBC "Your payments"
+ *     table, stamped sectionVerified at import) that are still builtin-
+ *     classified get re-run through the v19 classifier, which trusts the
+ *     verified section as kind='payment'. This also re-runs the anchored
+ *     PAYMENT-descriptor rule (idempotent: v18 already applied it).
+ *  2. No data changes beyond reclassification — the "refund vs other
+ *     credit vs bill payment" naming lives in the UI and reconcile math.
+ *
+ * Sacred, never touched: user corrections (classificationSource 'user'),
+ * manual rows, and household-rule classifications — same rule as v18.
+ */
+App.migratePaymentClarity = async function () {
+  try {
+    if (await App.prefGet('payclarity_v19') === '1') return;
+  } catch (e) { return; }
+  try {
+    var rules = rulePayloads(await enabledRules());
+    var statements = await sAll('statements');
+    var cibcStmt = {};
+    statements.forEach(function (s) {
+      if (/^cibc/i.test(String((s || {}).templateId || ''))) cibcStmt[String(s.id)] = 1;
+    });
+    var txns = await sAll('txns');
+    var n = 0;
+    for (var i = 0; i < txns.length; i++) {
+      var t = txns[i];
+      if (!t || t.classificationSource !== 'builtin') continue;
+      var hit = Engine.isBankPaymentDescriptor(t);
+      // Parser-verified section: stamp sectionVerified on the stored row
+      // (imports before v19 carried the section but not the stamp), then
+      // let the classifier trust it. Generic 'payments' sections are NOT
+      // stamped — they mix credits/returns with payments.
+      if (!hit && t.section === 'payments' && cibcStmt[String(t.statementId)]) {
+        t.sectionVerified = true;
+        hit = true;
+      }
+      if (!hit) continue;
+      Engine.classifyRows([t], rules);
+      await Store.put('txns', t);
+      n++;
+    }
+    await App.prefSet('payclarity_v19', '1');
+    try { audit('migrate.payclarity', 'db', 'txns', { reclassified: n }); } catch (e2) { /* audit best-effort */ }
   } catch (e) { /* migration is best-effort: unmatched rows keep their stored kind */ }
 };
 
@@ -1461,6 +1512,9 @@ App.Actions['confirm-import'] = async function () {
     if (r.confidence === 'low' || r.confidence === 'medium' || r.confidence === 'high') o.confidence = r.confidence;
     if (r.confidenceNote) o.confidenceNote = String(r.confidenceNote);
     if (r.section) o.section = String(r.section);
+    // v19: parser-verified bill-payments section (CIBC "Your payments"
+    // table) — lets the classifier trust the section without guessing.
+    if (r.sectionVerified === true) o.sectionVerified = true;
     if (r.spendCategoryRaw) o.spendCategoryRaw = String(r.spendCategoryRaw);
     if (r.fxOriginalAmount) o.fxOriginalAmount = String(r.fxOriginalAmount);
     if (r.fxCurrency) o.fxCurrency = String(r.fxCurrency);
@@ -1833,8 +1887,12 @@ App.stageReconcile = async function (pipe) {
     '<li>Gross purchases: <strong>' + spendAbs(recon.grossPurchasesMinor) + '</strong></li>' +
     '<li>Refunds: <strong>' + spendAbs(recon.refundsTotalMinor) + '</strong></li>' +
     ((recon.statementCreditsMinor || 0) > 0
-      ? '<li>Statement credits: <strong>' + spendAbs(recon.statementCreditsMinor) + '</strong> (' +
-        (recon.statementCreditCount || 0) + ' row(s) printed as credits but classified as purchases)</li>'
+      ? '<li>Other credits: <strong>' + spendAbs(recon.statementCreditsMinor) + '</strong> (' +
+        (recon.statementCreditCount || 0) + ' row(s) of money back that is not a store refund)</li>'
+      : '') +
+    ((recon.paymentsTotalMinor || 0) > 0
+      ? '<li>Bill payments: <strong>' + spendAbs(recon.paymentsTotalMinor) + '</strong> (' +
+        (recon.paymentCount || 0) + ' row(s) — money movement, not spending)</li>'
       : '') +
     '<li>Excluded: <strong>' + spendAbs(recon.excludedTotalMinor) + '</strong></li>' +
     '<li>Net spend: <strong>' + spendAbs(recon.netSpendMinor) + '</strong></li>' +
@@ -2347,9 +2405,13 @@ App.Actions['confirm-match'] = async function (d) {
  * raw-vs-normalized, one-tap corrections, "make this a rule", duplicates.
  * ========================================================================== */
 
-/** Tab key for a txn. */
+/** Tab key for a txn.
+ * v19: bill payments / transfers / fees are money movement — they live on
+ * the "Payments & transfers" tab even though the engine marks them
+ * excluded from spend (excluded never counted toward totals). */
 function txnTab(t) {
   t = nt(t);
+  if (t.kind === 'payment' || t.kind === 'transfer' || t.kind === 'fee') return 'payments';
   if (t.excluded) return 'excluded';
   if (t.status === 'duplicate' || t.kind === 'duplicate-candidate') return 'duplicates';
   if (App.needsReview(t)) return 'uncertain';
@@ -2480,23 +2542,31 @@ App.vStatement = async function (v, seq) {
     html += '<p class="small">' + esc(st.scopeLabel || st.periodLabel || '') + ' · ' + txns.length + ' transactions</p>';
   }
 
-  // Reconciliation strip: gross − refunds = net (the Engine reports canonical
-  // spend magnitudes — purchases positive, refunds positive-as-magnitude;
-  // we display labeled magnitudes so "net spend" never reads as a
-  // negative). Excluded rows never enter gross, so they are an informational
-  // note, not a subtraction line. When the statement carries reported
-  // balances (PDF imports), the strip proves the rows add up to them.
+  // Reconciliation strip: gross − refunds − other credits = net (the Engine
+  // reports canonical spend magnitudes — purchases positive, refunds
+  // positive-as-magnitude; we display labeled magnitudes so "net spend"
+  // never reads as a negative). Bill payments are money movement, never
+  // part of the equation — they get their own informational row, not a
+  // subtraction line. Excluded rows never enter gross, so they are an
+  // informational note, not a subtraction line. When the statement carries
+  // reported balances (PDF imports), the strip proves the rows add up.
   html += '<div class="strip" role="region" aria-label="Reconciliation">' +
     '<div class="s-row"><span>Gross purchases</span><span>' + spendAbs(recon.grossPurchasesMinor) + '</span></div>' +
-    '<div class="s-row"><span>− Refunds</span><span>' + spendAbs(recon.refundsTotalMinor) + '</span></div>' +
+    '<div class="s-row"><span>− Refunds (money back from stores)</span><span>' + spendAbs(recon.refundsTotalMinor) + '</span></div>' +
     ((recon.statementCreditsMinor || 0) > 0
-      ? '<div class="s-row"><span>− Statement credits</span><span>' + spendAbs(recon.statementCreditsMinor) + '</span></div>'
+      ? '<div class="s-row"><span>− Other credits</span><span>' + spendAbs(recon.statementCreditsMinor) + '</span></div>'
       : '') +
     '<div class="s-row s-net"><span>' + (recon.netSpendMinor < 0 ? 'Net credit' : 'Net spend') + '</span><span>' + spendAbs(recon.netSpendMinor) + '</span></div>' +
+    // v19: bill payments shown separately — movement, not spending, never
+    // subtracted. The excluded note nets them out so the same dollars are
+    // not mentioned twice with different words.
+    ((recon.paymentsTotalMinor || 0) > 0
+      ? '<div class="s-row"><span>Bill payments (movement, not spending)</span><span>' + spendAbs(recon.paymentsTotalMinor) + '</span></div>'
+      : '') +
     '<div class="s-note">' + (recon.unresolvedCount ? recon.unresolvedCount + ' unresolved · ' : '') +
     'balance check: ' + esc(String(recon.balanceCheck)) +
     (recon.gapMinor ? ' · gap ' + money(recon.gapMinor) : '') +
-    (recon.excludedTotalMinor ? ' · excluded ' + spendAbs(recon.excludedTotalMinor) + ' (not counted)' : '') + '</div>';
+    (otherExcluded(recon) ? ' · excluded ' + spendAbs(otherExcluded(recon)) + ' (not counted)' : '') + '</div>';
   if (stmtReported) {
     html += '<div class="s-note">Reported: ' + money(stmtReported.startMinor) + ' → ' +
       money(stmtReported.endMinor) + ' · rows sum: ' + money(recon.signedRowsSumMinor) + '</div>';
@@ -3575,7 +3645,12 @@ App.monthContext = async function () {
   var deltas = facts ? (facts.deltas || []) : [];
   var drivers = facts ? (facts.topDrivers || []) : [];
   var rs = facts ? facts.refundsSummary : null;
-  var move = mTxns.filter(function (t) { return ['refund', 'payment', 'transfer', 'fee'].indexOf(t.kind) !== -1 && !t.excluded; });
+  // v19: movement rows for the month view. Payments, transfers and fees
+  // are engine-excluded from spend (movement, not spending) — that must
+  // NOT hide them here. Only duplicates stay out.
+  var move = mTxns.filter(function (t) {
+    return ['refund', 'payment', 'transfer', 'fee'].indexOf(t.kind) !== -1 && t.status !== 'duplicate';
+  });
 
   var briefingText = '';
   try { briefingText = facts ? Engine.renderBriefingText(facts) : ''; } catch (e) { briefingText = ''; }
@@ -3648,21 +3723,29 @@ App.headlineHtml = function (ctx) {
   }
   var buildup = '<span>' + spendAbs(r.grossPurchasesMinor) + ' purchases</span>';
   if ((r.refundsTotalMinor || 0) > 0 || at.outMinor || at.inMinor) {
-    buildup += ' <span aria-hidden="true">&minus;</span> <span>' + spendAbs(at.attrRefundsMinor) + ' refunds</span>';
+    buildup += ' <span aria-hidden="true">&minus;</span> <span>' + spendAbs(at.attrRefundsMinor) + ' refunds (money back from stores)</span>';
   }
   // v17: statement credits (returns/rebates the import couldn't classify
   // as refunds) are their own subtraction line, so the build-up resolves.
+  // v19: renamed "other credits" so the app never claims it knows the exact
+  // reason for the money back. Bill payments are NEVER in this equation.
   if (sc > 0) {
-    buildup += ' <span aria-hidden="true">&minus;</span> <span>' + spendAbs(sc) + ' statement credits</span>';
+    buildup += ' <span aria-hidden="true">&minus;</span> <span>' + spendAbs(sc) + ' other credits</span>';
   }
   var label = net < 0 ? 'Net credit' : 'Net spend';
   var creditNote = net < 0
     ? '<p class="small" style="margin-bottom:0">You got back more than you spent this month.</p>'
     : '';
+  // v19: bill payments are money movement, never spending — shown on their
+  // own line, explicitly NOT subtracted in the equation above.
+  var pay = r.paymentsTotalMinor || 0;
+  var payNote = pay > 0
+    ? '<p class="small" style="margin-bottom:0">Bill payments: <strong>' + spendAbs(pay) + '</strong> &mdash; money movement, not spending. Not subtracted above.</p>'
+    : '';
   return '<div class="card hero"><div class="headline-label">' + label + ' &middot; ' + esc(fmtPeriod(ctx.month)) + '</div>' +
     '<div class="headline-num">' + spendAbs(net) + '</div>' +
     '<div class="hero-sub">' + buildup + '</div>' +
-    retNote + creditNote +
+    retNote + creditNote + payNote +
     '<p class="small" style="margin-bottom:0">' + esc(ctx.headline || ('Across ' + ctx.mTxns.length + ' transactions in ' + fmtPeriod(ctx.month) + ', all accounts.')) + '</p></div>';
 };
 
@@ -3771,11 +3854,22 @@ App.homeAskHtml = async function () {
 
 /** Excluded rows never enter gross/refunds/net, so they are an informational
  *  note — never a subtraction line (that would double-count them). Pure. */
-App.excludedNoteHtml = function (recon) {
+/** v19: excluded magnitudes minus bill payments. Payments get their own
+ *  named row (money movement, not spending), so the excluded note must not
+ *  mention the same dollars twice. Pure. */
+function otherExcluded(recon) {
   var x = (recon || {}).excludedTotalMinor || 0;
+  var p = (recon || {}).paymentsTotalMinor || 0;
+  return Math.max(0, x - p);
+}
+App.excludedNoteHtml = function (recon) {
+  var x = otherExcluded(recon);
   if (!x) return '';
-  return '<p class="tiny" style="margin-bottom:0">Excluded by you: <strong>' +
-    spendAbs(x) + '</strong> &mdash; left out of this total entirely.</p>';
+  // v19: "excluded" is not always the user's doing — the engine itself
+  // leaves movement (payments, transfers, fees) out of spend — so the
+  // note names the effect, not the actor.
+  return '<p class="tiny" style="margin-bottom:0">Left out of spending: <strong>' +
+    spendAbs(x) + '</strong> &mdash; not counted in this total.</p>';
 };
 
 /** Refunds & money-movement summary line. Honest about attribution: when
@@ -3788,7 +3882,11 @@ App.refundsNoteHtml = function (recon, rs) {
   var total = rs ? rs.totalMinor : r.refundsTotalMinor;
   var count = rs ? rs.count : (r.refundCount || 0);
   var at = App.attributedRefunds(r);
-  var s = 'Refunds received: <strong>' + spendAbs(total) + '</strong> across ' + count +
+  // v19: three distinct concepts — (1) refunds: money back from stores,
+  // (2) other credits: money back the app cannot confidently tie to a
+  // store, (3) bill payments: money you paid toward the card bill
+  // (movement, never subtracted from spending).
+  var s = 'Refunds (money back from stores): <strong>' + spendAbs(total) + '</strong> across ' + count +
     ' transaction' + (count === 1 ? '' : 's');
   if (at.outMinor || at.inMinor) {
     var netted = (total || 0) - at.outMinor + at.inMinor;
@@ -3799,15 +3897,19 @@ App.refundsNoteHtml = function (recon, rs) {
   } else {
     s += ' (already subtracted from net spend).';
   }
-  // v17: statement credits (credits the import couldn't classify as refunds)
-  // are their own subtraction line in the hero build-up — name them here too
-  // so this section accounts for every subtraction.
   var sc = r.statementCreditsMinor || 0;
   if (sc > 0) {
     var scCount = r.statementCreditCount || 0;
-    s += ' Statement credits: <strong>' + spendAbs(sc) + '</strong> across ' + scCount +
+    s += ' Other credits (money back that is not a store refund): <strong>' + spendAbs(sc) + '</strong> across ' + scCount +
       ' transaction' + (scCount === 1 ? '' : 's') +
-      ' (printed as credits but classified as purchases — also subtracted from net spend).';
+      ' (also subtracted from net spend).';
+  }
+  var pay = r.paymentsTotalMinor || 0;
+  if (pay > 0) {
+    var payCount = r.paymentCount || 0;
+    s += ' Bill payments (what you paid toward the card bill): <strong>' + spendAbs(pay) + '</strong> across ' + payCount +
+      ' transaction' + (payCount === 1 ? '' : 's') +
+      ' — money movement, not spending, and never subtracted.';
   }
   return '<p class="small">' + s + '</p>';
 };
@@ -3851,8 +3953,20 @@ App.monthDetailsHtml = async function (ctx) {
   html += '<div class="section-head"><h2>Refunds &amp; money movement</h2>' +
     '<button class="linklike" data-action="wrong" data-filter="refunds">This explanation is wrong</button></div>';
   if (ctx.move.length) {
+    var payRows = ctx.move.filter(function (t) { return t.kind === 'payment'; });
+    var otherMove = ctx.move.filter(function (t) { return t.kind !== 'payment'; });
     html += '<div class="card">';
-    ctx.move.slice(0, 8).forEach(function (t) {
+    // v19: bill payments are money movement — grouped under their own
+    // labeled heading so they can never be read as refunds or credits.
+    if (payRows.length) {
+      html += '<p class="tiny" style="margin:0 0 4px"><strong>Bill payments</strong> &mdash; money movement, not spending (never subtracted):</p>';
+      payRows.slice(0, 8).forEach(function (t) {
+        t = nt(t);
+        html += '<div class="bar-row"><span class="b-label">' + esc(t.desc) + '</span>' +
+          '<span class="b-amt">' + spendAbs(t.amountMinor) + ' &middot; bill payment</span></div>';
+      });
+    }
+    otherMove.slice(0, 8).forEach(function (t) {
       t = nt(t);
       html += '<div class="bar-row"><span class="b-label">' + esc(t.desc) + '</span>' +
         '<span class="b-amt">' + money(t.amountMinor) + ' \u00b7 ' + esc(kindLabel(t.kind)) + '</span></div>';
@@ -4165,7 +4279,7 @@ App.askCtx = async function () {
   var askReported = (st && typeof st.reportedStartMinor === 'number' && typeof st.reportedEndMinor === 'number')
     ? { startMinor: st.reportedStartMinor, endMinor: st.reportedEndMinor } : null;
   try { recon = Engine.reconcile(txns, askReported); } catch (e) {
-    recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, statementCreditsMinor: 0, statementCreditCount: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'unavailable', gapMinor: null };
+    recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, statementCreditsMinor: 0, statementCreditCount: 0, paymentsTotalMinor: 0, paymentCount: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'unavailable', gapMinor: null };
   }
   var briefs = (await sAll('briefings')).filter(function (b) { return String(b.statementId) === String(st.id); });
   briefs.sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
@@ -4225,9 +4339,12 @@ App.buildAnswer = async function (qid, ctx) {
         '<table class="kv"><tr><th>Gross purchases</th><td>' + spendAbs(recon.grossPurchasesMinor) + '</td></tr>' +
         '<tr><th>− Refunds</th><td>' + spendAbs(recon.refundsTotalMinor) + '</td></tr>' +
         ((recon.statementCreditsMinor || 0) > 0
-          ? '<tr><th>− Statement credits</th><td>' + spendAbs(recon.statementCreditsMinor) + '</td></tr>'
+          ? '<tr><th>− Other credits</th><td>' + spendAbs(recon.statementCreditsMinor) + '</td></tr>'
           : '') +
         '<tr><th>= ' + (recon.netSpendMinor < 0 ? 'Net credit' : 'Net spend') + '</th><td><strong>' + spendAbs(recon.netSpendMinor) + '</strong></td></tr></table>' +
+        ((recon.paymentsTotalMinor || 0) > 0
+          ? '<p class="small">Bill payments: <strong>' + spendAbs(recon.paymentsTotalMinor) + '</strong> &mdash; money movement, not spending, never subtracted above.</p>'
+          : '') +
         App.excludedNoteHtml(recon) +
         '<p class="small">Payments and transfers are money movement, not spending — they never enter this total.</p>',
       txnIds: ids(purch), basis: purch.length + ' purchase transactions', confidence: ctx.confidence };
@@ -5371,7 +5488,7 @@ App._test = {
   searchTxns: App.searchTxns, applyBalanceCheckPolicy: App.applyBalanceCheckPolicy,
   defaultBudgetMonth: App.defaultBudgetMonth, catLabelSmart: catLabelSmart,
   parseDollarsToMinor: App.parseDollarsToMinor, subDismissSlug: App.subDismissSlug,
-  matchQuestion: App.matchQuestion, shortHash: shortHash,
+  matchQuestion: App.matchQuestion, shortHash: shortHash, otherExcluded: otherExcluded,
   _paginate: App._paginate, _dupCacheKey: App._dupCacheKey, TXN_PAGE_SIZE: App.TXN_PAGE_SIZE,
   /* Auto-categorization (Problem A) + Month aggregation (Problem B). */
   needsCategory: needsCategory, needsReview: App.needsReview, reviewTxns: App.reviewTxns, monthsWithData: App.monthsWithData,

@@ -149,7 +149,7 @@ const text = E.renderBriefingText(brief);
 ok(text.indexOf('-$') === -1, 'briefing text never prints -$', text.split('\n')[0]);
 ok(text.indexOf('You spent $135.00 in June 2026') !== -1, 'briefing headline magnitude', text.split('\n')[0]);
 ok(text.indexOf('after $15.00 in refunds') !== -1, 'briefing refunds magnitude', text.split('\n')[0]);
-ok(text.indexOf('Gross purchases before refunds: $150.00') !== -1, 'briefing gross magnitude');
+ok(text.indexOf('Gross purchases before money back: $150.00') !== -1, 'briefing gross magnitude');
 ok(E.fmtMoneyAbs(-123456) === '$1,234.56', 'fmtMoneyAbs', E.fmtMoneyAbs(-123456));
 
 /* ---------- splitAwareNetCategoryTotals: movers compare bar figures ---------- */

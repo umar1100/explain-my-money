@@ -83,8 +83,11 @@ const btext = E.renderBriefingText(facts);
 ok(btext.indexOf('-$') === -1, 'briefing never prints -$');
 ok(btext.indexOf('You spent $14,951.02 in June 2026') !== -1, 'briefing headline = canonical net', btext.split('\n')[0]);
 ok(btext.indexOf('after $798.41 in refunds') !== -1, 'briefing refunds magnitude');
-ok(btext.indexOf('Gross purchases before refunds: $15,749.43') !== -1, 'briefing gross magnitude');
-ok(btext.indexOf('Card payments and transfers are money movement, not spending') !== -1, 'briefing states movement policy');
+ok(btext.indexOf('Gross purchases before money back: $15,749.43') !== -1, 'briefing gross magnitude');
+// v19: the fixture carries two bill payments ($7,539.98), so the briefing
+// names them on their own line — movement, never subtracted.
+ok(btext.indexOf('Bill payments (what you paid toward the card bill)') !== -1, 'briefing states movement policy');
+ok(btext.indexOf('$7,539.98') !== -1 && btext.indexOf('never subtracted') !== -1, 'briefing payment total never subtracted');
 
 /* Hero build-up resolves: gross - refunds = net (no unexplained gap). */
 ok(recon.grossPurchasesMinor - recon.refundsTotalMinor === recon.netSpendMinor, 'hero build-up resolves exactly');

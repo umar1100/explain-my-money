@@ -99,23 +99,34 @@ Canonical rules (`Engine.canonicalSpendMinor`, `Engine.spendMagnitudeOf`,
 - payment / transfer / fee / cash advance / uncertain → 0 (money movement, never spend)
 - excluded / duplicate rows → 0 (invisible to every spend figure)
 
-Bill-payment recognition (v18): a negative row whose description STARTS
-with the word PAYMENT (`PAYMENT CIBC`, `PAYMENT`, `PAYMENT - THANK YOU`)
-is classified kind=`payment` at import (`Engine.isBankPaymentDescriptor`),
-so a card bill payment is money movement — it never enters spend and, via
-the v17 fallback, could otherwise be miscounted as a spend-reducing
-statement credit. Anchored, not substring: `TELUS PRE-AUTH PAYMENT` does
-not start with PAYMENT and stays a statement credit (money back). Rows
-imported before v18 are re-classified once by a guarded boot migration
-(`paydesc_v18`); user corrections, manual entries, and household-rule rows
-are never touched.
+Bill-payment recognition (v18/v19): a credit-signed row whose description
+STARTS with the word PAYMENT (`PAYMENT CIBC`, `PAYMENT`, `PAYMENT - THANK
+YOU`) is classified kind=`payment` at import
+(`Engine.isBankPaymentDescriptor`), so a card bill payment is money
+movement — it never enters spend and, via the v17 fallback, could
+otherwise be miscounted as a spend-reducing statement credit. Anchored,
+not substring: `TELUS PRE-AUTH PAYMENT` does not start with PAYMENT and
+stays a statement credit (money back). The verified patterns are
+documented in `Engine.BANK_PAYMENT_EXAMPLES` (CIBC, TD, RBC, Amex, … —
+only patterns checked against real statements are listed; anything
+unverified is never guessed). v19 additionally trusts a
+parser-VERIFIED bill-payments section (`Engine.isParserPaymentSection`):
+the CIBC parser stamps `sectionVerified` on rows from the "Your payments"
+table, so those rows classify as payments from the statement's own
+structure. The generic-table parser's `payments` section is NOT trusted
+(it also covers credit/return sections). Rows imported before v18/v19
+are re-classified once by guarded boot migrations (`paydesc_v18`,
+`payclarity_v19`); user corrections, manual entries, and household-rule
+rows are never touched.
 
 Rows whose kind a human set explicitly (`classificationSource` `user` or
 `manual`) are trusted as-is and never treated as statement credits.
 
 `Engine.reconcile()` reports `grossPurchasesMinor` (genuine purchases only),
 `refundsTotalMinor` (always ≥ 0), `statementCreditsMinor` /
-`statementCreditCount` (v17, always ≥ 0), and
+`statementCreditCount` (v17, always ≥ 0), `paymentsTotalMinor` /
+`paymentCount` (v19: bill payments — money movement, always ≥ 0, never
+part of net spend), and
 `netSpendMinor = gross − refunds − statementCredits`. All user-facing
 spend labels show magnitudes (`You spent $X`, never `You spent -$X`); a
 negative net is labeled **Net credit** honestly instead of "Net spend".
@@ -124,7 +135,7 @@ informational only, never subtracted.
 
 View inclusion rules:
 
-- Hero build-up always resolves: purchases − attributed refunds − statement credits = net.
+- Hero build-up always resolves: purchases − attributed refunds − other credits = net. Bill payments are shown on their own line (money movement, not spending — never subtracted).
 - Category bars net refunds and statement credits (same figures the movers compare); their
   signed sum equals the unattributed net. A net-negative category is tagged "credit".
 - Receipt coverage denominator is the canonical genuine-purchase gross over the

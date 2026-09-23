@@ -965,6 +965,10 @@
         pageNumber: page,
         rowIndex: rows.length,
         section: section,
+        // v19: the parser positively identified the "Your payments" table,
+        // so the engine may trust these rows as bill payments without
+        // guessing from the descriptor text.
+        sectionVerified: section === 'payments' ? true : undefined,
         signedAmountMinor: signedAmountMinor,
         transDateInferred: inferred,
         dateInferred: inferred, // harness-wide alias; the engine falls back to it
