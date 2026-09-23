@@ -62,9 +62,12 @@ const cov = E.coverageOfTxns(txns, []);
 ok(cov.grossMinor === recon.grossPurchasesMinor, 'receipt denominator == canonical gross ($15,749.43)', cov.grossMinor);
 ok(cov.grossMinor === EXP.grossMinor, 'receipt denominator exact', cov.grossMinor);
 
-/* Same logical ledger stored entirely PDF-style gives identical totals. */
+/* Same logical ledger stored entirely PDF-style gives identical totals.
+   v17: converting the storage convention means converting the provenance
+   stamp too — a real PDF import carries both together. */
 const allPdf = txns.map((t) => {
   const c = Object.assign({}, t);
+  c.signConvention = 'pdf-card';
   if (c.kind === 'purchase') c.amountMinor = Math.abs(c.amountMinor);
   if (c.kind === 'refund') c.amountMinor = -Math.abs(c.amountMinor);
   return c;

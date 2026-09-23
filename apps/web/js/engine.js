@@ -669,12 +669,84 @@
     return Math.abs(m || 0);
   }
   Engine.spendMagnitudeOf = spendMagnitudeOf;
+
+  /**
+   * v17: which sign a purchase-kind row is EXPECTED to carry, from its
+   * import provenance. Rows are stamped at import with signConvention:
+   *   'pdf-card' - card-centric statements (PC, CIBC, generic PDF template):
+   *                purchases print positive, credits/payments negative.
+   *   'csv'      - CSV imports and manual entries: purchases print negative,
+   *                refunds positive.
+   * A missing stamp defaults to 'pdf-card' (the validated-template path).
+   */
+  function purchaseExpectedSign(r) {
+    return (r && r.signConvention === 'csv') ? -1 : 1;
+  }
+
+  /**
+   * Engine.purchaseSignContradicts(r) -> bool.
+   * True when a purchase-kind row's STORED sign contradicts its source
+   * convention's purchase sign: the row is a credit (return, rebate,
+   * adjustment, goodwill credit) the keyword rules didn't catch, so it
+   * defaulted to kind='purchase'. Such rows must REDUCE spend (they are
+   * statement credits), never add to it.
+   * Rows whose kind a human explicitly set (classificationSource 'user'
+   * correction or 'manual' entry) are trusted as-is: the human decided
+   * what they are. Zero-amount rows never contradict. Pure. Exposed for
+   * tests and views.
+   */
+  function purchaseSignContradicts(r) {
+    r = r || {};
+    if (r.kind !== 'purchase') return false;
+    var src = r.classificationSource;
+    if (src === 'user' || src === 'manual') return false;
+    // amountMinor carries the row's stored sign in its own convention
+    // (normalizeRows copies it to spendAmountMinor for imports, but manual
+    // entries store a positive magnitude in spendAmountMinor — so read
+    // amountMinor here, never spendAmountMinor).
+    var m = r.amountMinor;
+    m = (m === null || m === undefined) ? 0 : m;
+    if (m === 0) return false;
+    return (m > 0 ? 1 : -1) !== purchaseExpectedSign(r);
+  }
+  Engine.purchaseSignContradicts = purchaseSignContradicts;
+
+  /**
+   * Canonical spend for one row, in Engine convention:
+   *   genuine purchase -> positive spend
+   *   refund          -> negative spend (refunds reduce net spend)
+   *   mis-signed purchase (v17: kind='purchase' but stored sign contradicts
+   *     its source convention) -> negative spend (a statement credit)
+   * Everything else (payment / transfer / fee / cash_advance / uncertain),
+   * and any excluded or duplicate row, contributes 0: money movement is
+   * never spend, and excluded rows never count.
+   *
+   * WHY THIS EXISTS (v16): rows reach the ledger in two sign conventions.
+   * PDF imports (PC, CIBC) store card-centric signed amounts: purchases
+   * positive, refunds/payments negative. CSV imports keep the file's own
+   * print convention (many print purchases negative, refunds positive),
+   * and manually added rows use that same CSV convention. Summing
+   * amountMinor raw therefore mixed signs and produced DIFFERENT totals in
+   * different views over the same rows (one real month showed hero
+   * $8,209.45, category bars $14,951.02, receipt coverage $15,749.43, and
+   * the briefing printed "You spent -$8,209.45"). Every spend computation
+   * below goes through this function, so all views agree no matter which
+   * convention a row was stored in. Pure.
+   *
+   * v17 ADDITION: sign provenance alone doesn't fix a CLASSIFICATION error.
+   * A credit whose description matches no refund keyword defaults to
+   * kind='purchase' while keeping its credit sign (negative on PDF cards).
+   * v16 treated that as positive spend. v17 detects the contradiction
+   * (purchaseSignContradicts) and counts it as a statement credit instead.
+   */
   Engine.canonicalSpendMinor = function (r) {
     r = r || {};
     if (r.excluded) return 0;
     if (r.status === 'duplicate') return 0;
     var k = r.kind;
-    if (k === 'purchase') return spendMagnitudeOf(r);
+    if (k === 'purchase') {
+      return purchaseSignContradicts(r) ? -spendMagnitudeOf(r) : spendMagnitudeOf(r);
+    }
     if (k === 'refund') return -spendMagnitudeOf(r);
     return 0;
   };
@@ -687,10 +759,14 @@
    * Engine.reconcile(rows, reported=null) -> {...}
    *
    * CANONICAL SPEND (v16, single source of truth for every view):
-   *   grossPurchasesMinor = sum of purchase magnitudes
+   *   grossPurchasesMinor = sum of genuine purchase magnitudes
    *   refundsTotalMinor   = sum of refund magnitudes (always >= 0)
    *   netSpendMinor       = grossPurchasesMinor - refundsTotalMinor
-   * All three go through Engine.canonicalSpendMinor, so PDF imports
+   *   v17 adds: statementCreditsMinor = sum of magnitudes of purchase-kind
+   *     rows whose stored sign contradicts their source convention
+   *     (purchaseSignContradicts), always >= 0; statementCreditCount counts
+   *     them. netSpendMinor = gross - refunds - statementCredits.
+   * All go through Engine.canonicalSpendMinor, so PDF imports
    * (purchases positive), CSV imports and manual rows (purchases negative)
    * produce identical figures. Money movement (payment / transfer / fee /
    * cash_advance / uncertain) never enters spend.
@@ -739,18 +815,23 @@
   Engine.rowNeedsReview = rowNeedsReview;
 
   Engine.reconcile = function (rows, reported) {
-    var gross = 0, refundsMag = 0, excludedTotal = 0;
+    var gross = 0, refundsMag = 0, stmtCreditsMag = 0, excludedTotal = 0;
     var unresolved = 0;
-    var refundCount = 0;
+    var refundCount = 0, stmtCreditCount = 0;
     var signedSum = 0, signedKnown = true;
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
-      // Canonical spend (v16): purchases positive, refunds negative as
+      // Canonical spend (v16/v17): genuine purchases positive, refunds and
+      // mis-signed "purchases" (v17 statement credits) negative as
       // magnitudes, everything else 0 — identical for PDF, CSV and manual
       // row conventions. Excluded/duplicate rows never count toward spend.
       var isX = r.excluded || r.status === 'duplicate';
       if (!isX) {
-        if (r.kind === 'purchase') gross += spendMagnitudeOf(r);
+        if (r.kind === 'purchase') {
+          var c = Engine.canonicalSpendMinor(r);
+          if (c < 0) { stmtCreditsMag += -c; stmtCreditCount++; }
+          else { gross += c; }
+        }
         else if (r.kind === 'refund') { refundsMag += spendMagnitudeOf(r); refundCount++; }
       }
       if (r.excluded) excludedTotal += Math.abs(r.amountMinor || 0);
@@ -760,11 +841,15 @@
       else signedSum += samt;
     }
     var refundsTotalMinor = refundsMag; // positive display magnitude, always >= 0
-    var netSpendMinor = gross - refundsMag;
+    var netSpendMinor = gross - refundsMag - stmtCreditsMag;
     var result = {
       grossPurchasesMinor: gross,
       refundsTotalMinor: refundsTotalMinor,
       refundCount: refundCount,
+      // v17: mis-classified credits (kind='purchase' but sign contradicts
+      // the source convention). Positive display magnitude, always >= 0.
+      statementCreditsMinor: stmtCreditsMag,
+      statementCreditCount: stmtCreditCount,
       excludedTotalMinor: excludedTotal,
       netSpendMinor: netSpendMinor,
       unresolvedCount: unresolved,
@@ -903,9 +988,11 @@
 
   function totalsByCategory(rows) {
     // Spend rows only: purchases (positive) and refunds (negative credits),
-    // in CANONICAL kind-implied sign (v16) so PDF, CSV and manual rows
-    // agree. Split-aware: a split purchase contributes each split's share
-    // to its split category; shares sum to the row's canonical spend.
+    // in CANONICAL signed value (v16/v17) so PDF, CSV and manual rows
+    // agree, and so mis-signed "purchases" (v17 statement credits) reduce
+    // the category instead of inflating it. Split-aware: a split purchase
+    // contributes each split's share to its split category; shares sum to
+    // the row's canonical spend.
     var totals = {};
     var counts = {};
     var expanded = Engine.expandSplits(rows);
@@ -917,7 +1004,11 @@
       // Excluded/duplicate rows never count toward category totals either.
       if (r.excluded || r.status === 'duplicate') continue;
       var key = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(r);
-      var amt = (r.kind === 'refund' ? -1 : 1) * Math.abs(ex.amountMinor || 0);
+      // v17: a credit row's whole magnitude is credit; the split shares
+      // keep their proportions of it.
+      var canon = Engine.canonicalSpendMinor(r);
+      var sign = canon < 0 ? -1 : 1;
+      var amt = sign * Math.abs(ex.amountMinor || 0);
       totals[key] = (totals[key] || 0) + amt;
       // counts track SOURCE rows per category (a split txn counts once).
       var ck = ex.row + '|' + key;
@@ -937,9 +1028,10 @@
    * Engine.categoryMembers(rows, key) -> [{txn, shareMinor}].
    * Split-aware drill-down behind "Where it went": every purchase/refund row
    * contributing to the categoryTotals `key`, with its canonical signed
-   * share of that total (purchases positive, refunds negative — v16, same
-   * sign convention as totalsByCategory). Excluded/duplicate rows never
-   * count, mirroring totalsByCategory. Pure.
+   * share of that total (genuine purchases positive, refunds and v17
+   * statement credits negative — same sign convention as
+   * totalsByCategory). Excluded/duplicate rows never count, mirroring
+   * totalsByCategory. Pure.
    */
   Engine.categoryMembers = function (rows, key) {
     var out = [];
@@ -951,7 +1043,8 @@
       if (r.excluded || r.status === 'duplicate') continue;
       var k = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(r);
       if (k !== key) continue;
-      var share = (r.kind === 'refund' ? -1 : 1) * Math.abs(ex.amountMinor || 0);
+      var canon = Engine.canonicalSpendMinor(r);
+      var share = (canon < 0 ? -1 : 1) * Math.abs(ex.amountMinor || 0);
       out.push({ txn: r, shareMinor: share });
     }
     return out;
@@ -1001,11 +1094,14 @@
     topDrivers.sort(function (a, b) { return Math.abs(b.totalMinor) - Math.abs(a.totalMinor); });
     topDrivers = topDrivers.slice(0, 5);
 
-    // Receipt coverage: share of purchase rows that carry a linked receipt id.
-    // Rows carry receiptId when app.js links a receipt; engine never invents it.
+    // Receipt coverage: share of genuine purchase rows that carry a linked
+    // receipt id. v17: mis-signed "purchases" (statement credits) are not
+    // purchase spend, so they are excluded from the denominator — same as
+    // coverageOfTxns. Rows carry receiptId when app.js links a receipt;
+    // engine never invents it.
     var purchaseCount = 0, coveredCount = 0;
     for (var p = 0; p < rows.length; p++) {
-      if (rows[p].kind === 'purchase') {
+      if (rows[p].kind === 'purchase' && Engine.canonicalSpendMinor(rows[p]) > 0) {
         purchaseCount++;
         if (rows[p].receiptId) coveredCount++;
       }
@@ -1027,6 +1123,8 @@
       netSpendMinor: rec.netSpendMinor,
       grossPurchasesMinor: rec.grossPurchasesMinor,
       refundsTotalMinor: rec.refundsTotalMinor,
+      statementCreditsMinor: rec.statementCreditsMinor,
+      statementCreditCount: rec.statementCreditCount,
       categoryTotals: categoryTotals,
       deltas: deltas,
       topDrivers: topDrivers,
@@ -1067,8 +1165,21 @@
     } else {
       // Labeled spend figures are magnitudes (v16): "You spent -$X" is
       // never an honest sentence. Signed values stay in txn rows only.
-      lines.push('You spent ' + Engine.fmtMoneyAbs(facts.netSpendMinor || 0) + ' in ' + period +
-        ' \u2014 after ' + Engine.fmtMoneyAbs(facts.refundsTotalMinor || 0) + ' in refunds.');
+      // v17: a net-credit month says so plainly instead of forcing the
+      // "You spent" frame over a negative total.
+      var net = facts.netSpendMinor || 0;
+      var sc = facts.statementCreditsMinor || 0;
+      if (net < 0) {
+        lines.push(period + ' was a net-credit month: you spent ' +
+          Engine.fmtMoneyAbs(facts.grossPurchasesMinor || 0) + ' but got ' +
+          Engine.fmtMoneyAbs((facts.refundsTotalMinor || 0) + sc) +
+          ' back — for a net credit of ' + Engine.fmtMoneyAbs(net) + '.');
+      } else {
+        var hl = 'You spent ' + Engine.fmtMoneyAbs(net) + ' in ' + period +
+          ' \u2014 after ' + Engine.fmtMoneyAbs(facts.refundsTotalMinor || 0) + ' in refunds';
+        if (sc > 0) hl += ' and ' + Engine.fmtMoneyAbs(sc) + ' in statement credits';
+        lines.push(hl + '.');
+      }
     }
     lines.push('');
 
@@ -1109,6 +1220,11 @@
     var rs = facts.refundsSummary || { count: 0, totalMinor: 0 };
     lines.push('- Refunds/credits: ' + rs.count + ' transaction(s), ' +
       Engine.fmtMoneyAbs(rs.totalMinor || 0) + ' back.');
+    if ((facts.statementCreditsMinor || 0) > 0) {
+      lines.push('- Statement credits (returns/rebates the import could not ' +
+        'match to a refund word): ' + (facts.statementCreditCount || 0) +
+        ' transaction(s), ' + Engine.fmtMoneyAbs(facts.statementCreditsMinor) + ' back.');
+    }
     lines.push('- Gross purchases before refunds: ' + Engine.fmtMoneyAbs(facts.grossPurchasesMinor || 0) + '.');
     lines.push('- Card payments and transfers are money movement, not spending: they never appear in the totals above.');
     lines.push('');
@@ -1225,22 +1341,30 @@
    * Engine.coverageOfTxns(txns, matches) -> {ratio, matchedMinor, grossMinor}.
    * Receipt coverage over an explicit txn list: the share of purchase spend
    * carrying a confirmed linked receipt. grossMinor is the CANONICAL
-   * purchase gross (v16) — the same figure as reconcile().grossPurchasesMinor
-   * over the same rows — so the Home receipt-coverage denominator always
-   * equals the hero's purchases figure. Pure.
+   * genuine-purchase gross (v16/v17) — the same figure as
+   * reconcile().grossPurchasesMinor over the same rows — so the Home
+   * receipt-coverage denominator always equals the hero's purchases figure.
+   * v17: purchase-kind rows whose sign contradicts their source convention
+   * (statement credits) are NOT purchase spend, so they are excluded from
+   * both the denominator and the matched numerator. Pure.
    */
   Engine.coverageOfTxns = function (txns, matches) {
     var gross = 0;
     (txns || []).forEach(function (t) {
-      if ((t.kind === 'purchase' || t.kind === 'cash_advance') && !t.excluded)
-        gross += Math.abs(Engine.canonicalSpendMinor(t));
+      if ((t.kind === 'purchase' || t.kind === 'cash_advance') && !t.excluded) {
+        var c = Engine.canonicalSpendMinor(t);
+        if (c > 0) gross += c;
+      }
     });
     var txnById = {};
     (txns || []).forEach(function (t) { txnById[String(t.id)] = t; });
     var matched = 0;
     (matches || []).forEach(function (m) {
       var t = txnById[String(m.txnId)];
-      if (t) matched += Math.abs(Engine.canonicalSpendMinor(t));
+      if (t) {
+        var mc = Engine.canonicalSpendMinor(t);
+        if (mc > 0) matched += mc;
+      }
     });
     return { ratio: gross > 0 ? Math.min(1, matched / gross) : 0, matchedMinor: matched, grossMinor: gross };
   };
@@ -1336,6 +1460,9 @@
       if (t.excluded) continue;
       if (t.status === 'duplicate') continue;
       if (typeof t.date !== 'string' || t.date.indexOf(monthPrefix) !== 0) continue;
+      // v17: a purchase-kind row whose sign contradicts its source convention
+      // is a statement credit, not spend — it must not consume a budget.
+      if (Engine.purchaseSignContradicts(t)) continue;
       var key = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(t);
       totals[key] = (totals[key] || 0) + Math.abs(ex.amountMinor || 0);
     }
@@ -1344,11 +1471,12 @@
 
   /**
    * Engine.splitAwareNetCategoryTotals(txns, monthPrefix) -> {category: minor}.
-   * Split-aware NET category totals for one 'YYYY-MM' month: purchases count
-   * positive, refunds count negative (canonical signs, v16). This is the
-   * month-scoped twin of totalsByCategory's netting — the same figures the
-   * Home "Where it went" bars show — so period-over-period movers compare
-   * the same numbers the bars display.
+   * Split-aware NET category totals for one 'YYYY-MM' month: genuine
+   * purchases count positive, refunds and v17 statement credits count
+   * negative (canonical signs). This is the month-scoped twin of
+   * totalsByCategory's netting — the same figures the Home "Where it went"
+   * bars show — so period-over-period movers compare the same numbers the
+   * bars display.
    */
   Engine.splitAwareNetCategoryTotals = function (txns, monthPrefix) {
     var totals = {};
@@ -1361,7 +1489,8 @@
       if (t.status === 'duplicate') continue;
       if (typeof t.date !== 'string' || t.date.indexOf(monthPrefix) !== 0) continue;
       var key = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(t);
-      var signed = t.kind === 'refund' ? -Math.abs(ex.amountMinor || 0) : Math.abs(ex.amountMinor || 0);
+      var canon = Engine.canonicalSpendMinor(t);
+      var signed = (canon < 0 ? -1 : 1) * Math.abs(ex.amountMinor || 0);
       totals[key] = (totals[key] || 0) + signed;
     }
     return totals;

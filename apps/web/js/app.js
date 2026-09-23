@@ -30,7 +30,8 @@
  *       merchantRaw|description}; returns [score, reasons]; acceptance
  *       threshold Engine.RECEIPT_MATCH_THRESHOLD (0.85).
  *   V7  reconcile(rows, reported=null) -> {grossPurchasesMinor,
- *       refundsTotalMinor, refundCount, excludedTotalMinor, netSpendMinor,
+ *       refundsTotalMinor, refundCount, statementCreditsMinor (v17),
+ *       statementCreditCount (v17), excludedTotalMinor, netSpendMinor,
  *       unresolvedCount, signedRowsSumMinor, balanceCheck, gapMinor}. SIGNED
  *       minor units; excluded counts only when excluded===1. reported:
  *       {startMinor, endMinor}. Card-account equation: the Engine treats
@@ -44,7 +45,8 @@
  *       signedAmountMinor, dateInferred, section, pageNumber, ...}.
  *       Refuses to guess: any unparsed table line throws.
  *   V8  buildBriefing(...) -> facts {periodStart, periodEnd, scopeLabel,
- *       netSpendMinor, grossPurchasesMinor, refundsTotalMinor, categoryTotals,
+ *       netSpendMinor, grossPurchasesMinor, refundsTotalMinor,
+ *       statementCreditsMinor, statementCreditCount (v17), categoryTotals,
  *       deltas[], topDrivers[], refundsSummary, unresolvedCount,
  *       receiptCoveragePct, evidenceTxnIds[], balanceCheck, gapMinor}.
  *       renderBriefingText applies an honesty rule (no final number while
@@ -416,6 +418,7 @@ App.boot = async function () {
       '</div>';
     return;
   }
+  await App.migrateSignConvention();
   await App.seedCategories();
 
   var statements = await sAll('statements');
@@ -430,6 +433,37 @@ App.boot = async function () {
   App.render();
   wireGlobalEvents();
   App.maybeOnboard();
+};
+
+/** v17 one-time data migration: stamp signConvention on txns imported
+ * before the stamp existed, so the Engine's purchaseSignContradicts check
+ * can tell a genuine purchase from a mis-signed credit. Provenance comes
+ * from the statement: a PDF statement (templateId set) prints purchases
+ * positive ('pdf-card'); CSV imports (templateId null) and manual
+ * statements print purchases negative ('csv'). Guarded by a pref so it
+ * runs exactly once; rows already stamped are left untouched. */
+App.migrateSignConvention = async function () {
+  try {
+    if (await App.prefGet('signconv_v17') === '1') return;
+  } catch (e) { return; }
+  try {
+    var statements = await sAll('statements');
+    var convByStmt = {};
+    statements.forEach(function (s) {
+      convByStmt[String(s.id)] = s.templateId ? 'pdf-card' : 'csv';
+    });
+    var txns = await sAll('txns');
+    var n = 0;
+    for (var i = 0; i < txns.length; i++) {
+      var t = txns[i];
+      if (t.signConvention) continue;
+      t.signConvention = convByStmt[String(t.statementId)] || 'pdf-card';
+      await Store.put('txns', t);
+      n++;
+    }
+    await App.prefSet('signconv_v17', '1');
+    try { audit('migrate.signconvention', 'db', 'txns', { stamped: n }); } catch (e2) { /* audit best-effort */ }
+  } catch (e) { /* migration is best-effort: unstamped rows default to 'pdf-card' */ }
 };
 
 /** Seed categories from Engine.defaultCategories() once. */
@@ -717,12 +751,15 @@ App.Actions['manual-save'] = async function () {
   var existing = await sQuery('txns', 'statementId', st.id);
   // Stored shape mirrors commitPipeline: CSV sign convention (purchases
   // negative, refunds positive); spendAmountMinor is the spend magnitude.
+  // v17: stamp signConvention 'csv' so the contradiction detector knows a
+  // negative purchase here is genuine spend, never a mis-signed credit.
   var id = await Store.put('txns', {
     statementId: st.id, manual: true, date: date,
     merchantRaw: desc.toUpperCase().replace(/\s+/g, ' ').trim(),
     rawDescription: desc, rawDateText: date, rawAmountText: raw,
     amountMinor: kind === 'purchase' ? -minor : minor,
     kind: kind, category: cat, spendAmountMinor: minor,
+    signConvention: 'csv',
     currency: 'CAD', excluded: 0, status: 'new', classificationSource: 'manual',
     rowIndex: existing.length, createdAt: Date.now()
   });
@@ -1607,10 +1644,15 @@ App.stageNormalize = async function (pipe) {
     try { return Engine.normalizeRows(chunk); } catch (e) { return chunk; }
   });
   // Merge defensively: normalized rows win, raw fields always present.
+  // v17: stamp the sign provenance so spend math can tell a genuine
+  // purchase from a mis-signed credit. PDF card statements (PC, CIBC,
+  // generic template) print purchases positive ('pdf-card'); CSV files
+  // print purchases negative ('csv').
   pipe.txns = normalized.map(function (n, i) {
     var m = {}; var r = rawRows[i] || {};
     Object.keys(r).forEach(function (k) { m[k] = r[k]; });
     Object.keys(n || {}).forEach(function (k) { m[k] = n[k]; });
+    if (!m.signConvention) m.signConvention = (pipe.fileKind === 'pdf') ? 'pdf-card' : 'csv';
     return m;
   });
   var withDate = pipe.txns.filter(function (t) { return t.date; }).length;
@@ -1722,17 +1764,20 @@ App.stageReconcile = async function (pipe) {
   catch (e) {
     // Last-resort local math mirroring the Engine's corrected card-account
     // equation: (reported_end - reported_start) == SUM(signedAmountMinor).
-    // Mirrors Engine.reconcile (v16 canonical spend): purchases positive,
-    // refunds negative as magnitudes; excluded/duplicate rows never count
-    // toward spend, but still feed the excluded total and the balance-check
-    // sum.
-    var g = 0, rfMag = 0, rfCount = 0, ex = 0, un = 0, sSum = 0, sKnown = true;
+    // Mirrors Engine.reconcile (v16/v17 canonical spend): genuine purchases
+    // positive, refunds and v17 statement credits negative as magnitudes;
+    // excluded/duplicate rows never count toward spend, but still feed the
+    // excluded total and the balance-check sum.
+    var g = 0, rfMag = 0, scMag = 0, rfCount = 0, scCount = 0, ex = 0, un = 0, sSum = 0, sKnown = true;
     pipe.txns.forEach(function (t) {
-      var mag = Engine.spendMagnitudeOf(t);
       var isX = t.excluded || t.status === 'duplicate';
       if (!isX) {
-        if (t.kind === 'purchase') g += mag;
-        else if (t.kind === 'refund') { rfMag += mag; rfCount++; }
+        if (t.kind === 'purchase') {
+          var c = Engine.canonicalSpendMinor(t);
+          if (c < 0) { scMag += -c; scCount++; }
+          else { g += c; }
+        }
+        else if (t.kind === 'refund') { rfMag += Engine.spendMagnitudeOf(t); rfCount++; }
       }
       if (t.excluded) ex += Math.abs(t.amountMinor || 0);
       if (App.needsReview(t)) un++;
@@ -1745,7 +1790,8 @@ App.stageReconcile = async function (pipe) {
       bc = (gap >= -1 && gap <= 1) ? 'ok' : 'gap';
     }
     recon = { grossPurchasesMinor: g, refundsTotalMinor: rfMag, refundCount: rfCount,
-      excludedTotalMinor: ex, netSpendMinor: g - rfMag, unresolvedCount: un,
+      statementCreditsMinor: scMag, statementCreditCount: scCount,
+      excludedTotalMinor: ex, netSpendMinor: g - rfMag - scMag, unresolvedCount: un,
       signedRowsSumMinor: sSum, balanceCheck: bc, gapMinor: gap };
   }
   pipe.recon = recon;
@@ -1753,6 +1799,10 @@ App.stageReconcile = async function (pipe) {
   var detail = '<ul>' +
     '<li>Gross purchases: <strong>' + spendAbs(recon.grossPurchasesMinor) + '</strong></li>' +
     '<li>Refunds: <strong>' + spendAbs(recon.refundsTotalMinor) + '</strong></li>' +
+    ((recon.statementCreditsMinor || 0) > 0
+      ? '<li>Statement credits: <strong>' + spendAbs(recon.statementCreditsMinor) + '</strong> (' +
+        (recon.statementCreditCount || 0) + ' row(s) printed as credits but classified as purchases)</li>'
+      : '') +
     '<li>Excluded: <strong>' + spendAbs(recon.excludedTotalMinor) + '</strong></li>' +
     '<li>Net spend: <strong>' + spendAbs(recon.netSpendMinor) + '</strong></li>' +
     '<li>Unresolved: <strong>' + (recon.unresolvedCount || 0) + '</strong></li>';
@@ -2375,7 +2425,7 @@ App.vStatement = async function (v, seq) {
   var stmtReported = (st && typeof st.reportedStartMinor === 'number' && typeof st.reportedEndMinor === 'number')
     ? { startMinor: st.reportedStartMinor, endMinor: st.reportedEndMinor } : null;
   try { recon = Engine.reconcile(txns, stmtReported); } catch (e) { recon = null; }
-  if (!recon) recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'unavailable', gapMinor: null };
+  if (!recon) recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, statementCreditsMinor: 0, statementCreditCount: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'unavailable', gapMinor: null };
   recon = App.applyBalanceCheckPolicy(recon, st);
 
   var counts = { review: 0, purchases: 0, refunds: 0, payments: 0, duplicates: 0, uncertain: 0, excluded: 0 };
@@ -2406,7 +2456,10 @@ App.vStatement = async function (v, seq) {
   html += '<div class="strip" role="region" aria-label="Reconciliation">' +
     '<div class="s-row"><span>Gross purchases</span><span>' + spendAbs(recon.grossPurchasesMinor) + '</span></div>' +
     '<div class="s-row"><span>− Refunds</span><span>' + spendAbs(recon.refundsTotalMinor) + '</span></div>' +
-    '<div class="s-row s-net"><span>Net spend</span><span>' + spendAbs(recon.netSpendMinor) + '</span></div>' +
+    ((recon.statementCreditsMinor || 0) > 0
+      ? '<div class="s-row"><span>− Statement credits</span><span>' + spendAbs(recon.statementCreditsMinor) + '</span></div>'
+      : '') +
+    '<div class="s-row s-net"><span>' + (recon.netSpendMinor < 0 ? 'Net credit' : 'Net spend') + '</span><span>' + spendAbs(recon.netSpendMinor) + '</span></div>' +
     '<div class="s-note">' + (recon.unresolvedCount ? recon.unresolvedCount + ' unresolved · ' : '') +
     'balance check: ' + esc(String(recon.balanceCheck)) +
     (recon.gapMinor ? ' · gap ' + money(recon.gapMinor) : '') +
@@ -3397,7 +3450,7 @@ App.monthContext = async function () {
   } catch (e) { facts = null; }
   var recon = null;
   try { recon = Engine.reconcile(mTxns, null); } catch (e) { recon = null; }
-  if (!recon) recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'no_baseline', gapMinor: 0 };
+  if (!recon) recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, statementCreditsMinor: 0, statementCreditCount: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'no_baseline', gapMinor: 0 };
   // Return-adjusted headline: refunds linked to purchases in other months are
   // attributed to the purchase's month, so the month you bought something
   // shows the true net. Components (gross/refunds) stay factual as-received.
@@ -3545,11 +3598,14 @@ App.attributedRefunds = function (recon) {
  *  build-up and any return-attribution notes, plus the Engine's first line.
  *  The numbers here already include cross-month return attribution; the
  *  per-account breakdown below applies the same rule, so the two agree.
- *  The build-up always resolves: purchases minus attributed refunds equals
- *  the headline net. */
+ *  The build-up always resolves: purchases minus attributed refunds minus
+ *  v17 statement credits equals the headline net. When the net is negative
+ *  the label says "Net credit" honestly instead of "Net spend". */
 App.headlineHtml = function (ctx) {
   var r = ctx.recon || {};
   var at = App.attributedRefunds(r);
+  var net = r.netSpendMinor || 0;
+  var sc = r.statementCreditsMinor || 0;
   var retNote = '';
   if (at.outMinor || at.inMinor) {
     retNote = '<p class="tiny" style="margin-bottom:0">Returns are counted in the month of the original purchase' +
@@ -3561,10 +3617,19 @@ App.headlineHtml = function (ctx) {
   if ((r.refundsTotalMinor || 0) > 0 || at.outMinor || at.inMinor) {
     buildup += ' <span aria-hidden="true">&minus;</span> <span>' + spendAbs(at.attrRefundsMinor) + ' refunds</span>';
   }
-  return '<div class="card hero"><div class="headline-label">Net spend &middot; ' + esc(fmtPeriod(ctx.month)) + '</div>' +
-    '<div class="headline-num">' + spendAbs(r.netSpendMinor) + '</div>' +
+  // v17: statement credits (returns/rebates the import couldn't classify
+  // as refunds) are their own subtraction line, so the build-up resolves.
+  if (sc > 0) {
+    buildup += ' <span aria-hidden="true">&minus;</span> <span>' + spendAbs(sc) + ' statement credits</span>';
+  }
+  var label = net < 0 ? 'Net credit' : 'Net spend';
+  var creditNote = net < 0
+    ? '<p class="small" style="margin-bottom:0">You got back more than you spent this month.</p>'
+    : '';
+  return '<div class="card hero"><div class="headline-label">' + label + ' &middot; ' + esc(fmtPeriod(ctx.month)) + '</div>' +
+    '<div class="headline-num">' + spendAbs(net) + '</div>' +
     '<div class="hero-sub">' + buildup + '</div>' +
-    retNote +
+    retNote + creditNote +
     '<p class="small" style="margin-bottom:0">' + esc(ctx.headline || ('Across ' + ctx.mTxns.length + ' transactions in ' + fmtPeriod(ctx.month) + ', all accounts.')) + '</p></div>';
 };
 
@@ -3598,14 +3663,17 @@ App.homeCategoriesHtml = function (ctx) {
   for (i = 0; i < drivers.length; i++) {
     var d = drivers[i];
     var pct = max ? Math.round(100 * Math.abs(d.totalMinor || 0) / max) : 0;
+    // v17: a category whose total is negative is a net credit for the month
+    // (returns/credits outweighed purchases) — say so, don't show it as spend.
+    var creditTag = (d.totalMinor || 0) < 0 ? ' <span class="tiny">credit</span>' : '';
     html += '<button class="driver" data-action="open-homecat" data-cat="' + esc(d.category || '') + '">' +
       '<span class="d-main"><span class="d-name">' + esc(catLabelSmart(d.category || '')) + '</span><br>' +
       '<span class="d-sub">' + (d.txnCount || 0) + ' transaction' + ((d.txnCount || 0) === 1 ? '' : 's') + '</span>' +
       '<span class="b-track" style="display:block;margin-top:6px"><span class="b-fill" style="width:' + pct + '%"></span></span></span>' +
-      '<span class="d-amt">' + spendAbs(d.totalMinor) + '</span></button>';
+      '<span class="d-amt">' + spendAbs(d.totalMinor) + creditTag + '</span></button>';
   }
   html += '<p class="tiny" style="margin-bottom:0">Top categories for ' + esc(fmtPeriod(ctx.month)) +
-    ', after refunds. Tap one to see its transactions.';
+    ', after refunds &amp; statement credits. Tap one to see its transactions.';
   var r = ctx.recon || {};
   if (r.returnOutMinor || r.returnAdjMinor) {
     html += ' Category totals count refunds in the month they were received;' +
@@ -3697,6 +3765,16 @@ App.refundsNoteHtml = function (recon, rs) {
       ' Netted against this month\u2019s spend: <strong>' + spendAbs(netted) + '</strong>.';
   } else {
     s += ' (already subtracted from net spend).';
+  }
+  // v17: statement credits (credits the import couldn't classify as refunds)
+  // are their own subtraction line in the hero build-up — name them here too
+  // so this section accounts for every subtraction.
+  var sc = r.statementCreditsMinor || 0;
+  if (sc > 0) {
+    var scCount = r.statementCreditCount || 0;
+    s += ' Statement credits: <strong>' + spendAbs(sc) + '</strong> across ' + scCount +
+      ' transaction' + (scCount === 1 ? '' : 's') +
+      ' (printed as credits but classified as purchases — also subtracted from net spend).';
   }
   return '<p class="small">' + s + '</p>';
 };
@@ -4054,7 +4132,7 @@ App.askCtx = async function () {
   var askReported = (st && typeof st.reportedStartMinor === 'number' && typeof st.reportedEndMinor === 'number')
     ? { startMinor: st.reportedStartMinor, endMinor: st.reportedEndMinor } : null;
   try { recon = Engine.reconcile(txns, askReported); } catch (e) {
-    recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'unavailable', gapMinor: null };
+    recon = { grossPurchasesMinor: 0, refundsTotalMinor: 0, statementCreditsMinor: 0, statementCreditCount: 0, excludedTotalMinor: 0, netSpendMinor: 0, unresolvedCount: 0, signedRowsSumMinor: 0, balanceCheck: 'unavailable', gapMinor: null };
   }
   var briefs = (await sAll('briefings')).filter(function (b) { return String(b.statementId) === String(st.id); });
   briefs.sort(function (a, b) { return (b.createdAt || 0) - (a.createdAt || 0); });
@@ -4103,8 +4181,9 @@ App.buildAnswer = async function (qid, ctx) {
   var purch = txns.filter(function (t) { return (t.kind === 'purchase' || t.kind === 'cash_advance') && !t.excluded; });
 
   if (qid === 'q-spend') {
-    // V16: the Engine reports canonical spend (purchases positive, refunds as
-    // positive magnitudes); labeled totals are magnitudes.
+    // V16/V17: the Engine reports canonical spend (genuine purchases
+    // positive, refunds and statement credits as positive magnitudes);
+    // labeled totals are magnitudes.
     // V15: excluded/duplicate rows never enter gross, so they are NOT a
     // subtraction line (the old table subtracted them twice over). The table
     // resolves: gross − refunds = net.
@@ -4112,7 +4191,10 @@ App.buildAnswer = async function (qid, ctx) {
       body: '<p>Your <strong>actual spend after refunds</strong> was <strong>' + spendAbs(recon.netSpendMinor) + '</strong>.</p>' +
         '<table class="kv"><tr><th>Gross purchases</th><td>' + spendAbs(recon.grossPurchasesMinor) + '</td></tr>' +
         '<tr><th>− Refunds</th><td>' + spendAbs(recon.refundsTotalMinor) + '</td></tr>' +
-        '<tr><th>= Net spend</th><td><strong>' + spendAbs(recon.netSpendMinor) + '</strong></td></tr></table>' +
+        ((recon.statementCreditsMinor || 0) > 0
+          ? '<tr><th>− Statement credits</th><td>' + spendAbs(recon.statementCreditsMinor) + '</td></tr>'
+          : '') +
+        '<tr><th>= ' + (recon.netSpendMinor < 0 ? 'Net credit' : 'Net spend') + '</th><td><strong>' + spendAbs(recon.netSpendMinor) + '</strong></td></tr></table>' +
         App.excludedNoteHtml(recon) +
         '<p class="small">Payments and transfers are money movement, not spending — they never enter this total.</p>',
       txnIds: ids(purch), basis: purch.length + ' purchase transactions', confidence: ctx.confidence };
@@ -4140,8 +4222,9 @@ App.buildAnswer = async function (qid, ctx) {
   if (qid === 'q-grocery') {
     var gids = App.categories.filter(function (c) { return /grocer|food|household|dining/i.test(c.name); }).map(function (c) { return String(c.id); });
     var g = txns.filter(function (t) { return gids.indexOf(String(nt(t).category)) !== -1 && !nt(t).excluded; });
-    // v16: canonical signed (purchases positive, refunds negative) so this
-    // nets refunds exactly like the Home category bars do.
+    // v16/v17: canonical signed (genuine purchases positive, refunds and
+    // statement credits negative) so this nets refunds exactly like the
+    // Home category bars do.
     var tot = g.reduce(function (s, t) { return s + Engine.canonicalSpendMinor(nt(t)); }, 0);
     var body;
     if (!g.length) {
@@ -4451,8 +4534,9 @@ App.vAccounts = async function (v, seq) {
     acctStmts.forEach(function (s) { stmtIds[s.id] = 1; });
     var acctTxns = txns.filter(function (t) { return t && stmtIds[t.statementId]; });
     var total = 0;
-    // v16: canonical net spend (purchases positive, refunds negative;
-    // payments/transfers/fees/excluded/duplicate rows contribute 0).
+    // v16/v17: canonical net spend (genuine purchases positive, refunds
+    // and statement credits negative; payments/transfers/fees/
+    // excluded/duplicate rows contribute 0).
     for (var i = 0; i < acctTxns.length; i++) total += Engine.canonicalSpendMinor(acctTxns[i]);
     // Coverage strip: 12 months ending at the latest statement month (or now).
     var latest = null;

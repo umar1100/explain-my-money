@@ -1,7 +1,10 @@
-/* Canonical spend tests (v16): one computation for every sign convention.
+/* Canonical spend tests (v16/v17): one computation for every sign convention.
    Rows reach the ledger in two conventions:
-     PDF imports (PC/CIBC): purchases positive, refunds negative
-     CSV imports / manual Add rows: purchases negative, refunds positive
+     PDF imports (PC/CIBC): purchases positive, refunds negative ('pdf-card')
+     CSV imports / manual Add rows: purchases negative, refunds positive ('csv')
+   v17: every row carries its signConvention stamp (import-time provenance);
+   a purchase-kind row whose stored sign contradicts its convention is a
+   statement credit and reduces spend instead of adding to it.
    Every spend computation must go through Engine.canonicalSpendMinor so all
    views agree. Covers: canonicalSpendMinor shapes, reconcile identical
    across conventions, payments/transfers/fees never spend, excludedTotal
@@ -23,10 +26,12 @@ function ok(cond, name, extra) {
 }
 
 function row(id, o) {
+  // v17: rows carry their signConvention stamp; the default is 'pdf-card'
+  // (the validated-template path), mirroring the engine default.
   const r = Object.assign({
     id: id, merchantRaw: 'FRESHCART MARKET', amountMinor: 100,
     kind: 'purchase', category: 'groceries', date: '2026-06-10', statementId: 'st-1',
-    excluded: 0, status: 'active'
+    excluded: 0, status: 'active', signConvention: 'pdf-card'
   }, o);
   if (r.signedAmountMinor === undefined) r.signedAmountMinor = r.amountMinor;
   return r;
@@ -34,11 +39,11 @@ function row(id, o) {
 
 /* ---------- canonicalSpendMinor shapes ---------- */
 ok(E.canonicalSpendMinor(row('a', { amountMinor: 10000, kind: 'purchase' })) === 10000, 'PDF purchase +10000 -> +10000');
-ok(E.canonicalSpendMinor(row('b', { amountMinor: -10000, kind: 'purchase' })) === 10000, 'CSV purchase -10000 -> +10000');
-ok(E.canonicalSpendMinor(row('c', { amountMinor: -10000, spendAmountMinor: 10000, kind: 'purchase' })) === 10000,
+ok(E.canonicalSpendMinor(row('b', { amountMinor: -10000, kind: 'purchase', signConvention: 'csv' })) === 10000, 'CSV purchase -10000 -> +10000');
+ok(E.canonicalSpendMinor(row('c', { amountMinor: -10000, spendAmountMinor: 10000, kind: 'purchase', signConvention: 'csv' })) === 10000,
   'manual purchase (amountMinor -10000, spendAmountMinor +10000) -> +10000');
 ok(E.canonicalSpendMinor(row('d', { amountMinor: -1500, kind: 'refund' })) === -1500, 'PDF refund -1500 -> -1500');
-ok(E.canonicalSpendMinor(row('e', { amountMinor: 1500, kind: 'refund' })) === -1500, 'CSV refund +1500 -> -1500');
+ok(E.canonicalSpendMinor(row('e', { amountMinor: 1500, kind: 'refund', signConvention: 'csv' })) === -1500, 'CSV refund +1500 -> -1500');
 ok(E.canonicalSpendMinor(row('f', { amountMinor: 1500, spendAmountMinor: 1500, kind: 'refund' })) === -1500,
   'manual refund -> -1500');
 ok(E.canonicalSpendMinor(row('g', { amountMinor: -12000, kind: 'payment' })) === 0, 'payment never spend');
@@ -64,12 +69,12 @@ const pdfLedger = [
 ];
 // ...and CSV/manual-style (purchases negative, refunds positive).
 const csvLedger = [
-  row('p1', { amountMinor: -10000, spendAmountMinor: -10000 }),
-  row('p2', { amountMinor: -5000, spendAmountMinor: -5000 }),
-  row('r1', { amountMinor: 1500, spendAmountMinor: 1500, kind: 'refund', merchantRaw: 'COSTCO REFUND' }),
-  row('pay', { amountMinor: 12000, spendAmountMinor: 0, kind: 'payment', excluded: 1, merchantRaw: 'PAYMENT RECEIVED' }),
-  row('xf', { amountMinor: 3000, spendAmountMinor: 0, kind: 'transfer', excluded: 1, merchantRaw: 'E-TRANSFER' }),
-  row('fee', { amountMinor: 1200, spendAmountMinor: 0, kind: 'fee', excluded: 1, merchantRaw: 'ANNUAL FEE' }),
+  row('p1', { amountMinor: -10000, spendAmountMinor: -10000, signConvention: 'csv' }),
+  row('p2', { amountMinor: -5000, spendAmountMinor: -5000, signConvention: 'csv' }),
+  row('r1', { amountMinor: 1500, spendAmountMinor: 1500, kind: 'refund', merchantRaw: 'COSTCO REFUND', signConvention: 'csv' }),
+  row('pay', { amountMinor: 12000, spendAmountMinor: 0, kind: 'payment', excluded: 1, merchantRaw: 'PAYMENT RECEIVED', signConvention: 'csv' }),
+  row('xf', { amountMinor: 3000, spendAmountMinor: 0, kind: 'transfer', excluded: 1, merchantRaw: 'E-TRANSFER', signConvention: 'csv' }),
+  row('fee', { amountMinor: 1200, spendAmountMinor: 0, kind: 'fee', excluded: 1, merchantRaw: 'ANNUAL FEE', signConvention: 'csv' }),
 ];
 // ...and a hostile mix of both.
 const mixedLedger = [pdfLedger[0], csvLedger[1], csvLedger[2], pdfLedger[3], csvLedger[4], pdfLedger[5]];
@@ -100,12 +105,12 @@ ok(xr.grossPurchasesMinor === 0 && xr.netSpendMinor === 0, 'all-excluded ledger 
 
 /* ---------- return attribution with CSV-convention refunds ---------- */
 const may = [
-  row('mp', { id: 'mp', amountMinor: -99900, kind: 'purchase', category: 'shopping', date: '2026-05-20', merchantRaw: 'BIGBOX STORE' }),
+  row('mp', { id: 'mp', amountMinor: -99900, kind: 'purchase', category: 'shopping', date: '2026-05-20', merchantRaw: 'BIGBOX STORE', signConvention: 'csv' }),
 ];
 const jun = [
-  row('jp', { id: 'jp', amountMinor: -50000, kind: 'purchase', category: 'groceries', date: '2026-06-05' }),
+  row('jp', { id: 'jp', amountMinor: -50000, kind: 'purchase', category: 'groceries', date: '2026-06-05', signConvention: 'csv' }),
   // Refund received in June for the May purchase, stored CSV-style (positive).
-  row('jr', { id: 'jr', amountMinor: 99900, kind: 'refund', category: 'shopping', date: '2026-06-18', merchantRaw: 'BIGBOX STORE' }),
+  row('jr', { id: 'jr', amountMinor: 99900, kind: 'refund', category: 'shopping', date: '2026-06-18', merchantRaw: 'BIGBOX STORE', signConvention: 'csv' }),
 ];
 const links = [{ refundTxnId: 'jr', purchaseTxnId: 'mp', status: 'confirmed' }];
 const moves = E.refundMoves(may.concat(jun), links);
@@ -122,7 +127,7 @@ ok(mMay && mMay.netMinor === 0, 'May attributed net = 99900 - 99900 = 0', mMay &
 /* ---------- split-aware totals use magnitudes ---------- */
 // NOTE: the app stores splits as positive magnitudes summing to |spend|
 // (the split editor enforces this); canonical math absorbs them via Math.abs.
-const splitTxn = row('s1', { amountMinor: -100000, kind: 'purchase', category: '', date: '2026-06-12',
+const splitTxn = row('s1', { amountMinor: -100000, kind: 'purchase', category: '', date: '2026-06-12', signConvention: 'csv',
   splits: [{ category: 'groceries', amountMinor: 60000 }, { category: 'household', amountMinor: 40000 }] });
 const st = E.splitAwareCategoryTotals([splitTxn], '2026-06');
 ok(st.groceries === 60000 && st.household === 40000, 'split shares count as magnitudes', st);
@@ -149,9 +154,9 @@ ok(E.fmtMoneyAbs(-123456) === '$1,234.56', 'fmtMoneyAbs', E.fmtMoneyAbs(-123456)
 
 /* ---------- splitAwareNetCategoryTotals: movers compare bar figures ---------- */
 const netTxns = [
-  row('n1', { amountMinor: -100000, kind: 'purchase', category: 'groceries', date: '2026-06-05' }),
-  row('n2', { amountMinor: 30000, kind: 'refund', category: 'groceries', date: '2026-06-20' }),
-  row('n3', { amountMinor: -50000, kind: 'purchase', category: 'dining', date: '2026-06-08' }),
+  row('n1', { amountMinor: -100000, kind: 'purchase', category: 'groceries', date: '2026-06-05', signConvention: 'csv' }),
+  row('n2', { amountMinor: 30000, kind: 'refund', category: 'groceries', date: '2026-06-20', signConvention: 'csv' }),
+  row('n3', { amountMinor: -50000, kind: 'purchase', category: 'dining', date: '2026-06-08', signConvention: 'csv' }),
 ];
 const netT = E.splitAwareNetCategoryTotals(netTxns, '2026-06');
 ok(netT.groceries === 70000, 'net category total nets refunds (100000 - 30000)', netT.groceries);

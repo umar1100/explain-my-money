@@ -67,9 +67,9 @@ check('statement change -> key changes', k1 !== k5);
 
 /* ---------- Phase 2: Engine.categorySpendMinor ---------- */
 console.log('== Phase 2: categorySpendMinor');
-function mkT(date, amountMinor, kind, category, excluded, status, spendAmountMinor) {
+function mkT(date, amountMinor, kind, category, excluded, status, spendAmountMinor, conv) {
   const t = { date: date, amountMinor: amountMinor, kind: kind, category: category,
-              excluded: excluded, status: status };
+              excluded: excluded, status: status, signConvention: conv || 'pdf-card' };
   if (spendAmountMinor !== undefined) t.spendAmountMinor = spendAmountMinor;
   return t;
 }
@@ -204,12 +204,12 @@ check('slug has only [a-z0-9_]', /^[a-z0-9_]+$/.test(T.subDismissSlug('Café & B
 /* ---------- Phase 3: Engine.monthlyNetSpend ---------- */
 console.log('== Phase 3: monthlyNetSpend');
 const trendTxns = [
-  mkT('2026-07-28', -5000, 'purchase', 'groceries', 0, 'new'),
-  mkT('2026-08-03', -4200, 'purchase', 'groceries', 0, 'new'),
-  mkT('2026-08-10', -1500, 'purchase', 'dining', 0, 'new'),
-  mkT('2026-08-17', 800, 'refund', 'groceries', 0, 'new'),
-  mkT('n/a', -999, 'purchase', 'groceries', 0, 'new'), // invalid date: skipped
-  mkT(null, -999, 'purchase', 'groceries', 0, 'new'),  // missing date: skipped
+  mkT('2026-07-28', -5000, 'purchase', 'groceries', 0, 'new', undefined, 'csv'),
+  mkT('2026-08-03', -4200, 'purchase', 'groceries', 0, 'new', undefined, 'csv'),
+  mkT('2026-08-10', -1500, 'purchase', 'dining', 0, 'new', undefined, 'csv'),
+  mkT('2026-08-17', 800, 'refund', 'groceries', 0, 'new', undefined, 'csv'),
+  mkT('n/a', -999, 'purchase', 'groceries', 0, 'new', undefined, 'csv'), // invalid date: skipped
+  mkT(null, -999, 'purchase', 'groceries', 0, 'new', undefined, 'csv'),  // missing date: skipped
 ];
 const monthly = Engine.monthlyNetSpend(trendTxns);
 check('two months, oldest first', monthly.length === 2 && monthly[0].month === '2026-07' && monthly[1].month === '2026-08',
@@ -254,14 +254,18 @@ check('total=0 -> []', Engine.splitEvenly(0, 3).length === 0);
 /* ---------- Phase 3: Engine.expandSplits ---------- */
 console.log('== Phase 3: expandSplits');
 const splitTxnA = { kind: 'purchase', category: 'groceries', amountMinor: -1000, spendAmountMinor: -1000,
+  signConvention: 'csv',
   date: '2026-08-03', excluded: 0, status: 'new',
   splits: [{ category: 'groceries', amountMinor: 600 }, { category: 'dining', amountMinor: 400 }] };
 const splitTxnB = { kind: 'purchase', category: 'groceries', amountMinor: -1000, spendAmountMinor: -1000,
+  signConvention: 'csv',
   date: '2026-08-04', excluded: 0, status: 'new' };
 const splitTxnBadSum = { kind: 'purchase', category: 'groceries', amountMinor: -1000, spendAmountMinor: -1000,
+  signConvention: 'csv',
   date: '2026-08-05', excluded: 0, status: 'new',
   splits: [{ category: 'groceries', amountMinor: 300 }] }; // sums to 300, not 1000
 const splitTxnBadCat = { kind: 'purchase', category: 'groceries', amountMinor: -1000, spendAmountMinor: -1000,
+  signConvention: 'csv',
   date: '2026-08-06', excluded: 0, status: 'new',
   splits: [{ category: '', amountMinor: 1000 }] }; // blank category
 const expanded = Engine.expandSplits([splitTxnA, splitTxnB, splitTxnBadSum, splitTxnBadCat]);
@@ -280,9 +284,9 @@ check('empty input -> []', Engine.expandSplits([]).length === 0);
 console.log('== Phase 3: split-aware categorySpendMinor');
 const splitSpendTxns = [
   { kind: 'purchase', category: 'groceries', amountMinor: -1000, spendAmountMinor: -1000,
-    date: '2026-08-03', excluded: 0, status: 'new',
+    date: '2026-08-03', excluded: 0, status: 'new', signConvention: 'csv',
     splits: [{ category: 'groceries', amountMinor: 600 }, { category: 'dining', amountMinor: 400 }] },
-  mkT('2026-08-10', -1000, 'purchase', 'groceries', 0, 'new'), // magnitude 1000
+  mkT('2026-08-10', -1000, 'purchase', 'groceries', 0, 'new', undefined, 'csv'), // magnitude 1000
 ];
 check('groceries = 600 split + 1000 unsplit', Engine.categorySpendMinor(splitSpendTxns, 'groceries', '2026-08') === 1600,
   'got ' + Engine.categorySpendMinor(splitSpendTxns, 'groceries', '2026-08'));

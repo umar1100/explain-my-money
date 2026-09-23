@@ -13,9 +13,10 @@ function T(o) {
     excluded: 0, status: 'active',
   }, o);
 }
-function p(merchant, amountMinor, category, date, kind) {
+function p(merchant, amountMinor, category, date, kind, conv) {
   return T({ merchantRaw: merchant, amountMinor: amountMinor, category: category,
-    date: date || '2026-06-15', kind: kind || 'purchase' });
+    date: date || '2026-06-15', kind: kind || 'purchase',
+    signConvention: conv || 'pdf-card' });
 }
 
 function juneTxns() {
@@ -24,41 +25,41 @@ function juneTxns() {
     // shopping gross $12,027.27
     p('BIGBOX ONLINE', 775499, 'shopping', '2026-06-03'),
     p('BIGBOX ONLINE', 250000, 'shopping', '2026-06-09'),
-    p('GADGET HUT', -114501, 'shopping', '2026-06-14'),
-    p('BOOK NOOK', -62727, 'shopping', '2026-06-21'),
+    p('GADGET HUT', -114501, 'shopping', '2026-06-14', 'purchase', 'csv'),
+    p('BOOK NOOK', -62727, 'shopping', '2026-06-21', 'purchase', 'csv'),
     p('BIGBOX ONLINE REFUND', -39920, 'shopping', '2026-06-25', 'refund'), // PDF-style refund (negative)
     // other gross $2,488.15
     p('CITY PARKING', 147944, 'other', '2026-06-02'),
-    p('LOTTO KIOSK', -100871, 'other', '2026-06-28'),
-    p('PAYPROCESS REBATE', 39921, 'other', '2026-06-27', 'refund'), // CSV-style refund (positive)
+    p('LOTTO KIOSK', -100871, 'other', '2026-06-28', 'purchase', 'csv'),
+    p('PAYPROCESS REBATE', 39921, 'other', '2026-06-27', 'refund', 'csv'), // CSV-style refund (positive)
     // groceries $585.76 (mixed conventions)
     p('FRESHCART', 16500, 'groceries', '2026-06-01'),
     p('FRESHCART', 8000, 'groceries', '2026-06-08'),
-    p('CORNER GREENS', -500, 'groceries', '2026-06-04'),
-    p('CORNER GREENS', -6200, 'groceries', '2026-06-11'),
-    p('BULK MART', -4800, 'groceries', '2026-06-13'),
-    p('FRESHCART', -7300, 'groceries', '2026-06-16'),
-    p('BULK MART', -3900, 'groceries', '2026-06-18'),
-    p('CORNER GREENS', -4100, 'groceries', '2026-06-22'),
-    p('FRESHCART', -3600, 'groceries', '2026-06-24'),
-    p('BULK MART', -3676, 'groceries', '2026-06-29'),
+    p('CORNER GREENS', -500, 'groceries', '2026-06-04', 'purchase', 'csv'),
+    p('CORNER GREENS', -6200, 'groceries', '2026-06-11', 'purchase', 'csv'),
+    p('BULK MART', -4800, 'groceries', '2026-06-13', 'purchase', 'csv'),
+    p('FRESHCART', -7300, 'groceries', '2026-06-16', 'purchase', 'csv'),
+    p('BULK MART', -3900, 'groceries', '2026-06-18', 'purchase', 'csv'),
+    p('CORNER GREENS', -4100, 'groceries', '2026-06-22', 'purchase', 'csv'),
+    p('FRESHCART', -3600, 'groceries', '2026-06-24', 'purchase', 'csv'),
+    p('BULK MART', -3676, 'groceries', '2026-06-29', 'purchase', 'csv'),
     // household $393.75
-    p('FIXIT HARDWARE', -7000, 'household', '2026-06-05'),
-    p('FIXIT HARDWARE', -8200, 'household', '2026-06-10'),
-    p('HOME GOODS', -5300, 'household', '2026-06-12'),
-    p('FIXIT HARDWARE', -4400, 'household', '2026-06-17'),
-    p('HOME GOODS', -6100, 'household', '2026-06-20'),
-    p('CLEAN SUPPLY', -3900, 'household', '2026-06-23'),
-    p('CLEAN SUPPLY', -1500, 'household', '2026-06-26'),
-    p('CLEAN SUPPLY', -500, 'household', '2026-06-26'),
-    p('CLEAN SUPPLY', -2475, 'household', '2026-06-27'),
+    p('FIXIT HARDWARE', -7000, 'household', '2026-06-05', 'purchase', 'csv'),
+    p('FIXIT HARDWARE', -8200, 'household', '2026-06-10', 'purchase', 'csv'),
+    p('HOME GOODS', -5300, 'household', '2026-06-12', 'purchase', 'csv'),
+    p('FIXIT HARDWARE', -4400, 'household', '2026-06-17', 'purchase', 'csv'),
+    p('HOME GOODS', -6100, 'household', '2026-06-20', 'purchase', 'csv'),
+    p('CLEAN SUPPLY', -3900, 'household', '2026-06-23', 'purchase', 'csv'),
+    p('CLEAN SUPPLY', -1500, 'household', '2026-06-26', 'purchase', 'csv'),
+    p('CLEAN SUPPLY', -500, 'household', '2026-06-26', 'purchase', 'csv'),
+    p('CLEAN SUPPLY', -2475, 'household', '2026-06-27', 'purchase', 'csv'),
     // subscriptions $254.50
-    p('STREAMFLIX', -1599, 'subscriptions', '2026-06-06'),
-    p('MUSIC WAVE', -1099, 'subscriptions', '2026-06-07'),
-    p('CLOUD DRIVE', -299, 'subscriptions', '2026-06-09'),
-    p('NEWS DAILY', -1299, 'subscriptions', '2026-06-11'),
-    p('FIT APP', -1999, 'subscriptions', '2026-06-15'),
-    p('GAME PASS', -19155, 'subscriptions', '2026-06-19'),
+    p('STREAMFLIX', -1599, 'subscriptions', '2026-06-06', 'purchase', 'csv'),
+    p('MUSIC WAVE', -1099, 'subscriptions', '2026-06-07', 'purchase', 'csv'),
+    p('CLOUD DRIVE', -299, 'subscriptions', '2026-06-09', 'purchase', 'csv'),
+    p('NEWS DAILY', -1299, 'subscriptions', '2026-06-11', 'purchase', 'csv'),
+    p('FIT APP', -1999, 'subscriptions', '2026-06-15', 'purchase', 'csv'),
+    p('GAME PASS', -19155, 'subscriptions', '2026-06-19', 'purchase', 'csv'),
     // money movement (never spend)
     T({ merchantRaw: 'PAYMENT RECEIVED - THANK YOU', amountMinor: 400000, spendAmountMinor: 0, kind: 'payment', excluded: 1, category: 'uncategorized', date: '2026-06-20' }),
     T({ merchantRaw: 'PAYMENT RECEIVED - THANK YOU', amountMinor: 353998, spendAmountMinor: 0, kind: 'payment', excluded: 1, category: 'uncategorized', date: '2026-06-28' }),
