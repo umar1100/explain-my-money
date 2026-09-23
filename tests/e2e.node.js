@@ -145,7 +145,7 @@ async function main() {
   ok(typeof br.facts.unresolvedCount === 'number', 'facts.unresolvedCount present');
   ok(br.text.split('\n')[0].indexOf("can't give you a final number") !== -1, 'briefing honesty headline');
   const recon = E.reconcile(txns, null);
-  ok(recon.netSpendMinor === -142153, 'reconcile netSpendMinor signed', recon.netSpendMinor);
+  ok(recon.netSpendMinor === 142153, 'reconcile netSpendMinor canonical (purchases positive, refunds reduce)', recon.netSpendMinor);
   ok(T.spendAbs(recon.netSpendMinor) === '$1,421.53', 'spendAbs magnitude display');
   ok(T.spendAbs(recon.grossPurchasesMinor) === '$1,463.71', 'gross magnitude');
 
@@ -205,17 +205,20 @@ async function main() {
   await App.applyCorrection(loblaws.id, 'excluded', 1);
   const txns2 = await Store.all('txns');
   const recon2 = E.reconcile(txns2, null);
-  ok(recon2.excludedTotalMinor === 118000 + (-8743), 'excluded===1 counted by reconcile', recon2.excludedTotalMinor);
+  ok(recon2.excludedTotalMinor === 250000 + 120000 + 12000 + 8743, 'excluded rows counted by reconcile as magnitudes left out (payment+transfer+fee+loblaws)', recon2.excludedTotalMinor);
   ok(App.state.ruleOffer === null, 'excluded correction offers no rule');
 
   // --- receipts: save + match suggestion with sign alignment ---
+  // NOTE: the LOBLAWS row was user-excluded above, so coverage (v16) no
+  // longer counts a receipt linked to it — matched spend must be spend that
+  // counts. Match the non-excluded COSTCO row instead.
   const rcId = await Store.put('receipts', {
-    imageBlob: null, merchantRaw: 'LOBLAWS', date: '2026-08-02', amountMinor: 8743, currency: 'CAD', createdAt: Date.now(),
+    imageBlob: null, merchantRaw: 'COSTCO WHOLESALE #137', date: '2026-08-03', amountMinor: 21466, currency: 'CAD', createdAt: Date.now(),
   });
   const rc = await Store.get('receipts', rcId);
-  ok(rc.amountMinor === 8743 && rc.merchantRaw === 'LOBLAWS', 'receipt schema fields');
-  const target = (await Store.all('txns')).find((t) => /LOBLAWS #4521/.test(t.rawDescription) && t.rowIndex === 0);
-  const res = E.scoreReceiptMatch(target, { amountMinor: -8743, date: rc.date, merchantRaw: rc.merchantRaw });
+  ok(rc.amountMinor === 21466 && rc.merchantRaw === 'COSTCO WHOLESALE #137', 'receipt schema fields');
+  const target = (await Store.all('txns')).find((t) => /COSTCO WHOLESALE #137/.test(t.rawDescription) && t.rowIndex === 1);
+  const res = E.scoreReceiptMatch(target, { amountMinor: -21466, date: rc.date, merchantRaw: rc.merchantRaw });
   ok(res[0] >= 0.85, 'sign-aligned receipt scores >= threshold', res);
   // app helper produces the aligned view (real function under test)
   const aligned = T.receiptForScore(rc, target);
@@ -228,7 +231,7 @@ async function main() {
   const tLinked = await Store.get('txns', target.id);
   ok(tLinked.receiptId === rcId, 'confirm-match stamps txn.receiptId');
   const cov = await App.receiptCoverage();
-  ok(cov.matchedMinor === 8743 && cov.ratio > 0, 'coverage counts confirmed match', cov);
+  ok(cov.matchedMinor === 21466 && cov.ratio > 0, 'coverage counts confirmed match', cov);
 
   // --- Ask: six answers render ---
   App.state.askQ = 'q-spend';

@@ -214,8 +214,8 @@ const trendTxns = [
 const monthly = Engine.monthlyNetSpend(trendTxns);
 check('two months, oldest first', monthly.length === 2 && monthly[0].month === '2026-07' && monthly[1].month === '2026-08',
   JSON.stringify(monthly));
-check('2026-07 net = -5000', monthly[0].netMinor === -5000, 'got ' + monthly[0].netMinor);
-check('2026-08 net = -4200-1500+800 = -4900', monthly[1].netMinor === -4900, 'got ' + monthly[1].netMinor);
+check('2026-07 net = 5000 (canonical: purchase magnitudes)', monthly[0].netMinor === 5000, 'got ' + monthly[0].netMinor);
+check('2026-08 net = 4200+1500-800 = 4900 (canonical)', monthly[1].netMinor === 4900, 'got ' + monthly[1].netMinor);
 check('equals reconcile(monthTxns, null).netSpendMinor',
   monthly[1].netMinor === Engine.reconcile(trendTxns.filter((t) => t.date && t.date.indexOf('2026-08') === 0), null).netSpendMinor);
 check('empty input -> []', Engine.monthlyNetSpend([]).length === 0);
@@ -294,9 +294,9 @@ check('splitAwareCategoryTotals keys', directTotals.groceries === 1600 && direct
 /* ---------- Phase 3: buildBriefing driver aggregation honors splits ---------- */
 console.log('== Phase 3: buildBriefing split wiring');
 const bf = Engine.buildBriefing([splitTxnA], '2026-08-01', '2026-08-31', null, 'test', null);
-check('categoryTotals split across categories', bf.categoryTotals.groceries === -600 && bf.categoryTotals.dining === -400,
+check('categoryTotals split across categories', bf.categoryTotals.groceries === 600 && bf.categoryTotals.dining === 400,
   JSON.stringify(bf.categoryTotals));
-check('split shares inherit txn sign (sum = signed spend)', (bf.categoryTotals.groceries + bf.categoryTotals.dining) === -1000);
+check('split shares use canonical sign (purchases positive; sum = spend magnitude)', (bf.categoryTotals.groceries + bf.categoryTotals.dining) === 1000);
 check('topDrivers list both split categories', bf.topDrivers.length === 2);
 
 /* ---------- Phase 3: balance-check policy (app-level mapping) ---------- */

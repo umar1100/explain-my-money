@@ -437,8 +437,10 @@
     r.kindReason = kindReason;
     r.classificationSource = source; // 'rule' | 'builtin' | 'user'
     if (kind === 'purchase' || kind === 'refund') {
-      // purchase: amountMinor as-is (positive = spend).
-      // refund: amountMinor as-is (negative credits reduce net spend).
+      // v16: stored sign is kept as-is (PDF imports print purchases positive /
+      // refunds negative; CSV/manual rows print the opposite). Canonical
+      // spend math (Engine.canonicalSpendMinor) reads magnitude + kind, so
+      // both conventions produce identical totals downstream.
       r.excluded = 0;
       r.spendAmountMinor = (r.amountMinor === null || r.amountMinor === undefined) ? 0 : r.amountMinor;
     } else {
@@ -641,6 +643,42 @@
     return out;
   };
 
+  /**
+   * Canonical spend for one row, in Engine convention:
+   *   purchase -> positive spend
+   *   refund   -> negative spend (refunds reduce net spend)
+   * Everything else (payment / transfer / fee / cash_advance / uncertain),
+   * and any excluded or duplicate row, contributes 0: money movement is
+   * never spend, and excluded rows never count.
+   *
+   * WHY THIS EXISTS (v16): rows reach the ledger in two sign conventions.
+   * PDF imports (PC, CIBC) store card-centric signed amounts: purchases
+   * positive, refunds/payments negative. CSV imports keep the file's own
+   * print convention (many print purchases negative, refunds positive),
+   * and manually added rows use that same CSV convention. Summing
+   * amountMinor raw therefore mixed signs and produced DIFFERENT totals in
+   * different views over the same rows (one real month showed hero
+   * $8,209.45, category bars $14,951.02, receipt coverage $15,749.43, and
+   * the briefing printed "You spent -$8,209.45"). Every spend computation
+   * below goes through this function, so all views agree no matter which
+   * convention a row was stored in. Pure.
+   */
+  function spendMagnitudeOf(r) {
+    var m = (r.spendAmountMinor === null || r.spendAmountMinor === undefined)
+      ? r.amountMinor : r.spendAmountMinor;
+    return Math.abs(m || 0);
+  }
+  Engine.spendMagnitudeOf = spendMagnitudeOf;
+  Engine.canonicalSpendMinor = function (r) {
+    r = r || {};
+    if (r.excluded) return 0;
+    if (r.status === 'duplicate') return 0;
+    var k = r.kind;
+    if (k === 'purchase') return spendMagnitudeOf(r);
+    if (k === 'refund') return -spendMagnitudeOf(r);
+    return 0;
+  };
+
   /* ================================================================== */
   /* Reconciliation                                                       */
   /* ================================================================== */
@@ -648,17 +686,19 @@
   /**
    * Engine.reconcile(rows, reported=null) -> {...}
    *
-   * SIGN CONVENTION (kept consistent everywhere):
-   *   positive amountMinor = money left the household (purchases/charges)
-   *   negative amountMinor = money came back (refunds/credits/payments)
-   * netSpendMinor = grossPurchasesMinor + signedRefundTotal
-   *               = grossPurchasesMinor - refundsTotalMinor
-   * where refundsTotalMinor is the POSITIVE display magnitude of refunds.
+   * CANONICAL SPEND (v16, single source of truth for every view):
+   *   grossPurchasesMinor = sum of purchase magnitudes
+   *   refundsTotalMinor   = sum of refund magnitudes (always >= 0)
+   *   netSpendMinor       = grossPurchasesMinor - refundsTotalMinor
+   * All three go through Engine.canonicalSpendMinor, so PDF imports
+   * (purchases positive), CSV imports and manual rows (purchases negative)
+   * produce identical figures. Money movement (payment / transfer / fee /
+   * cash_advance / uncertain) never enters spend.
    *
    * EXCLUDED ROWS (user-excluded or marked duplicate) never count toward
-   * spend: they are skipped for grossPurchasesMinor/refundsTotalMinor/
-   * netSpendMinor. They are real printed rows, so they still feed
-   * excludedTotalMinor and the balance-check signed sum.
+   * spend. They are real printed rows, so they still feed
+   * excludedTotalMinor (as a magnitude sum: what was left out entirely)
+   * and the balance-check signed sum.
    *
    * BALANCE CHECK (corrected card-account equation, mirrors
    * backend/engine/reconcile.py):
@@ -699,27 +739,28 @@
   Engine.rowNeedsReview = rowNeedsReview;
 
   Engine.reconcile = function (rows, reported) {
-    var gross = 0, refundSigned = 0, excludedTotal = 0;
+    var gross = 0, refundsMag = 0, excludedTotal = 0;
     var unresolved = 0;
     var refundCount = 0;
     var signedSum = 0, signedKnown = true;
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
-      var amt = (r.amountMinor === null || r.amountMinor === undefined) ? 0 : r.amountMinor;
-      // Excluded rows (user-excluded, duplicates) never count toward spend.
-      var isX = r.excluded === 1 || r.status === 'duplicate';
+      // Canonical spend (v16): purchases positive, refunds negative as
+      // magnitudes, everything else 0 — identical for PDF, CSV and manual
+      // row conventions. Excluded/duplicate rows never count toward spend.
+      var isX = r.excluded || r.status === 'duplicate';
       if (!isX) {
-        if (r.kind === 'purchase') gross += amt;
-        else if (r.kind === 'refund') { refundSigned += amt; refundCount++; }
+        if (r.kind === 'purchase') gross += spendMagnitudeOf(r);
+        else if (r.kind === 'refund') { refundsMag += spendMagnitudeOf(r); refundCount++; }
       }
-      if (r.excluded === 1) excludedTotal += amt;
+      if (r.excluded) excludedTotal += Math.abs(r.amountMinor || 0);
       if (rowNeedsReview(r)) unresolved++;
       var samt = r.signedAmountMinor;
       if (samt === null || samt === undefined) signedKnown = false;
       else signedSum += samt;
     }
-    var refundsTotalMinor = -refundSigned; // positive display magnitude
-    var netSpendMinor = gross + refundSigned; // == gross - refundsTotalMinor
+    var refundsTotalMinor = refundsMag; // positive display magnitude, always >= 0
+    var netSpendMinor = gross - refundsMag;
     var result = {
       grossPurchasesMinor: gross,
       refundsTotalMinor: refundsTotalMinor,
@@ -745,7 +786,8 @@
    *   returnAdjMinor}, ...] oldest -> newest.
    * Groups txns by calendar month (valid ISO dates only) and reports each
    * month's net spend = Engine.reconcile(monthTxns, null).netSpendMinor
-   * (signed minor units; the app displays magnitudes).
+   * (canonical spend: gross purchases minus refunds, magnitudes; the app
+   * displays magnitudes).
    * links (optional): refund-link rows {refundTxnId, purchaseTxnId, status}.
    * A refund linked to a purchase in a DIFFERENT month is attributed to the
    * purchase's month (return-adjusted spend: the month you bought it shows
@@ -792,9 +834,11 @@
    * Engine.refundMoves(txns, links) -> [{refund, purchase, fromMonth, toMonth,
    *   amountMinor}]. Pure helper behind return-adjusted monthly spend: for
    * each refund link whose refund and purchase fall in different calendar
-   * months, the refund's signed amount (refunds are negative) moves from the
-   * refund's month to the purchase's month. Rejected links and same-month
-   * links produce no move.
+   * months, the refund's canonical signed amount (refunds are negative)
+   * moves from the refund's month to the purchase's month. Rejected links
+   * and same-month links produce no move. amountMinor is canonical (v16),
+   * so CSV/manual rows (refunds stored positive) attribute exactly like
+   * PDF rows. Pure.
    */
   Engine.refundMoves = function (txns, links) {
     var byId = {};
@@ -808,12 +852,12 @@
       if (!rf || !pu || rf.kind !== 'refund') return;
       // An excluded/duplicate leg makes the return unattributable: excluded
       // rows are invisible to spend math, so the move must not happen.
-      if (rf.excluded === 1 || pu.excluded === 1 ||
+      if (rf.excluded || pu.excluded ||
           rf.status === 'duplicate' || pu.status === 'duplicate') return;
       var rm = Engine._monthOf(rf.date), pm = Engine._monthOf(pu.date);
       if (!rm || !pm || rm === pm) return;
       moves.push({ refund: rf, purchase: pu, fromMonth: rm, toMonth: pm,
-                   amountMinor: rf.amountMinor || 0 });
+                   amountMinor: -spendMagnitudeOf(rf) });
     });
     return moves;
   };
@@ -858,11 +902,10 @@
   }
 
   function totalsByCategory(rows) {
-    // Spend rows only: purchases (positive) and refunds (negative credits).
-    // Split-aware: a split purchase contributes each split's share to its
-    // split category. Share sign follows the txn's signed spend, so a split
-    // purchase sums to exactly the row's original signed spend and briefing
-    // deltas stay in the same sign convention as unsplit rows.
+    // Spend rows only: purchases (positive) and refunds (negative credits),
+    // in CANONICAL kind-implied sign (v16) so PDF, CSV and manual rows
+    // agree. Split-aware: a split purchase contributes each split's share
+    // to its split category; shares sum to the row's canonical spend.
     var totals = {};
     var counts = {};
     var expanded = Engine.expandSplits(rows);
@@ -872,15 +915,9 @@
       if (!r) continue;
       if (r.kind !== 'purchase' && r.kind !== 'refund') continue;
       // Excluded/duplicate rows never count toward category totals either.
-      if (r.excluded === 1 || r.status === 'duplicate') continue;
+      if (r.excluded || r.status === 'duplicate') continue;
       var key = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(r);
-      var amt;
-      if (ex.fromSplit) {
-        var tAmt = (r.amountMinor === null || r.amountMinor === undefined) ? 0 : r.amountMinor;
-        amt = tAmt < 0 ? -(ex.amountMinor || 0) : (ex.amountMinor || 0);
-      } else {
-        amt = (r.amountMinor === null || r.amountMinor === undefined) ? 0 : r.amountMinor;
-      }
+      var amt = (r.kind === 'refund' ? -1 : 1) * Math.abs(ex.amountMinor || 0);
       totals[key] = (totals[key] || 0) + amt;
       // counts track SOURCE rows per category (a split txn counts once).
       var ck = ex.row + '|' + key;
@@ -899,9 +936,10 @@
   /**
    * Engine.categoryMembers(rows, key) -> [{txn, shareMinor}].
    * Split-aware drill-down behind "Where it went": every purchase/refund row
-   * contributing to the categoryTotals `key`, with its signed share of that
-   * total (same sign convention as totalsByCategory). Excluded/duplicate rows
-   * never count, mirroring totalsByCategory. Pure.
+   * contributing to the categoryTotals `key`, with its canonical signed
+   * share of that total (purchases positive, refunds negative — v16, same
+   * sign convention as totalsByCategory). Excluded/duplicate rows never
+   * count, mirroring totalsByCategory. Pure.
    */
   Engine.categoryMembers = function (rows, key) {
     var out = [];
@@ -910,13 +948,10 @@
       var ex = expanded[i], r = ex.txn;
       if (!r) continue;
       if (r.kind !== 'purchase' && r.kind !== 'refund') continue;
-      if (r.excluded === 1 || r.status === 'duplicate') continue;
+      if (r.excluded || r.status === 'duplicate') continue;
       var k = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(r);
       if (k !== key) continue;
-      var tAmt = (r.amountMinor === null || r.amountMinor === undefined) ? 0 : r.amountMinor;
-      var share = ex.fromSplit
-        ? (tAmt < 0 ? -(ex.amountMinor || 0) : (ex.amountMinor || 0))
-        : tAmt;
+      var share = (r.kind === 'refund' ? -1 : 1) * Math.abs(ex.amountMinor || 0);
       out.push({ txn: r, shareMinor: share });
     }
     return out;
@@ -1030,8 +1065,10 @@
           Engine.fmtMoney(facts.gapMinor) + '). Something is missing or miscategorized.');
       }
     } else {
-      lines.push('You spent ' + Engine.fmtMoney(facts.netSpendMinor || 0) + ' in ' + period +
-        ' \u2014 after ' + Engine.fmtMoney(facts.refundsTotalMinor || 0) + ' in refunds.');
+      // Labeled spend figures are magnitudes (v16): "You spent -$X" is
+      // never an honest sentence. Signed values stay in txn rows only.
+      lines.push('You spent ' + Engine.fmtMoneyAbs(facts.netSpendMinor || 0) + ' in ' + period +
+        ' \u2014 after ' + Engine.fmtMoneyAbs(facts.refundsTotalMinor || 0) + ' in refunds.');
     }
     lines.push('');
 
@@ -1061,7 +1098,7 @@
       lines.push('- No categorized spend in this period.');
     } else {
       for (var t = 0; t < drivers.length; t++) {
-        lines.push('- ' + drivers[t].category + ': ' + Engine.fmtMoney(drivers[t].totalMinor) +
+        lines.push('- ' + drivers[t].category + ': ' + Engine.fmtMoneyAbs(drivers[t].totalMinor) +
           ' across ' + drivers[t].txnCount + ' transaction(s).');
       }
     }
@@ -1071,8 +1108,9 @@
     lines.push('Refunds & money movement');
     var rs = facts.refundsSummary || { count: 0, totalMinor: 0 };
     lines.push('- Refunds/credits: ' + rs.count + ' transaction(s), ' +
-      Engine.fmtMoney(rs.totalMinor || 0) + ' back.');
-    lines.push('- Gross purchases before refunds: ' + Engine.fmtMoney(facts.grossPurchasesMinor || 0) + '.');
+      Engine.fmtMoneyAbs(rs.totalMinor || 0) + ' back.');
+    lines.push('- Gross purchases before refunds: ' + Engine.fmtMoneyAbs(facts.grossPurchasesMinor || 0) + '.');
+    lines.push('- Card payments and transfers are money movement, not spending: they never appear in the totals above.');
     lines.push('');
 
     // Needs your review
@@ -1183,6 +1221,30 @@
     return [score, reasons];
   };
 
+  /**
+   * Engine.coverageOfTxns(txns, matches) -> {ratio, matchedMinor, grossMinor}.
+   * Receipt coverage over an explicit txn list: the share of purchase spend
+   * carrying a confirmed linked receipt. grossMinor is the CANONICAL
+   * purchase gross (v16) — the same figure as reconcile().grossPurchasesMinor
+   * over the same rows — so the Home receipt-coverage denominator always
+   * equals the hero's purchases figure. Pure.
+   */
+  Engine.coverageOfTxns = function (txns, matches) {
+    var gross = 0;
+    (txns || []).forEach(function (t) {
+      if ((t.kind === 'purchase' || t.kind === 'cash_advance') && !t.excluded)
+        gross += Math.abs(Engine.canonicalSpendMinor(t));
+    });
+    var txnById = {};
+    (txns || []).forEach(function (t) { txnById[String(t.id)] = t; });
+    var matched = 0;
+    (matches || []).forEach(function (m) {
+      var t = txnById[String(m.txnId)];
+      if (t) matched += Math.abs(Engine.canonicalSpendMinor(t));
+    });
+    return { ratio: gross > 0 ? Math.min(1, matched / gross) : 0, matchedMinor: matched, grossMinor: gross };
+  };
+
   /* ================================================================== */
   /* Splits: one purchase across several categories                     */
   /* ================================================================== */
@@ -1257,11 +1319,13 @@
 
   /**
    * Engine.splitAwareCategoryTotals(txns, monthPrefix) -> {category: minor}.
-   * Purchase-only spend totals for one 'YYYY-MM' month, honoring splits:
+   * Purchase-only spend MAGNITUDES for one 'YYYY-MM' month, honoring splits:
    * a split purchase contributes each split's magnitude to its split
-   * category. Excluded and duplicate txns never count. Integer math only.
-   * Category keys mirror buildBriefing's: the expanded category, falling
-   * back to the merchant name when the row has no category.
+   * category (v16: magnitudes, so CSV/manual rows stored negative count
+   * exactly like PDF rows). Excluded and duplicate txns never count.
+   * Integer math only. Category keys mirror buildBriefing's: the expanded
+   * category, falling back to the merchant name when the row has no
+   * category.
    */
   Engine.splitAwareCategoryTotals = function (txns, monthPrefix) {
     var totals = {};
@@ -1273,14 +1337,35 @@
       if (t.status === 'duplicate') continue;
       if (typeof t.date !== 'string' || t.date.indexOf(monthPrefix) !== 0) continue;
       var key = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(t);
-      totals[key] = (totals[key] || 0) + (ex.amountMinor || 0);
+      totals[key] = (totals[key] || 0) + Math.abs(ex.amountMinor || 0);
     }
     return totals;
   };
 
-  /* ================================================================== */
-  /* Planning: budget spend + recurring-charge detection                  */
-  /* ================================================================== */
+  /**
+   * Engine.splitAwareNetCategoryTotals(txns, monthPrefix) -> {category: minor}.
+   * Split-aware NET category totals for one 'YYYY-MM' month: purchases count
+   * positive, refunds count negative (canonical signs, v16). This is the
+   * month-scoped twin of totalsByCategory's netting — the same figures the
+   * Home "Where it went" bars show — so period-over-period movers compare
+   * the same numbers the bars display.
+   */
+  Engine.splitAwareNetCategoryTotals = function (txns, monthPrefix) {
+    var totals = {};
+    var expanded = Engine.expandSplits(txns || []);
+    for (var i = 0; i < expanded.length; i++) {
+      var ex = expanded[i], t = ex.txn;
+      if (!t) continue;
+      if (t.kind !== 'purchase' && t.kind !== 'refund') continue;
+      if (t.excluded) continue;
+      if (t.status === 'duplicate') continue;
+      if (typeof t.date !== 'string' || t.date.indexOf(monthPrefix) !== 0) continue;
+      var key = trimStr(ex.category) !== '' ? ex.category : categoryKeyFor(t);
+      var signed = t.kind === 'refund' ? -Math.abs(ex.amountMinor || 0) : Math.abs(ex.amountMinor || 0);
+      totals[key] = (totals[key] || 0) + signed;
+    }
+    return totals;
+  };
 
   /**
    * Engine.categorySpendMinor(txns, categoryId, monthPrefix) -> int minor.
@@ -1455,6 +1540,14 @@
     var cents = a % 100;
     var ds = String(dollars).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
     return (neg ? '-' : '') + '$' + ds + '.' + (cents < 10 ? '0' : '') + cents;
+  };
+
+  /** Magnitude formatter for labeled spend figures (v16): "net spend",
+   *  category totals, gross and refund lines must never read "-$X".
+   *  Engine.fmtMoney stays signed for diagnostics (balance gaps) and txn
+   *  rows (statement convention). */
+  Engine.fmtMoneyAbs = function (minor) {
+    return Engine.fmtMoney(Math.abs(minor || 0));
   };
 
   /* ================================================================== */

@@ -72,3 +72,42 @@ audit events, never silent rewrites.
 - Refunds reduce net spending but remain visible as events.
 - `Net spending = gross purchases − linked/unlinked refunds.`
 - Corrections create audit events and may create scoped, reversible rules.
+
+## Canonical spend accounting (v16)
+
+One computation feeds every Home/Month figure (hero, category bars,
+briefing, receipt coverage, movers, per-account totals, trends, Ask
+answers, reconciliation strip). There is no per-view spend math.
+
+Stored rows arrive in two amount-sign conventions, and the ledger keeps
+each row's printed sign as-is:
+
+- PDF imports (e.g. President's Choice): purchases positive, refunds/payments negative.
+- CSV imports and manually added rows: purchases negative, refunds/payments positive.
+
+Canonical rules (`Engine.canonicalSpendMinor`, `Engine.spendMagnitudeOf`):
+
+- purchase → +|amount| (spend magnitude)
+- refund → −|amount| (reduces spend)
+- payment / transfer / fee / cash advance / uncertain → 0 (money movement, never spend)
+- excluded / duplicate rows → 0 (invisible to every spend figure)
+
+`Engine.reconcile()` reports `grossPurchasesMinor`, `refundsTotalMinor`
+(always ≥ 0), and `netSpendMinor = gross − refunds`. All user-facing
+spend labels show magnitudes (`You spent $X`, never `You spent -$X`).
+`excludedTotalMinor` is the sum of printed magnitudes left out of spend —
+informational only, never subtracted.
+
+View inclusion rules:
+
+- Hero build-up always resolves: purchases − attributed refunds = net.
+- Category bars net refunds (same figures the movers compare); their
+  signed sum equals the unattributed net.
+- Receipt coverage denominator is the canonical purchase gross over the
+  same rows — identical to the hero's purchases figure.
+- Biggest movers compare net category totals and say plainly when there
+  is no previous-month baseline (never deltas vs zero).
+- Plan budgets count purchases *before refunds* (split-aware) and are
+  labeled as such; the Home bars net refunds out.
+- Cash advances are money movement (like ATM withdrawals): excluded from
+  spend, shown separately.

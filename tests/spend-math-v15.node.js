@@ -48,7 +48,7 @@ const r = E.reconcile(base, null);
 ok(r.grossPurchasesMinor === 15000, 'excluded + duplicate purchases NOT in gross', r.grossPurchasesMinor);
 ok(r.refundsTotalMinor === 1500, 'excluded refunds NOT in the refund total', r.refundsTotalMinor);
 ok(r.netSpendMinor === 13500, 'net = 15000 - 1500 (excluded/duplicate/payment/transfer out)', r.netSpendMinor);
-ok(r.excludedTotalMinor === 6200, 'excludedTotal records the signed excluded amounts (3000+4000-800)', r.excludedTotalMinor);
+ok(r.excludedTotalMinor === 7800, 'excludedTotal records the magnitudes left out (3000+4000+800)', r.excludedTotalMinor);
 ok(r.refundCount === 1, 'refundCount ignores the excluded refund', r.refundCount);
 ok(r.signedRowsSumMinor === 9700,
    'balance-check sum still sees every real row (incl. excluded)', r.signedRowsSumMinor);
